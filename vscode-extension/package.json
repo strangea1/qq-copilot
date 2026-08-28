@@ -1,0 +1,66 @@
+{
+  "name": "qq-copilot-ahp-status",
+  "displayName": "QQ Copilot AHP Status",
+  "description": "Shows QQ Bridge, AHP binding, and pending QQ delivery status.",
+  "version": "0.1.0",
+  "publisher": "guoyu-local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.134.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:qqCopilot.refreshStatus",
+    "onCommand:qqCopilot.showStatus"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qqCopilot.refreshStatus",
+        "title": "QQ Copilot: Refresh Status"
+      },
+      {
+        "command": "qqCopilot.showStatus",
+        "title": "QQ Copilot: Show Status"
+      }
+    ],
+    "configuration": {
+      "title": "QQ Copilot AHP",
+      "properties": {
+        "qqCopilot.bridgeExecutable": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to qq-bridge.exe."
+        },
+        "qqCopilot.configPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the QQ Bridge config.toml."
+        },
+        "qqCopilot.statusPollSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 2,
+          "maximum": 60,
+          "description": "Status refresh interval."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "@types/vscode": "1.134.0",
+    "typescript": "5.9.3"
+  }
+}

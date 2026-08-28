@@ -1,0 +1,15 @@
+/target/
+/adapter/dist/
+/adapter/node_modules/
+/adapter/.cache/
+/vscode-extension/dist/
+/vscode-extension/node_modules/
+**/.serena/
+*.vsix
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.lock
+!Cargo.lock
+.env
+.env.*

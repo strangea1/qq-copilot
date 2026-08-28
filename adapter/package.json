@@ -1,0 +1,36 @@
+{
+  "name": "qq-copilot-ahp-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --test --import tsx \"test/**/*.test.ts\"",
+    "probe": "node dist/probe.js",
+    "inspect-session": "node dist/inspect-session.js"
+  },
+  "dependencies": {
+    "@microsoft/agent-host-protocol": "file:../vendor/microsoft-agent-host-protocol-0.8.0.tgz",
+    "smol-toml": "1.8.0",
+    "ws": "8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "@types/ws": "8.18.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}

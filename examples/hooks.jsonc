@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "windows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"{{INSTALL_DIR}}\\copilot-qq-hook.ps1\" -ConfigPath \"{{CONFIG_PATH}}\" -Mode prompt",
+        "timeout": 15
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "windows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"{{INSTALL_DIR}}\\copilot-qq-hook.ps1\" -ConfigPath \"{{CONFIG_PATH}}\" -Mode prompt",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "windows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"{{INSTALL_DIR}}\\copilot-qq-hook.ps1\" -ConfigPath \"{{CONFIG_PATH}}\" -Mode pre-tool",
+        "timeout": 660
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "windows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"{{INSTALL_DIR}}\\copilot-qq-hook.ps1\" -ConfigPath \"{{CONFIG_PATH}}\" -Mode post-tool",
+        "timeout": 15
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "windows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"{{INSTALL_DIR}}\\copilot-qq-hook.ps1\" -ConfigPath \"{{CONFIG_PATH}}\" -Mode stop",
+        "timeout": 30
+      }
+    ]
+  }
+}

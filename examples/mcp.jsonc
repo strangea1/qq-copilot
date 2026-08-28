@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "qq-copilot": {
+      "type": "stdio",
+      "command": "{{INSTALL_DIR}}\\qq-mcp.exe",
+      "args": [
+        "--config",
+        "{{CONFIG_PATH}}"
+      ]
+    }
+  }
+}

@@ -1,0 +1,57 @@
+[package]
+name = "qq-copilot-remote"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Fail-closed QQ remote supervision bridge for VS Code Copilot"
+license = "MIT"
+
+[lib]
+name = "qq_copilot_remote"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qq-bridge"
+path = "src/bin/qq-bridge.rs"
+
+[[bin]]
+name = "copilot-qq-hook"
+path = "src/bin/copilot-qq-hook.rs"
+
+[[bin]]
+name = "qq-mcp"
+path = "src/bin/qq-mcp.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+fs2 = "0.4"
+hex = "0.4"
+keyring = { version = "3.6", features = ["windows-native"] }
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+urlencoding = "2.1"
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3.21"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
