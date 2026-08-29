@@ -39,22 +39,23 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - PC 或 QQ 首个有效审批/回答生效，终态广播给另一端。
 - Agent 运行中收到的新消息通过 AHP queued message 串行执行。
 - PC 或 QQ 均可取消当前 Turn。
-- `/sessions` 以文本列出共享工作区 Session；`/switch` 显示全部 Session
-  按钮并在空闲时切换绑定。
+- `/sessions` 同时列出所有目标目录的 Session 和完整目录；`/switch` 显示全部 Session
+  按钮，并在当前绑定和目标 Session 均空闲时切换唯一绑定。
 - Session 编号由 Bridge 稳定分配，目录刷新不会改变。
 - Turn 运行期间 QQ 显示官方 `msg_type=6`“正在输入”状态，每 45 秒续期，
   完成、取消、失败或等待审批/澄清时停止。
 - Host/Adapter 重连恢复 Session 订阅；Host 实例更换时未决操作 fail-closed。
 - 脱敏事件和未送达 projection 保留 30 天。
 - QQ 实时投递失败后，在 Owner 下一条 QQ 消息的被动回复中补发。
+- QQ 私聊语音使用事件自带的 ASR 结果作为普通共享会话输入；敏感控制命令仍要求文字或按钮。
 - AHP/Legacy 模式一键切换。
 
 ## 重要边界
 
 - 首版使用 **VS Code 托管 Agent Host**；VS Code 完全退出后 QQ 不能继续执行。
 - 只绑定一个本地 AHP Session 和一个 QQ Owner。
-- 同一工作区可以有多个 Session，但任一时刻只绑定一个；运行中、存在排队消息或
-  Pending 交互时禁止切换。
+- 多个目标目录可以各自包含多个 Session，但任一时刻只绑定一个；当前绑定运行中、
+  存在排队消息或 Pending 交互，或者目标 Session 不空闲时，均禁止切换。
 - AHP 直接连接针对 VS Code 1.135 的实际协议方言验证。
 - 当前 VS Code 1.135 使用 AHP `1.0.0`，对应 vendored revision
   `f770e26b8483de59050e8de71b65a20efdab62d4`。
@@ -106,8 +107,8 @@ npm ci --prefix vscode-extension
 npm run typecheck --prefix vscode-extension
 
 .\scripts\install.ps1 `
-  -Workspace "C:\test","C:\path\to\other-allowed-workspace" `
-  -AhpWorkspace "C:\test"
+  -Workspace "C:\test","C:\src\another-project" `
+  -AhpWorkspace "C:\test","C:\src\another-project"
 ```
 
 详细步骤和首次 QQ/Session 绑定流程见 [部署指南](docs/deployment.md)。
@@ -131,6 +132,7 @@ npm run typecheck --prefix vscode-extension
 app_id = "你的 AppID"
 app_secret_source = "credential_manager"
 approval_buttons_enabled = true
+voice_input_enabled = true
 intents = 100663296
 ```
 
@@ -154,11 +156,55 @@ AppSecret 只进入 Windows Credential Manager，不写入 TOML、命令行或�
 /bind <code>
 ```
 
+## 配置目标目录
+
+`bridge.workspace_roots` 是本地文件操作的安全允许根目录；`ahp.shared_workspaces`
+则是 QQ 可以同时查看和切换 Session 的精确目录列表。安装脚本和新增目录命令会确保
+每个目标目录也被安全根目录覆盖：
+
+```toml
+[ahp]
+shared_workspaces = [
+    'C:\test',
+    'C:\src\another-project',
+]
+```
+
+目标目录采用精确匹配。把 `C:\src` 加入列表不会自动展示
+`C:\src\project-a` 或 `C:\src\project-b` 的 Session，必须分别添加实际 Session
+所在目录。
+
+安装后可一次增加一个或多个目标目录，并安全重启 Bridge/Adapter：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\add-workspace.ps1" `
+  -Workspace "C:\src\project-a","C:\src\project-b"
+```
+
+脚本要求 Bridge 正在运行且 AHP 已配置，并只会在当前绑定无活动 Turn、无排队消息且
+无待执行 Adapter 命令时重启。它会规范化路径、去重，并同时更新安全根目录和目标目录。
+
+只修改配置、稍后手动重启时可使用；多个目录需要重复 `--workspace`：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" `
+  add-workspace `
+  --workspace "C:\src\project-a" `
+  --workspace "C:\src\project-b"
+
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\switch-vscode-integration.ps1" `
+  -Mode Ahp
+```
+
+旧的单值 `ahp.shared_workspace` 配置仍可读取；下一次保存配置时会自动迁移为数组。
+重新运行安装脚本时，`-AhpWorkspace` 应传入希望保留的**完整目标目录列表**；
+仅追加目录优先使用 `add-workspace.ps1`。
+
 ## 创建并绑定共享 Session
 
 1. 运行 `code --agents`。
 2. 在独立 Agents Window 中创建 Copilot Session。
-3. 选择配置的 `ahp.shared_workspace`。
+3. 选择任一 `ahp.shared_workspaces` 目标目录。
 4. 发送并完成至少一轮消息。
 5. 本机列出 Session：
 
@@ -180,10 +226,11 @@ Adapter 会订阅 Session 和默认 Chat。不能按标题模糊绑定。
 
 ```text
 普通文本                 发送到共享对话
+QQ 语音                  使用内置 ASR 识别后发送到共享对话
 /ask <文本>              即使 Agent 正等待澄清，也排队为新消息
-/sessions                以文本列出共享工作区内可切换的 Session
+/sessions                同时列出所有目标目录的 Session 和完整目录
 /switch                  显示全部 Session 按钮并切换
-/switch <编号>           文本兜底，仅在当前 Session 空闲时切换
+/switch <编号>           文本兜底，当前绑定和目标 Session 均空闲时切换
 /allow <审批码>          单次批准
 /deny <审批码>           拒绝
 /answer <问题码> <文本>  显式回答澄清
@@ -195,9 +242,22 @@ Adapter 会订阅 Session 和默认 Chat。不能按标题模糊绑定。
 当 Agent 正等待澄清时，普通文本优先作为当前问题的答案。审批永远要求按钮或显式
 `/allow`、`/deny`，普通文本不会被解释为批准。
 
+语音识别结果同样只作为普通输入或澄清回答，不会执行 `/allow`、`/deny`、`/cancel`
+或 `/switch` 等控制命令。QQ 事件未提供 ASR 结果时，Bot 会提示重新录制或改发文字；
+Bridge 不下载或长期保存语音文件。
+
 每次 `/switch` 会生成有效期有限的一次性按钮 token；旧菜单、重复点击、Session
-工作区变化以及运行中的 Turn/排队消息/Pending 交互都会拒绝切换。单个 Keyboard
-最多 25 个 Session；最多使用 4 条被动回复展示 100 个 Session。
+目录变化、忙碌的目标 Session，以及运行中的 Turn/排队消息/Pending 交互都会拒绝切换。
+所有目标目录的 Session 会同时显示并标注完整目录，但数据库始终只保留一个活动绑定。
+单个 Keyboard 最多 25 个 Session；最多使用 4 条被动回复展示 100 个 Session。
+
+示例：
+
+```text
+AHP Sessions:
+* APYZB | Clone and deploy qq-copilot | D:\work\vscode\qq-copilot | 当前
+  AZ49U | 接入GitHub Copilot功能实现 | D:\work\vscode\CodexPlusPlus | 可切换
+```
 
 本机也可以使用完整 URI 切换：
 
@@ -206,8 +266,8 @@ qq-bridge ahp-sessions
 qq-bridge ahp-bind --endpoint <endpoint-id> --session <session-uri>
 ```
 
-QQ 端只显示稳定短编号，不暴露或要求输入长 Session URI。Adapter 目录短暂断开或
-重启不会改变编号。
+QQ 端显示稳定短编号、标题和所在目录，不暴露或要求输入长 Session URI。Adapter 目录
+短暂断开或重启不会改变编号。
 
 ## 工具通知模式
 
@@ -297,6 +357,7 @@ npm run typecheck --prefix vscode-extension
 npm run build --prefix vscode-extension
 ```
 
-当前测试覆盖：SQLite 迁移、Owner 身份、事件幂等、Session 绑定、命令租约、Host
-更换 fail-closed、双端审批、按钮重放、选择按钮、离线补发、通知模式、AHP reducer、
-Named Pipe WebSocket、Session/Chat hydration 和 final 去重。
+当前测试覆盖：SQLite 迁移、旧单目录配置迁移、多目标目录过滤和跨目录切换、唯一绑定、
+忙碌目标拒绝、Owner 身份、事件幂等、命令租约、Host 更换 fail-closed、双端审批、
+按钮重放、选择按钮、离线补发、通知模式、AHP reducer、Named Pipe WebSocket、
+Session/Chat hydration 和 final 去重。

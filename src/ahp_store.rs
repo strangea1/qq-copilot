@@ -686,6 +686,7 @@ impl Database {
     pub fn ahp_switch_session_by_button(
         &self,
         button_data: &str,
+        allowed_session_uris: &[String],
     ) -> Result<Option<AhpSessionSwitchSubmission>> {
         let now = now();
         let mut connection = self.connection()?;
@@ -716,6 +717,18 @@ impl Database {
         };
         let session = session_by_uri(&transaction, &session_uri)?
             .context("AHP Session for switch button is no longer available")?;
+        if !allowed_session_uris
+            .iter()
+            .any(|allowed| allowed == &session.session_uri)
+        {
+            transaction.execute(
+                "UPDATE ahp_session_switch_buttons
+                 SET used_at = ?1 WHERE button_data = ?2 AND used_at IS NULL",
+                params![now, button_data],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
         if used_at.is_some() || expires_at <= now || menu_workspace_uris != current_workspace_uris {
             let binding = binding_from_connection(&transaction)?
                 .context("no AHP Session is currently bound")?;
@@ -1436,6 +1449,27 @@ impl Database {
         if changed != 1 {
             bail!("AHP command acknowledgement is stale or mismatched");
         }
+        match outcome {
+            AhpCommandOutcome::Applied => {}
+            AhpCommandOutcome::Rejected => {
+                expire_ahp_interactions(&transaction, now)?;
+                transaction.execute(
+                    "UPDATE ahp_inputs
+                     SET state = 'pending', command_id = NULL,
+                         decided_by_surface = NULL, decided_by_message_id = NULL,
+                         updated_at = ?1
+                     WHERE command_id = ?2 AND state = 'submitted' AND expires_at > ?1",
+                    params![now, command_id],
+                )?;
+            }
+            AhpCommandOutcome::Failed => {
+                transaction.execute(
+                    "UPDATE ahp_inputs SET state = 'failed', updated_at = ?1
+                     WHERE command_id = ?2 AND state = 'submitted'",
+                    params![now, command_id],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2082,6 +2116,9 @@ fn bind_session_transaction(
     now: i64,
 ) -> Result<AhpBindingRecord> {
     let previous = binding_from_connection(connection)?;
+    let switching_session = previous.as_ref().is_some_and(|binding| {
+        binding.endpoint_id != endpoint_id || binding.session_uri != session_uri
+    });
     if let Some(previous) = previous.as_ref() {
         if previous.endpoint_id == endpoint_id
             && previous.session_uri == session_uri
@@ -2105,15 +2142,18 @@ fn bind_session_transaction(
             bail!("cannot switch AHP Session while input is pending");
         }
     }
-    let host_instance_id: String = connection
+    let (host_instance_id, target_status): (String, i64) = connection
         .query_row(
-            "SELECT host_instance_id FROM ahp_session_catalog
+            "SELECT host_instance_id, status FROM ahp_session_catalog
              WHERE endpoint_id = ?1 AND session_uri = ?2 AND available = 1",
             params![endpoint_id, session_uri],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .context("AHP Session is not present in the current catalogue")?;
+    if switching_session && target_status & 1 == 0 {
+        bail!("cannot switch to an AHP Session that is not idle");
+    }
     let generation = previous.map_or(1, |binding| binding.generation + 1);
     connection.execute(
         "UPDATE ahp_commands
@@ -2555,6 +2595,52 @@ mod tests {
     }
 
     #[test]
+    fn rejected_input_completion_returns_input_to_pending_for_retry() {
+        let (_directory, database, binding) = bound_database();
+        let input = database
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "input-retry".to_owned(),
+                session_uri: binding.session_uri,
+                chat_uri: binding.chat_uri.expect("chat URI"),
+                request_id: "request-retry".to_owned(),
+                prompt: "Choose or enter a value".to_owned(),
+                choices: vec!["test".to_owned()],
+                allow_freeform: true,
+                selection_mode: "single".to_owned(),
+                expires_at: now() + 600,
+            })
+            .expect("begin input");
+        assert!(
+            database
+                .ahp_submit_input("input-retry", "custom", "qq-message-rejected")
+                .expect("submit input")
+        );
+        let commands = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("input command");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                commands[0].command_id,
+                AhpCommandOutcome::Rejected,
+                Some("invalid-command"),
+            )
+            .expect("reject command");
+
+        let pending = database
+            .ahp_pending_input()
+            .expect("pending input")
+            .expect("input restored");
+        assert_eq!(pending.short_code, input.record.short_code);
+        assert!(
+            database
+                .ahp_submit_input("input-retry", "test", "qq-message-retry")
+                .expect("retry input")
+        );
+    }
+
+    #[test]
     fn session_codes_are_stable_and_active_turn_blocks_switching() {
         let (_directory, database, binding) = bound_database();
         let original = database
@@ -2653,17 +2739,96 @@ mod tests {
             .find(|button| button.session.session_uri == "copilot:/session-2")
             .expect("second button");
         let switched = database
-            .ahp_switch_session_by_button(&second_button.button_data)
+            .ahp_switch_session_by_button(&second_button.button_data, &session_uris)
             .expect("switch")
             .expect("button exists");
         assert!(switched.accepted);
         assert_eq!(switched.session.session_uri, "copilot:/session-2");
         assert_eq!(switched.binding.generation, binding.generation + 1);
         let replay = database
-            .ahp_switch_session_by_button(&second_button.button_data)
+            .ahp_switch_session_by_button(&second_button.button_data, &session_uris)
             .expect("replay")
             .expect("button exists");
         assert!(!replay.accepted);
+    }
+
+    #[test]
+    fn switch_rejects_busy_target_and_keeps_single_binding() {
+        let (_directory, database, original_binding) = bound_database();
+        let busy = AhpSessionDescriptor {
+            short_code: None,
+            endpoint_id: "endpoint-1".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            session_uri: "copilot:/busy-session".to_owned(),
+            provider: "copilot".to_owned(),
+            title: "Busy session".to_owned(),
+            status: 1 << 3,
+            workspace_uris: vec!["file:///c%3A/other".to_owned()],
+            created_at: "2026-08-27T00:01:00Z".to_owned(),
+            modified_at: "2026-08-27T00:01:00Z".to_owned(),
+        };
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &[session("host-1"), busy],
+            )
+            .expect("catalogue");
+
+        assert!(
+            database
+                .ahp_bind_session("endpoint-1", "copilot:/busy-session")
+                .is_err()
+        );
+        let binding = database
+            .ahp_binding()
+            .expect("binding query")
+            .expect("single binding");
+        assert_eq!(binding.generation, original_binding.generation);
+        assert_eq!(binding.session_uri, "copilot:/session-1");
+    }
+
+    #[test]
+    fn switch_button_cannot_bind_outside_allowed_session_set() {
+        let (_directory, database, original_binding) = bound_database();
+        let outside = AhpSessionDescriptor {
+            short_code: None,
+            endpoint_id: "endpoint-1".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            session_uri: "copilot:/outside-session".to_owned(),
+            provider: "copilot".to_owned(),
+            title: "Outside session".to_owned(),
+            status: 1,
+            workspace_uris: vec!["file:///c%3A/outside".to_owned()],
+            created_at: "2026-08-27T00:01:00Z".to_owned(),
+            modified_at: "2026-08-27T00:01:00Z".to_owned(),
+        };
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &[session("host-1"), outside],
+            )
+            .expect("catalogue");
+        let buttons = database
+            .ahp_create_session_switch_buttons(&["copilot:/outside-session".to_owned()], 600)
+            .expect("switch button");
+
+        let rejected = database
+            .ahp_switch_session_by_button(
+                &buttons[0].button_data,
+                &["copilot:/session-1".to_owned()],
+            )
+            .expect("reject switch");
+        assert!(rejected.is_none());
+        let binding = database
+            .ahp_binding()
+            .expect("binding query")
+            .expect("single binding");
+        assert_eq!(binding.generation, original_binding.generation);
+        assert_eq!(binding.session_uri, "copilot:/session-1");
     }
 
     #[test]

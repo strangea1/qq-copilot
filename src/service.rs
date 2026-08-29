@@ -39,6 +39,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_WAIT_FOR_MESSAGE_SECONDS: u64 = 300;
 const INBOUND_MESSAGE_TTL_SECONDS: u64 = 1800;
 
+#[derive(Clone, Copy)]
+enum InboundMessage<'a> {
+    Text(&'a str),
+    Voice(Option<&'a str>),
+}
+
 pub struct BridgeService {
     config: Arc<AppConfig>,
     config_path: PathBuf,
@@ -451,6 +457,26 @@ impl BridgeService {
         user_openid: &str,
         content: &str,
     ) -> Result<()> {
+        self.handle_inbound(message_id, user_openid, InboundMessage::Text(content))
+            .await
+    }
+
+    pub async fn handle_inbound_voice_message(
+        &self,
+        message_id: &str,
+        user_openid: &str,
+        transcript: Option<&str>,
+    ) -> Result<()> {
+        self.handle_inbound(message_id, user_openid, InboundMessage::Voice(transcript))
+            .await
+    }
+
+    async fn handle_inbound(
+        &self,
+        message_id: &str,
+        user_openid: &str,
+        message: InboundMessage<'_>,
+    ) -> Result<()> {
         if message_id.trim().is_empty() || user_openid.trim().is_empty() {
             bail!("QQ message omitted a stable identity");
         }
@@ -458,9 +484,17 @@ impl BridgeService {
             return Ok(());
         }
 
-        let command = content.trim();
+        let command = match message {
+            InboundMessage::Text(content) => content.trim(),
+            InboundMessage::Voice(transcript) => transcript.unwrap_or_default().trim(),
+        };
         let owner = self.database.owner()?;
         if owner.is_none() {
+            if matches!(message, InboundMessage::Voice(_)) {
+                self.database
+                    .mark_inbound_kind(message_id, "voice_ignored")?;
+                return Ok(());
+            }
             let mut fields = command.split_whitespace();
             let verb = fields.next().unwrap_or_default();
             let code = fields.next().unwrap_or_default();
@@ -503,10 +537,15 @@ impl BridgeService {
             return Ok(());
         }
 
-        let response = if self.config.ahp.enabled {
-            self.process_ahp_owner_message(message_id, command).await?
-        } else {
-            self.process_owner_command(message_id, command).await?
+        let response = match message {
+            InboundMessage::Text(_) if self.config.ahp.enabled => {
+                self.process_ahp_owner_message(message_id, command).await?
+            }
+            InboundMessage::Text(_) => self.process_owner_command(message_id, command).await?,
+            InboundMessage::Voice(transcript) => {
+                self.process_owner_voice_message(message_id, transcript)
+                    .await?
+            }
         };
         let (replay, replay_event_ids) = if self.config.ahp.enabled {
             self.pending_ahp_replay(
@@ -649,24 +688,38 @@ impl BridgeService {
                 }
             }
         } else {
-            match self.database.ahp_switch_session_by_button(button_data) {
-                Ok(Some(submission))
-                    if submission.accepted
-                        && ahp_session_matches_workspace(&self.config, &submission.session) =>
-                {
-                    (
-                        0,
-                        Some(format!(
-                            "正在切换到 {}：{}（generation {}）。",
-                            submission
-                                .session
-                                .short_code
-                                .as_deref()
-                                .unwrap_or("[unknown]"),
-                            submission.session.title,
-                            submission.binding.generation
-                        )),
-                    )
+            let allowed_session_uris = self
+                .database
+                .ahp_list_sessions()?
+                .into_iter()
+                .filter(|session| ahp_session_matches_workspace(&self.config, session))
+                .map(|session| session.session_uri)
+                .collect::<Vec<_>>();
+            match self
+                .database
+                .ahp_switch_session_by_button(button_data, &allowed_session_uris)
+            {
+                Ok(Some(submission)) if submission.accepted => {
+                    if let Some(workspace) =
+                        ahp_session_target_workspace(&self.config, &submission.session)
+                    {
+                        (
+                            0,
+                            Some(format!(
+                                "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
+                                submission
+                                    .session
+                                    .short_code
+                                    .as_deref()
+                                    .unwrap_or("[unknown]"),
+                                submission.session.title,
+                                workspace.display(),
+                                submission.binding.generation
+                            )),
+                        )
+                    } else {
+                        (3, None)
+                    }
                 }
                 Ok(Some(_)) | Ok(None) => (3, None),
                 Err(error) => {
@@ -1196,7 +1249,19 @@ impl BridgeService {
                 if !ahp_session_matches_workspace(&self.config, &session) {
                     self.database
                         .mark_inbound_kind(message_id, "ahp_switch_forbidden")?;
-                    return Ok(Some("该 Session 不属于配置的共享工作区。".to_owned()));
+                    return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
+                }
+                let already_bound = self.database.ahp_binding()?.is_some_and(|binding| {
+                    binding.endpoint_id == session.endpoint_id
+                        && binding.session_uri == session.session_uri
+                });
+                if !already_bound && !ahp_session_is_idle(&session) {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_switch_busy_target")?;
+                    return Ok(Some(format!(
+                        "目标 Session {} 当前正忙，请等待其空闲后再切换。",
+                        session.short_code.as_deref().unwrap_or("[unknown]")
+                    )));
                 }
                 match self
                     .database
@@ -1205,9 +1270,12 @@ impl BridgeService {
                     Ok(binding) => {
                         self.database.mark_inbound_kind(message_id, "ahp_switch")?;
                         Ok(Some(format!(
-                            "正在切换到 {}：{}（generation {}）。",
+                            "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
                             session.short_code.as_deref().unwrap_or("[unknown]"),
                             session.title,
+                            ahp_session_target_workspace(&self.config, &session)
+                                .expect("filtered target workspace")
+                                .display(),
                             binding.generation
                         )))
                     }
@@ -1215,9 +1283,7 @@ impl BridgeService {
                         tracing::warn!(error = %error, "AHP Session switch rejected");
                         self.database
                             .mark_inbound_kind(message_id, "ahp_switch_rejected")?;
-                        Ok(Some(
-                            "当前 Turn、排队消息或审批尚未结束，暂不能切换 Session。".to_owned(),
-                        ))
+                        Ok(Some("当前绑定或目标 Session 正忙，暂不能切换。".to_owned()))
                     }
                 }
             }
@@ -1247,12 +1313,80 @@ impl BridgeService {
                             .ahp_submit_input(&input.input_key, command, message_id)?;
                     self.database.mark_inbound_kind(message_id, "ahp_answer")?;
                     return Ok(Some(if accepted {
-                        format!("已回答 Agent 问题 {}。", input.short_code)
+                        format!(
+                            "问题 {} 的回答已提交给 Agent Host，等待确认。",
+                            input.short_code
+                        )
                     } else {
                         format!("问题 {} 已由另一端处理。", input.short_code)
                     }));
                 }
                 self.queue_ahp_owner_message(message_id, command)
+            }
+        }
+    }
+
+    async fn process_owner_voice_message(
+        &self,
+        message_id: &str,
+        transcript: Option<&str>,
+    ) -> Result<Option<String>> {
+        if !self.config.qq.voice_input_enabled {
+            self.database
+                .mark_inbound_kind(message_id, "voice_disabled")?;
+            return Ok(Some(
+                "语音输入尚未启用，请在配置中设置 qq.voice_input_enabled = true。".to_owned(),
+            ));
+        }
+        let Some(transcript) = transcript.map(str::trim).filter(|value| !value.is_empty()) else {
+            self.database
+                .mark_inbound_kind(message_id, "voice_asr_missing")?;
+            return Ok(Some(
+                "未获取到 QQ 内置语音识别结果，请重新录制较短、清晰的语音，或改发文字。".to_owned(),
+            ));
+        };
+        if !self.config.ahp.enabled {
+            self.database
+                .mark_inbound_kind(message_id, "voice_unsupported_mode")?;
+            return Ok(Some(
+                "语音输入仅支持 AHP 共享会话；Legacy 控制命令请使用文字发送。".to_owned(),
+            ));
+        }
+        if transcript.chars().count() > 4_000 || contains_secret_value(transcript) {
+            self.database
+                .mark_inbound_kind(message_id, "ahp_voice_rejected")?;
+            return Ok(Some(
+                "语音识别结果过长或包含疑似 Secret，已拒绝。".to_owned(),
+            ));
+        }
+        if let Some(input) = self.database.ahp_pending_input()? {
+            let accepted =
+                self.database
+                    .ahp_submit_input(&input.input_key, transcript, message_id)?;
+            self.database
+                .mark_inbound_kind(message_id, "ahp_voice_answer")?;
+            return Ok(Some(if accepted {
+                format!(
+                    "语音回答已提交给 Agent Host，等待确认（问题 {}）：\n{transcript}",
+                    input.short_code
+                )
+            } else {
+                format!("问题 {} 已由另一端处理。", input.short_code)
+            }));
+        }
+        match self.database.ahp_enqueue_message(message_id, transcript) {
+            Ok(_) => {
+                self.database
+                    .mark_inbound_kind(message_id, "ahp_voice_message")?;
+                Ok(Some(format!("已识别并发送到共享会话：\n{transcript}")))
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "AHP voice message rejected");
+                self.database
+                    .mark_inbound_kind(message_id, "ahp_voice_rejected")?;
+                Ok(Some(
+                    "共享 AHP Session 尚未绑定或 Adapter 未就绪，请先在本机完成绑定。".to_owned(),
+                ))
             }
         }
     }
@@ -1769,11 +1903,11 @@ impl BridgeService {
             .filter(|session| ahp_session_matches_workspace(&self.config, session))
             .collect();
         if sessions.is_empty() {
-            return Ok(Some("当前共享工作区没有可切换的 AHP Session。".to_owned()));
+            return Ok(Some("目标目录中没有可展示的 AHP Session。".to_owned()));
         }
         if sessions.len() > 100 {
             return Ok(Some(
-                "当前工作区超过 100 个 Session，QQ 单条命令最多被动回复 4 次，无法安全展示全部按钮；请先归档旧 Session。"
+                "目标目录中超过 100 个 Session，QQ 单条命令最多被动回复 4 次，无法安全展示全部按钮；请先归档旧 Session。"
                     .to_owned(),
             ));
         }
@@ -1808,13 +1942,23 @@ impl BridgeService {
                     let current = binding
                         .as_ref()
                         .is_some_and(|binding| binding.session_uri == button.session.session_uri);
+                    let state = if current {
+                        "当前"
+                    } else if ahp_session_is_idle(&button.session) {
+                        "可切换"
+                    } else {
+                        "忙碌"
+                    };
+                    let workspace = ahp_session_target_workspace(&self.config, &button.session)
+                        .expect("filtered target workspace");
                     format!(
-                        "{} `{}` {}",
-                        if current { "当前" } else { "可选" },
+                        "{} `{}` {} · {}",
+                        state,
                         escape_qq_markdown(
                             button.session.short_code.as_deref().unwrap_or("[unknown]")
                         ),
-                        escape_qq_markdown(&button.session.title)
+                        escape_qq_markdown(&button.session.title),
+                        escape_qq_markdown(&workspace.display().to_string())
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1836,7 +1980,7 @@ impl BridgeService {
                     &owner.user_openid,
                     &ChoiceButtons {
                         markdown: format!(
-                            "## 切换 AHP Session（{}/{page_count}）\n{session_lines}\n\n仅在当前 Session 空闲时可切换；按钮有效期 {} 秒。",
+                            "## 切换 AHP Session（{}/{page_count}）\n{session_lines}\n\n当前绑定和目标 Session 均空闲时可切换；按钮有效期 {} 秒。",
                             page_index + 1,
                             self.config.bridge.question_ttl_seconds
                         ),
@@ -2178,20 +2322,8 @@ impl BridgeService {
     fn validate_ahp_session_workspace(&self, endpoint_id: &str, session_uri: &str) -> Result<()> {
         validate_identifier("endpoint_id", endpoint_id)?;
         validate_identifier("session_uri", session_uri)?;
-        let configured_workspace = self
-            .config
-            .ahp
-            .shared_workspace
-            .as_ref()
-            .context("AHP shared workspace is not configured")?;
-        if !self
-            .config
-            .bridge
-            .workspace_roots
-            .iter()
-            .any(|root| path_is_within(configured_workspace, root))
-        {
-            bail!("AHP shared workspace is outside the configured workspace roots");
+        if self.config.ahp.shared_workspaces.is_empty() {
+            bail!("AHP target workspaces are not configured");
         }
         let session = self
             .database
@@ -2201,17 +2333,8 @@ impl BridgeService {
                 session.endpoint_id == endpoint_id && session.session_uri == session_uri
             })
             .context("AHP session is not present in the current catalogue")?;
-        let matches_workspace = session.workspace_uris.iter().any(|workspace_uri| {
-            url::Url::parse(workspace_uri)
-                .ok()
-                .and_then(|url| url.to_file_path().ok())
-                .is_some_and(|path| {
-                    path_is_within(&path, configured_workspace)
-                        && path_is_within(configured_workspace, &path)
-                })
-        });
-        if !matches_workspace {
-            bail!("AHP session does not target the configured shared workspace");
+        if ahp_session_target_workspace(&self.config, &session).is_none() {
+            bail!("AHP session does not target a configured workspace");
         }
         Ok(())
     }
@@ -2589,10 +2712,11 @@ fn ahp_help_text() -> String {
     [
         "AHP 双端共享会话命令:",
         "普通文本：发送到共享对话；若 Agent 正等待澄清，则优先作为回答",
+        "QQ 语音：使用内置 ASR；优先回答澄清，否则发送到共享对话；不会执行控制命令",
         "/ask <文本>：即使存在澄清问题，也把文本排队为新消息",
-        "/sessions：列出共享工作区内可切换的 Session",
+        "/sessions：列出所有目标目录内的 Session",
         "/switch：显示 Session 切换按钮",
-        "/switch <编号>：文本兜底，仅在当前 Session 空闲时切换",
+        "/switch <编号>：文本兜底，仅在当前绑定和目标 Session 均空闲时切换",
         "/allow <审批码>：单次批准",
         "/deny <审批码>：拒绝",
         "/answer <问题码> <文本>：显式回答 Agent 问题",
@@ -2613,18 +2737,28 @@ fn format_ahp_sessions(
         .filter(|session| ahp_session_matches_workspace(config, session))
         .collect();
     if visible.is_empty() {
-        return "当前共享工作区没有可绑定的 AHP Session。".to_owned();
+        return "目标目录中没有可绑定的 AHP Session。".to_owned();
     }
     let lines = visible
         .into_iter()
         .map(|session| {
             let current = binding.is_some_and(|binding| binding.session_uri == session.session_uri);
+            let state = if current {
+                "当前"
+            } else if ahp_session_is_idle(session) {
+                "可切换"
+            } else {
+                "忙碌"
+            };
+            let workspace =
+                ahp_session_target_workspace(config, session).expect("filtered target workspace");
             format!(
-                "{} {} | {} | {}",
+                "{} {} | {} | {} | {}",
                 if current { "*" } else { " " },
                 session.short_code.as_deref().unwrap_or("[unknown]"),
                 session.title,
-                if current { "当前" } else { "可切换" }
+                workspace.display(),
+                state
             )
         })
         .collect::<Vec<_>>()
@@ -2633,18 +2767,33 @@ fn format_ahp_sessions(
 }
 
 fn ahp_session_matches_workspace(config: &AppConfig, session: &AhpSessionDescriptor) -> bool {
-    let Some(configured_workspace) = config.ahp.shared_workspace.as_ref() else {
-        return false;
-    };
-    session.workspace_uris.iter().any(|workspace_uri| {
-        url::Url::parse(workspace_uri)
-            .ok()
-            .and_then(|url| url.to_file_path().ok())
-            .is_some_and(|path| {
-                path_is_within(&path, configured_workspace)
-                    && path_is_within(configured_workspace, &path)
+    ahp_session_target_workspace(config, session).is_some()
+}
+
+fn ahp_session_target_workspace<'a>(
+    config: &'a AppConfig,
+    session: &AhpSessionDescriptor,
+) -> Option<&'a Path> {
+    config.ahp.shared_workspaces.iter().find_map(|configured| {
+        session
+            .workspace_uris
+            .iter()
+            .any(|workspace_uri| {
+                url::Url::parse(workspace_uri)
+                    .ok()
+                    .and_then(|url| url.to_file_path().ok())
+                    .is_some_and(|path| {
+                        path_is_within(&path, configured) && path_is_within(configured, &path)
+                    })
             })
+            .then_some(configured.as_path())
     })
+}
+
+fn ahp_session_is_idle(session: &AhpSessionDescriptor) -> bool {
+    const IDLE: u32 = 1;
+    const IN_PROGRESS: u32 = 1 << 3;
+    session.status & IDLE != 0 && session.status & IN_PROGRESS == 0
 }
 
 fn help_text() -> String {
@@ -2741,6 +2890,179 @@ mod tests {
         .expect("permission result");
         assert_eq!(result.decision, PermissionDecision::Allow);
         assert!(session_label.starts_with('S'));
+    }
+
+    #[tokio::test]
+    async fn voice_transcript_is_queued_without_executing_control_command() {
+        use crate::protocol::AhpCommandKind;
+
+        let fixture = Fixture::new_ahp_with_voice_input(true);
+        fixture
+            .service
+            .handle_inbound_voice_message("voice-message-1", "owner-openid", Some("/allow ABC123"))
+            .await
+            .expect("voice message");
+
+        let commands = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, AhpCommandKind::SendMessage);
+        assert_eq!(commands[0].data["content"], "/allow ABC123");
+        assert!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .last()
+                .expect("voice reply")
+                .content
+                .contains("已识别并发送")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_transcript_answers_pending_freeform_question() {
+        use crate::protocol::AhpCommandKind;
+
+        let fixture = Fixture::new_ahp_with_voice_input(true);
+        let input = fixture
+            .service
+            .database()
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "voice-input-1".to_owned(),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: "ahp-chat://default/session-1".to_owned(),
+                request_id: "voice-request-1".to_owned(),
+                prompt: "Choose or enter a response".to_owned(),
+                choices: vec!["选项 A".to_owned(), "选项 B".to_owned()],
+                allow_freeform: true,
+                selection_mode: "single".to_owned(),
+                expires_at: Utc::now().timestamp() + 600,
+            })
+            .expect("pending input");
+        fixture
+            .service
+            .handle_inbound_voice_message("voice-answer-1", "owner-openid", Some("今天是星期几？"))
+            .await
+            .expect("voice answer");
+
+        let commands = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, AhpCommandKind::CompleteInput);
+        assert_eq!(commands[0].data["answer"], "今天是星期几？");
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_input_by_code(&input.record.short_code)
+                .expect("input")
+                .expect("stored input")
+                .state,
+            "submitted"
+        );
+        assert!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .last()
+                .expect("voice reply")
+                .content
+                .contains("等待确认")
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_without_builtin_asr_prompts_owner_without_queueing() {
+        let fixture = Fixture::new_ahp_with_voice_input(true);
+        fixture
+            .service
+            .handle_inbound_voice_message("voice-message-2", "owner-openid", None)
+            .await
+            .expect("voice message");
+
+        assert!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .last()
+                .expect("voice reply")
+                .content
+                .contains("未获取到 QQ 内置语音识别结果")
+        );
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_input_is_disabled_by_default() {
+        let fixture = Fixture::new_ahp();
+        fixture
+            .service
+            .handle_inbound_voice_message(
+                "voice-message-3",
+                "owner-openid",
+                Some("检查当前项目状态"),
+            )
+            .await
+            .expect("voice message");
+
+        assert!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .last()
+                .expect("voice reply")
+                .content
+                .contains("语音输入尚未启用")
+        );
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_owner_voice_input_is_ignored() {
+        let fixture = Fixture::new_ahp_with_voice_input(true);
+        fixture
+            .service
+            .handle_inbound_voice_message(
+                "voice-message-4",
+                "attacker-openid",
+                Some("检查当前项目状态"),
+            )
+            .await
+            .expect("voice message");
+
+        assert!(fixture.qq.messages().await.is_empty());
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("commands")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3162,8 +3484,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_command_sends_buttons_and_click_switches_session() {
-        let fixture = Fixture::new_ahp();
+    async fn switch_menu_lists_directories_and_switches_across_workspaces() {
+        let fixture = Fixture::new_ahp_multi_workspace();
         let host = AhpHostDescriptor {
             endpoint_id: "endpoint-1".to_owned(),
             host_instance_id: "host-1".to_owned(),
@@ -3174,6 +3496,18 @@ mod tests {
         };
         let workspace_uri = url::Url::from_file_path(&fixture.workspace)
             .expect("workspace URI")
+            .to_string();
+        let other_workspace = fixture
+            .other_workspace
+            .as_ref()
+            .expect("other target workspace");
+        let other_workspace_uri = url::Url::from_file_path(other_workspace)
+            .expect("other workspace URI")
+            .to_string();
+        let outside_workspace = fixture._directory.path().join("outside-workspace");
+        fs::create_dir(&outside_workspace).expect("outside workspace");
+        let outside_workspace_uri = url::Url::from_file_path(&outside_workspace)
+            .expect("outside workspace URI")
             .to_string();
         let sessions = vec![
             AhpSessionDescriptor {
@@ -3196,9 +3530,37 @@ mod tests {
                 provider: "copilot".to_owned(),
                 title: "Second".to_owned(),
                 status: 1,
-                workspace_uris: vec![workspace_uri],
+                workspace_uris: vec![other_workspace_uri],
                 created_at: "2026-08-27T00:01:00Z".to_owned(),
                 modified_at: "2026-08-27T00:01:00Z".to_owned(),
+            },
+            AhpSessionDescriptor {
+                short_code: None,
+                endpoint_id: "endpoint-1".to_owned(),
+                host_instance_id: "host-1".to_owned(),
+                session_uri: "copilot:/outside-session".to_owned(),
+                provider: "copilot".to_owned(),
+                title: "Outside".to_owned(),
+                status: 1,
+                workspace_uris: vec![outside_workspace_uri],
+                created_at: "2026-08-27T00:02:00Z".to_owned(),
+                modified_at: "2026-08-27T00:02:00Z".to_owned(),
+            },
+            AhpSessionDescriptor {
+                short_code: None,
+                endpoint_id: "endpoint-1".to_owned(),
+                host_instance_id: "host-1".to_owned(),
+                session_uri: "copilot:/busy-session".to_owned(),
+                provider: "copilot".to_owned(),
+                title: "Busy".to_owned(),
+                status: 1 << 3,
+                workspace_uris: vec![
+                    url::Url::from_file_path(other_workspace)
+                        .expect("busy workspace URI")
+                        .to_string(),
+                ],
+                created_at: "2026-08-27T00:03:00Z".to_owned(),
+                modified_at: "2026-08-27T00:03:00Z".to_owned(),
             },
         ];
         fixture
@@ -3211,6 +3573,19 @@ mod tests {
                 &sessions,
             )
             .expect("catalogue");
+        let listing = fixture
+            .service
+            .process_ahp_owner_message("session-list-message", "/sessions")
+            .await
+            .expect("session list")
+            .expect("session list response");
+        assert!(listing.contains(&fixture.workspace.display().to_string()));
+        assert!(listing.contains(&other_workspace.display().to_string()));
+        assert!(listing.contains("First"));
+        assert!(listing.contains("Second"));
+        assert!(listing.contains("Busy"));
+        assert!(listing.contains("忙碌"));
+        assert!(!listing.contains("Outside"));
         assert!(
             fixture
                 .service
@@ -3231,6 +3606,10 @@ mod tests {
             menu.reply_to_message_id.as_deref(),
             Some("switch-menu-message")
         );
+        assert!(menu.content.contains("workspace"));
+        assert!(menu.content.contains("other-workspace"));
+        assert!(menu.content.contains("忙碌"));
+        assert!(!menu.content.contains("Outside"));
 
         let session_uris = vec![
             "copilot:/session-1".to_owned(),
@@ -3273,11 +3652,23 @@ mod tests {
             .expect("bound");
         assert_eq!(binding.session_uri, "copilot:/session-2");
         assert_eq!(binding.state, "binding");
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .binding
+                .expect("single binding")
+                .session_uri,
+            "copilot:/session-2"
+        );
     }
 
     struct Fixture {
         _directory: tempfile::TempDir,
         workspace: PathBuf,
+        other_workspace: Option<PathBuf>,
         service: Arc<BridgeService>,
         qq: Arc<MockQqMessenger>,
     }
@@ -3314,26 +3705,51 @@ mod tests {
             Self {
                 _directory: directory,
                 workspace,
+                other_workspace: None,
                 service,
                 qq,
             }
         }
 
         fn new_ahp() -> Self {
+            Self::new_ahp_with_voice_input(false)
+        }
+
+        fn new_ahp_multi_workspace() -> Self {
+            Self::new_ahp_with_options(false, true)
+        }
+
+        fn new_ahp_with_voice_input(voice_input_enabled: bool) -> Self {
+            Self::new_ahp_with_options(voice_input_enabled, false)
+        }
+
+        fn new_ahp_with_options(voice_input_enabled: bool, multi_workspace: bool) -> Self {
             let directory = tempfile::tempdir().expect("tempdir");
             let workspace = directory.path().join("workspace");
+            let other_workspace = directory.path().join("other-workspace");
             let config_directory = directory.path().join("config");
             fs::create_dir_all(workspace.join("src")).expect("workspace");
+            if multi_workspace {
+                fs::create_dir_all(other_workspace.join("src")).expect("other workspace");
+            }
             fs::create_dir_all(&config_directory).expect("config directory");
             let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+            let other_workspace = multi_workspace
+                .then(|| fs::canonicalize(other_workspace).expect("canonical other workspace"));
             let config_path = config_directory.join("config.toml");
-            let mut config =
-                AppConfig::write_new(&config_path, vec![workspace.clone()]).expect("config");
+            let mut workspace_roots = vec![workspace.clone()];
+            workspace_roots.extend(other_workspace.iter().cloned());
+            let mut config = AppConfig::write_new(&config_path, workspace_roots).expect("config");
             config.qq.app_id = "app-1".to_owned();
             config.qq.approval_buttons_enabled = true;
+            config.qq.voice_input_enabled = voice_input_enabled;
             config.qq.intents |= 1_u64 << 26;
             config.ahp.enabled = true;
-            config.ahp.shared_workspace = Some(workspace.clone());
+            config.ahp.shared_workspaces = vec![workspace.clone()];
+            config
+                .ahp
+                .shared_workspaces
+                .extend(other_workspace.iter().cloned());
             let database = Database::open(&config.bridge.database_path).expect("database");
             let code = database.create_binding_code(600).expect("binding code");
             assert_eq!(
@@ -3418,6 +3834,7 @@ mod tests {
             Self {
                 _directory: directory,
                 workspace,
+                other_workspace,
                 service,
                 qq,
             }

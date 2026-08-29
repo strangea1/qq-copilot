@@ -84,20 +84,26 @@ npm run build --prefix vscode-extension
 
 ## 6. 安装
 
-示例使用 `C:\test` 作为共享工作区：
-
-```powershell
-.\scripts\install.ps1 `
-  -Workspace "C:\test" `
-  -AhpWorkspace "C:\test"
-```
-
-如果还要允许其他工作区：
+示例同时配置两个 QQ 可见的目标目录：
 
 ```powershell
 .\scripts\install.ps1 `
   -Workspace "C:\test","C:\src\another-project" `
-  -AhpWorkspace "C:\test"
+  -AhpWorkspace "C:\test","C:\src\another-project"
+```
+
+`-Workspace` 设置安全允许根目录，`-AhpWorkspace` 设置 QQ 可见的精确目标目录。每个
+AHP 目标目录也会自动加入安全允许根目录。升级已有安装时，应向 `-AhpWorkspace`
+传入希望保留的完整目标目录列表；该参数会重设 AHP 目标列表，而不是只追加本次参数。
+
+读取旧配置后，单值 `ahp.shared_workspace` 会在下一次保存时自动迁移为：
+
+```toml
+[ahp]
+shared_workspaces = [
+    'C:\test',
+    'C:\src\another-project',
+]
 ```
 
 默认安装位置：
@@ -126,6 +132,7 @@ app_id = "你的 QQ Bot AppID"
 app_secret_source = "credential_manager"
 intents = 100663296
 approval_buttons_enabled = true
+voice_input_enabled = true
 ```
 
 不要把 AppSecret 写入 TOML。交互式存入 Windows Credential Manager：
@@ -139,6 +146,11 @@ approval_buttons_enabled = true
 ```text
 QQ AppSecret stored and verified in Windows Credential Manager.
 ```
+
+`voice_input_enabled = true` 启用 QQ 私聊语音输入。Bridge 使用
+`C2C_MESSAGE_CREATE.attachments[].asr_refer_text` 中的 QQ 内置 ASR 结果，不需要
+腾讯云 ASR 凭证，也不会下载或保存原始语音。语音结果只作为普通共享会话输入或澄清
+回答；审批、取消和 Session 切换仍要求文字命令或按钮。
 
 ## 8. 启动与 Owner 绑定
 
@@ -175,11 +187,35 @@ Developer: Reload Window
 QQ AHP 已连接
 ```
 
-## 10. 创建并绑定 Session
+## 10. 增加目标目录并绑定 Session
+
+安装后增加目录时，使用托管脚本完成路径规范化、存在性校验、配置去重、安全空闲检查和
+Bridge/Adapter 重启。`-Workspace` 接受一个或多个目录：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\add-workspace.ps1" `
+  -Workspace "C:\src\project-a","C:\src\project-b"
+```
+
+目标目录按精确路径匹配；只添加共同父目录不会展示其子目录中的 Session。脚本要求
+Bridge 正在运行且已配置 AHP，并会拒绝在当前 Turn、排队消息或 Adapter 命令未结束时
+重启。
+
+只需要写入配置并稍后手动重启时，可运行：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" `
+  add-workspace `
+  --workspace "C:\src\project-a" `
+  --workspace "C:\src\project-b"
+
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\switch-vscode-integration.ps1" `
+  -Mode Ahp
+```
 
 1. 运行 `code --agents`。
 2. 在 Agents Window 新建 Copilot Session。
-3. 工作目录选择 `C:\test`。
+3. 工作目录选择任一 `ahp.shared_workspaces` 精确目标目录。
 4. 提交并完成至少一轮消息。
 5. 列出 Session：
 
@@ -197,6 +233,14 @@ QQ AHP 已连接
 
 绑定完成后，QQ 发送普通文本即可进入同一个 Session。
 
+QQ `/sessions` 的示例输出：
+
+```text
+AHP Sessions:
+* APYZB | Clone and deploy qq-copilot | D:\work\vscode\qq-copilot | 当前
+  AZ49U | 接入GitHub Copilot功能实现 | D:\work\vscode\CodexPlusPlus | 可切换
+```
+
 ## 11. Session 切换
 
 QQ 中发送：
@@ -205,12 +249,14 @@ QQ 中发送：
 /switch
 ```
 
-Bot 会展示共享工作区内全部可用 Session 按钮。只有满足以下条件时才允许切换：
+Bot 会同时展示所有目标目录内的 Session、完整所在目录及空闲状态。任一时刻数据库中只
+有一个活动绑定。只有满足以下条件时才允许切换：
 
 - 当前 Turn 已结束。
 - 没有排队消息。
 - 没有 Pending 审批。
 - 没有 Pending 澄清输入。
+- 目标 Session 处于空闲状态。
 
 文本兜底：
 
@@ -219,12 +265,15 @@ Bot 会展示共享工作区内全部可用 Session 按钮。只有满足以下�
 /switch <Session短码>
 ```
 
-短码会跨 Adapter 重启保持稳定。单页最多 25 个 Session，最多 4 页。
+短码会跨 Adapter 重启保持稳定。单页最多 25 个 Session，最多 4 页；非目标目录的
+Session 不会显示，也不能通过旧按钮切换。按钮标签仍只使用短码，目录显示在按钮上方的
+Session 清单中。
 
 ## 12. QQ 命令
 
 ```text
 普通文本
+QQ 私聊语音
 /ask <文本>
 /sessions
 /switch
@@ -273,7 +322,7 @@ typing_refresh_seconds = 45
 1. 备份 `%LOCALAPPDATA%\CopilotQQBridge`。
 2. 保留 Windows Credential Manager 中的 AppSecret。
 3. 运行完整测试。
-4. 重新执行安装脚本。
+4. 重新执行安装脚本，并向 `-AhpWorkspace` 传入要保留的完整目标目录列表。
 5. 重载 VS Code。
 6. 验证 `qq-bridge status` 中：
    - `qq_gateway.state = connected`
@@ -321,7 +370,17 @@ VS Code 自动升级后如果 AHP Schema 不兼容，Adapter 会对相关 Host �
 
 - 确保使用独立 Agents Window，而不是普通 Chat 面板。
 - 确保 Session 完成过至少一轮消息。
-- 确保 Session 工作目录与 `ahp.shared_workspace` 一致。
+- 确保 Session 工作目录与 `ahp.shared_workspaces` 中某个目标目录精确一致。
+- 不要只配置共同父目录；每个实际 Session 目录都需要单独加入目标列表。
+- 运行 `qq-bridge ahp-sessions`，确认 Adapter 已发现该 Session 及其 `workspace_uris`。
+- 新增目录后若使用的是 `qq-bridge add-workspace`，需要重启 Bridge/Adapter。
+
+### Session 无法切换
+
+- 当前绑定必须没有活动 Turn、排队消息、Pending 审批或 Pending 澄清。
+- 目标 Session 必须处于空闲状态；`/sessions` 和 `/switch` 会标为“可切换”或“忙碌”。
+- 配置变更、Session 目录变更、按钮过期或重复点击后，应重新发送 `/switch` 生成菜单。
+- Bridge 数据库只有一个绑定槽位；成功切换会替换旧绑定，不会同时绑定多个 Session。
 
 ### QQ 按钮不可用
 

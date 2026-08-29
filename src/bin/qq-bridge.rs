@@ -46,12 +46,16 @@ enum Command {
     },
     AhpUnbind,
     ConfigureAhp {
-        #[arg(long)]
-        workspace: PathBuf,
+        #[arg(long = "workspace", required = true)]
+        workspaces: Vec<PathBuf>,
         #[arg(long)]
         node: PathBuf,
         #[arg(long)]
         adapter_script: PathBuf,
+    },
+    AddWorkspace {
+        #[arg(long = "workspace", required = true)]
+        workspaces: Vec<PathBuf>,
     },
     SetMode {
         mode: IntegrationMode,
@@ -110,10 +114,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::ConfigureAhp {
-            workspace,
+            workspaces,
             node,
             adapter_script,
-        } => configure_ahp(&config_path, &workspace, &node, &adapter_script),
+        } => configure_ahp(&config_path, workspaces, &node, &adapter_script),
+        Command::AddWorkspace { workspaces } => add_workspaces(&config_path, workspaces),
         Command::SetMode { mode } => set_mode(&config_path, mode),
         Command::NewBindCode => {
             let result = admin_call(&config_path, BridgeRequest::NewBindCode).await?;
@@ -155,17 +160,7 @@ async fn main() -> Result<()> {
 }
 
 fn initialize(config_path: &Path, workspaces: Vec<PathBuf>) -> Result<()> {
-    let mut canonical_workspaces = Vec::with_capacity(workspaces.len());
-    for workspace in workspaces {
-        let workspace = std::fs::canonicalize(&workspace)
-            .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
-        if !workspace.is_dir() {
-            bail!("workspace is not a directory: {}", workspace.display());
-        }
-        canonical_workspaces.push(workspace);
-    }
-    canonical_workspaces.sort();
-    canonical_workspaces.dedup();
+    let canonical_workspaces = canonicalize_workspaces(workspaces)?;
     AppConfig::write_new(config_path, canonical_workspaces)?;
     if let Err(error) = restrict_config_permissions(config_path) {
         let _ = std::fs::remove_file(config_path);
@@ -276,13 +271,12 @@ async fn run(config_path: &Path) -> Result<()> {
 
 fn configure_ahp(
     config_path: &Path,
-    workspace: &Path,
+    workspaces: Vec<PathBuf>,
     node: &Path,
     adapter_script: &Path,
 ) -> Result<()> {
     let mut config = AppConfig::load(config_path)?;
-    let workspace = std::fs::canonicalize(workspace)
-        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
+    let workspaces = canonicalize_workspaces(workspaces)?;
     let node = process_path(node)
         .with_context(|| format!("failed to resolve Node executable {}", node.display()))?;
     let adapter_script = process_path(adapter_script).with_context(|| {
@@ -291,16 +285,18 @@ fn configure_ahp(
             adapter_script.display()
         )
     })?;
-    if !config
-        .bridge
-        .workspace_roots
-        .iter()
-        .any(|root| path_is_within(&workspace, root))
-    {
-        bail!("AHP workspace is not covered by bridge.workspace_roots");
+    for workspace in &workspaces {
+        if !config
+            .bridge
+            .workspace_roots
+            .iter()
+            .any(|root| path_is_within(workspace, root))
+        {
+            config.bridge.workspace_roots.push(workspace.clone());
+        }
     }
     config.ahp.enabled = true;
-    config.ahp.shared_workspace = Some(workspace);
+    config.ahp.shared_workspaces = workspaces;
     config.ahp.adapter_auto_start = true;
     config.ahp.node_executable = Some(node);
     config.ahp.adapter_script = Some(adapter_script);
@@ -308,7 +304,69 @@ fn configure_ahp(
     config.qq.intents |= 1_u64 << 26;
     config.save(config_path)?;
     println!("AHP mode configured. Restart qq-bridge to start the Adapter.");
+    print_target_workspaces(&config);
     Ok(())
+}
+
+fn add_workspaces(config_path: &Path, workspaces: Vec<PathBuf>) -> Result<()> {
+    let mut config = AppConfig::load(config_path)?;
+    let workspaces = canonicalize_workspaces(workspaces)?;
+    let mut added = 0_usize;
+
+    for workspace in workspaces {
+        if !config
+            .bridge
+            .workspace_roots
+            .iter()
+            .any(|root| path_is_within(&workspace, root))
+        {
+            config.bridge.workspace_roots.push(workspace.clone());
+        }
+        if !config
+            .ahp
+            .shared_workspaces
+            .iter()
+            .any(|configured| paths_equal(configured, &workspace))
+        {
+            config.ahp.shared_workspaces.push(workspace);
+            added += 1;
+        }
+    }
+
+    config.save(config_path)?;
+    println!("Added {added} target workspace(s).");
+    print_target_workspaces(&config);
+    println!("Restart qq-bridge and the AHP Adapter to apply the updated target list.");
+    Ok(())
+}
+
+fn canonicalize_workspaces(workspaces: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut canonical_workspaces: Vec<PathBuf> = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        let workspace = process_path(&workspace)
+            .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
+        if !workspace.is_dir() {
+            bail!("workspace is not a directory: {}", workspace.display());
+        }
+        if !canonical_workspaces
+            .iter()
+            .any(|configured| paths_equal(configured, &workspace))
+        {
+            canonical_workspaces.push(workspace);
+        }
+    }
+    Ok(canonical_workspaces)
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    path_is_within(left, right) && path_is_within(right, left)
+}
+
+fn print_target_workspaces(config: &AppConfig) {
+    println!("AHP target workspaces:");
+    for workspace in &config.ahp.shared_workspaces {
+        println!("- {}", workspace.display());
+    }
 }
 
 fn set_mode(config_path: &Path, mode: IntegrationMode) -> Result<()> {
@@ -410,4 +468,36 @@ fn restrict_config_permissions(config_path: &Path) -> Result<()> {
 #[cfg(not(windows))]
 fn restrict_config_permissions(_config_path: &Path) -> Result<()> {
     bail!("this project supports only Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_workspaces_authorizes_targets_and_deduplicates_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).expect("first workspace");
+        std::fs::create_dir(&second).expect("second workspace");
+        AppConfig::write_new(&config_path, vec![first.clone()]).expect("config");
+
+        add_workspaces(
+            &config_path,
+            vec![first.clone(), second.clone(), second.clone()],
+        )
+        .expect("add workspaces");
+
+        let config = AppConfig::load(&config_path).expect("load config");
+        assert_eq!(config.ahp.shared_workspaces, vec![first, second.clone()]);
+        assert!(
+            config
+                .bridge
+                .workspace_roots
+                .iter()
+                .any(|root| paths_equal(root, &second))
+        );
+    }
 }

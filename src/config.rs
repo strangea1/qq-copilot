@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rand::{RngCore, rngs::OsRng};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::security::path_is_within;
 
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
@@ -67,6 +69,8 @@ pub struct QqConfig {
     pub token_refresh_skew_seconds: u64,
     #[serde(default)]
     pub approval_buttons_enabled: bool,
+    #[serde(default)]
+    pub voice_input_enabled: bool,
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,8 +85,12 @@ pub enum AppSecretSource {
 pub struct AhpConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub shared_workspace: Option<PathBuf>,
+    #[serde(
+        default,
+        alias = "shared_workspace",
+        deserialize_with = "deserialize_path_or_paths"
+    )]
+    pub shared_workspaces: Vec<PathBuf>,
     #[serde(default = "default_ahp_event_retention_days")]
     pub event_retention_days: u32,
     #[serde(default = "default_ahp_command_lease_seconds")]
@@ -119,7 +127,7 @@ impl Default for AhpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            shared_workspace: None,
+            shared_workspaces: Vec::new(),
             event_retention_days: default_ahp_event_retention_days(),
             command_lease_seconds: default_ahp_command_lease_seconds(),
             poll_seconds: default_ahp_poll_seconds(),
@@ -208,6 +216,7 @@ impl AppConfig {
                 intents: default_intents(),
                 token_refresh_skew_seconds: default_token_refresh_skew_seconds(),
                 approval_buttons_enabled: false,
+                voice_input_enabled: false,
             },
             ahp: AhpConfig::default(),
             policy: PolicyConfig::default(),
@@ -258,13 +267,24 @@ impl AppConfig {
             bail!("QQ approval buttons require INTERACTION intent (1 << 26)");
         }
         if self.ahp.enabled {
-            let workspace = self
-                .ahp
-                .shared_workspace
-                .as_ref()
-                .context("ahp.shared_workspace is required when AHP is enabled")?;
-            if !workspace.is_absolute() {
-                bail!("ahp.shared_workspace must be absolute");
+            if self.ahp.shared_workspaces.is_empty() {
+                bail!("ahp.shared_workspaces requires at least one path when AHP is enabled");
+            }
+            for workspace in &self.ahp.shared_workspaces {
+                if !workspace.is_absolute() {
+                    bail!("ahp.shared_workspaces paths must be absolute");
+                }
+                if !self
+                    .bridge
+                    .workspace_roots
+                    .iter()
+                    .any(|root| path_is_within(workspace, root))
+                {
+                    bail!(
+                        "AHP target workspace {} is outside bridge.workspace_roots",
+                        workspace.display()
+                    );
+                }
             }
             if self.ahp.event_retention_days == 0
                 || self.ahp.command_lease_seconds == 0
@@ -488,6 +508,23 @@ fn default_ahp_event_retention_days() -> u32 {
     30
 }
 
+fn deserialize_path_or_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PathOrPaths {
+        One(PathBuf),
+        Many(Vec<PathBuf>),
+    }
+
+    Ok(match PathOrPaths::deserialize(deserializer)? {
+        PathOrPaths::One(path) => vec![path],
+        PathOrPaths::Many(paths) => paths,
+    })
+}
+
 fn default_ahp_command_lease_seconds() -> u64 {
     60
 }
@@ -598,7 +635,62 @@ mod tests {
         assert_eq!(config.bridge.ipc_token.len(), 64);
         assert_eq!(config.bridge.workspace_roots, vec![root]);
         assert!(config.bridge.database_path.is_absolute());
+        assert!(!config.qq.voice_input_enabled);
         AppConfig::load(&config_path).expect("reload config");
+    }
+
+    #[test]
+    fn loads_legacy_shared_workspace_and_migrates_on_save() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let mut config =
+            AppConfig::write_new(&config_path, vec![workspace.clone()]).expect("new config");
+        config.ahp.enabled = true;
+        config.ahp.shared_workspaces = vec![workspace.clone()];
+
+        let mut legacy = toml::Value::try_from(&config).expect("serialize config");
+        let ahp = legacy
+            .get_mut("ahp")
+            .and_then(toml::Value::as_table_mut)
+            .expect("ahp table");
+        let shared_workspaces = ahp
+            .remove("shared_workspaces")
+            .and_then(|value| value.as_array().cloned())
+            .expect("shared workspaces");
+        ahp.insert(
+            "shared_workspace".to_owned(),
+            shared_workspaces.first().cloned().expect("workspace value"),
+        );
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&legacy).expect("legacy TOML"),
+        )
+        .expect("write legacy config");
+
+        let loaded = AppConfig::load(&config_path).expect("load legacy config");
+        assert_eq!(loaded.ahp.shared_workspaces, vec![workspace]);
+        loaded.save(&config_path).expect("save migrated config");
+        let migrated = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(migrated.contains("shared_workspaces = ["));
+        assert!(!migrated.contains("\nshared_workspace ="));
+    }
+
+    #[test]
+    fn rejects_ahp_target_outside_authorized_roots() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let allowed = directory.path().join("allowed");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&allowed).expect("allowed workspace");
+        std::fs::create_dir(&outside).expect("outside workspace");
+        let mut config = AppConfig::write_new(&config_path, vec![allowed]).expect("new config");
+        config.ahp.enabled = true;
+        config.ahp.shared_workspaces = vec![outside];
+
+        let error = config.validate().expect_err("outside target must fail");
+        assert!(error.to_string().contains("outside bridge.workspace_roots"));
     }
 
     #[cfg(windows)]

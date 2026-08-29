@@ -648,14 +648,28 @@ async fn run_gateway_connection(
                                     payload.d.context("C2C message omitted data")?
                                 )
                                 .context("invalid C2C message payload")?;
-                                if let Err(error) = service
-                                    .handle_inbound_message(
-                                        &event.id,
-                                        &event.author.user_openid,
-                                        &event.content,
-                                    )
-                                    .await
-                                {
+                                let voice = event
+                                    .attachments
+                                    .iter()
+                                    .find(|attachment| attachment.content_type == "voice");
+                                let result = if let Some(voice) = voice {
+                                    service
+                                        .handle_inbound_voice_message(
+                                            &event.id,
+                                            &event.author.user_openid,
+                                            voice.asr_refer_text.as_deref(),
+                                        )
+                                        .await
+                                } else {
+                                    service
+                                        .handle_inbound_message(
+                                            &event.id,
+                                            &event.author.user_openid,
+                                            &event.content,
+                                        )
+                                        .await
+                                };
+                                if let Err(error) = result {
                                     tracing::error!(
                                         message_id = %event.id,
                                         error = %error,
@@ -732,8 +746,19 @@ struct GatewayPayload {
 #[derive(Debug, Deserialize)]
 struct C2cMessage {
     id: String,
+    #[serde(default)]
     content: String,
     author: C2cAuthor,
+    #[serde(default)]
+    attachments: Vec<C2cAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct C2cAttachment {
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    asr_refer_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -937,6 +962,42 @@ impl QqMessenger for MockQqMessenger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c2c_voice_attachment_accepts_builtin_asr_without_text_content() {
+        let event: C2cMessage = serde_json::from_value(json!({
+            "id": "voice-message-1",
+            "author": {"user_openid": "owner-openid"},
+            "attachments": [{
+                "content_type": "voice",
+                "url": "https://multimedia.nt.qq.com.cn/download?redacted=1",
+                "voice_wav_url": "https://multimedia.nt.qq.com.cn/download?redacted=2",
+                "asr_refer_text": "检查当前项目状态"
+            }]
+        }))
+        .expect("voice event");
+
+        assert!(event.content.is_empty());
+        let voice = event
+            .attachments
+            .iter()
+            .find(|attachment| attachment.content_type == "voice")
+            .expect("voice attachment");
+        assert_eq!(voice.asr_refer_text.as_deref(), Some("检查当前项目状态"));
+    }
+
+    #[test]
+    fn c2c_voice_attachment_allows_missing_asr_result() {
+        let event: C2cMessage = serde_json::from_value(json!({
+            "id": "voice-message-2",
+            "content": "",
+            "author": {"user_openid": "owner-openid"},
+            "attachments": [{"content_type": "voice"}]
+        }))
+        .expect("voice event");
+
+        assert!(event.attachments[0].asr_refer_text.is_none());
+    }
 
     #[test]
     fn c2c_approval_buttons_defer_identity_to_server_validation() {

@@ -1,7 +1,7 @@
 # VS Code Copilot 与 QQ Bot 远程交互设计
 
-状态：AHP 双客户端模式已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
-日期：2026-08-28<br>
+状态：AHP 双客户端、多目标目录和单绑定切换已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
+日期：2026-08-29<br>
 目标环境：Windows、单个 QQ 单聊用户、VS Code 本地 Agent、当前 Windows 标准用户权限
 
 实现对应关系：
@@ -14,7 +14,7 @@
 - `vscode-extension/`：QQ/AHP 连接与待补发状态栏。
 - `src/db.rs`：SQLite 状态机、去重、幂等和审计。
 - `src/security.rs`：工具分类、工作区边界和 Secret 脱敏。
-- `examples/` 与 `scripts/`：用户级集成模板、安装和登录启动。
+- `examples/` 与 `scripts/`：用户级集成模板、安装、目标目录管理和登录启动。
 
 ## 0. 当前产品架构
 
@@ -30,11 +30,22 @@ flowchart LR
 ```
 
 - Agent Host 是 Session、Chat、Turn 和工具审批的唯一权威状态源。
-- VS Code 与 QQ Adapter 同时订阅同一个已由用户创建并在本机绑定的 Session。
+- VS Code 与 QQ Adapter 同时订阅同一个已由用户创建并在本机绑定的 Session；Bridge
+  数据库使用 singleton binding，任一时刻只绑定一个 Session。
 - PC 或 QQ 消息进入同一 Chat；Agent 忙碌时 QQ 消息使用 AHP queued message。
-- Bridge 为同工作区 Session 分配稳定短码；QQ `/sessions` 文本查看，`/switch`
-  返回全部 Session 的一次性回调按钮，`/switch <code>` 作为文本兜底。active Turn、
-  queued message 或 Pending 交互会阻止切换。每个 Keyboard 最多 25 项，最多 4 页。
+- `bridge.workspace_roots` 定义本地操作安全边界；`ahp.shared_workspaces` 定义 QQ
+  可见的精确目标目录集合。目标目录必须被某个安全根目录覆盖，共同父目录不会隐式包含
+  子目录 Session。
+- Bridge 为所有目标目录中的 Session 分配稳定短码；QQ `/sessions` 同时显示短码、
+  标题、完整目录和空闲状态，`/switch` 返回全部 Session 的一次性回调按钮，
+  `/switch <code>` 作为文本兜底。
+- 切换要求当前绑定没有 active Turn、queued message 或 Pending 交互，并且目标
+  Session 处于 `SessionStatus.Idle`。目录配置变化、Session 目录变化、过期或已使用的
+  按钮都会 fail-closed。每个 Keyboard 最多 25 项，最多 4 页。
+- `qq-bridge add-workspace` 规范化并去重目录，同时追加安全根和 AHP 目标列表；
+  `scripts/add-workspace.ps1` 在确认当前绑定空闲后完成配置和 Bridge/Adapter 重启。
+- 旧的标量 `ahp.shared_workspace` 可读取，配置保存后迁移为
+  `ahp.shared_workspaces = [...]`。
 - PC 或 QQ 首个有效审批/澄清回答生效，Host 终态再广播给另一端。
 - QQ 只提供 Allow once / Deny；PC 可使用原生 Session Allow。
 - Assistant 仅在完整消息形成后推送 QQ；reasoning 和原始工具输出不外发。

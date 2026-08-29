@@ -1,15 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import {
-  ChatInputAnswerState,
-  ChatInputAnswerValueKind,
-  ChatInputQuestionKind,
-  ChatInputResponseKind,
-  SessionInputRequestKind,
-  SUPPORTED_PROTOCOL_VERSIONS,
-  type ChatInputAnswer,
-  type ChatInputQuestion,
-} from "@microsoft/agent-host-protocol";
+import { SUPPORTED_PROTOCOL_VERSIONS } from "@microsoft/agent-host-protocol";
 
 import {
   AhpCore,
@@ -32,6 +23,7 @@ import {
   AhpEventNormalizer,
   type PublishedEvent,
 } from "./event-normalizer.js";
+import { buildInputCompletion } from "./input-completion.js";
 
 const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
@@ -647,139 +639,6 @@ function parseBindingCommand(command: AdapterCommand): BridgeBinding {
     state: "binding",
     last_server_sequence: 0,
   };
-}
-
-function buildInputCompletion(
-  binding: AhpSessionBinding,
-  inputKey: string,
-  answer: string,
-): {
-  readonly requestId: string;
-  readonly response: ChatInputResponseKind.Accept;
-  readonly answers: Record<string, ChatInputAnswer>;
-} {
-  const request = binding
-    .snapshot()
-    .session?.inputNeeded?.find(
-      (candidate) =>
-        candidate.id === inputKey &&
-        candidate.kind === SessionInputRequestKind.ChatInput,
-    );
-  if (!request || request.kind !== SessionInputRequestKind.ChatInput) {
-    throw new AhpOperationError(
-      "pending-input-not-found",
-      "Input request is no longer pending",
-    );
-  }
-  const questions = request.request.questions ?? [];
-  if (questions.length !== 1 || !questions[0]) {
-    throw new AhpOperationError(
-      "ambiguous-input",
-      "QQ can answer only a single-field input request",
-    );
-  }
-  return {
-    requestId: request.request.id,
-    response: ChatInputResponseKind.Accept,
-    answers: {
-      [questions[0].id]: answerQuestion(questions[0], answer),
-    },
-  };
-}
-
-function answerQuestion(
-  question: ChatInputQuestion,
-  answer: string,
-): ChatInputAnswer {
-  const submitted = ChatInputAnswerState.Submitted;
-  switch (question.kind) {
-    case ChatInputQuestionKind.Text:
-      return {
-        state: submitted,
-        value: { kind: ChatInputAnswerValueKind.Text, value: answer },
-      };
-    case ChatInputQuestionKind.Number:
-    case ChatInputQuestionKind.Integer: {
-      const value = Number(answer);
-      if (
-        !Number.isFinite(value) ||
-        (question.kind === ChatInputQuestionKind.Integer &&
-          !Number.isInteger(value))
-      ) {
-        throw new AhpOperationError("invalid-command", "Answer is not numeric");
-      }
-      return {
-        state: submitted,
-        value: { kind: ChatInputAnswerValueKind.Number, value },
-      };
-    }
-    case ChatInputQuestionKind.Boolean: {
-      const normalized = answer.trim().toLocaleLowerCase("zh-CN");
-      if (!["是", "否", "true", "false", "yes", "no"].includes(normalized)) {
-        throw new AhpOperationError("invalid-command", "Answer is not boolean");
-      }
-      return {
-        state: submitted,
-        value: {
-          kind: ChatInputAnswerValueKind.Boolean,
-          value: ["是", "true", "yes"].includes(normalized),
-        },
-      };
-    }
-    case ChatInputQuestionKind.SingleSelect: {
-      const option = findOption(question, answer);
-      return {
-        state: submitted,
-        value: {
-          kind: ChatInputAnswerValueKind.Selected,
-          value: option.id,
-        },
-      };
-    }
-    case ChatInputQuestionKind.MultiSelect: {
-      const values = answer
-        .split(/[,，]/u)
-        .map((value) => value.trim())
-        .filter(Boolean)
-        .map((value) => findOption(question, value).id);
-      if (values.length === 0) {
-        throw new AhpOperationError(
-          "invalid-command",
-          "At least one option is required",
-        );
-      }
-      return {
-        state: submitted,
-        value: {
-          kind: ChatInputAnswerValueKind.SelectedMany,
-          value: values,
-        },
-      };
-    }
-  }
-}
-
-function findOption(
-  question: Extract<
-    ChatInputQuestion,
-    {
-      kind:
-        | ChatInputQuestionKind.SingleSelect
-        | ChatInputQuestionKind.MultiSelect;
-    }
-  >,
-  answer: string,
-): { readonly id: string } {
-  const option = question.options.find(
-    (candidate) => candidate.id === answer || candidate.label === answer,
-  );
-  if (!option) {
-    throw new AhpOperationError(
-      "invalid-command",
-      "Answer is not an available option",
-    );
-  }
-  return option;
 }
 
 function requireRecord(value: unknown): Record<string, unknown> {

@@ -7,7 +7,7 @@ param(
 
     [string]$ConfigPath = "$env:LOCALAPPDATA\CopilotQQBridge\config.toml",
 
-    [string]$AhpWorkspace,
+    [string[]]$AhpWorkspace,
 
     [switch]$SkipBuild
 )
@@ -51,6 +51,14 @@ foreach ($Path in $Workspace) {
         throw "Workspace is not a directory: $Resolved"
     }
     $ResolvedWorkspaces += $Resolved
+}
+$ResolvedAhpWorkspaces = @()
+foreach ($Path in $AhpWorkspace) {
+    $Resolved = (Resolve-Path -LiteralPath $Path).Path
+    if (-not (Test-Path -LiteralPath $Resolved -PathType Container)) {
+        throw "AHP target workspace is not a directory: $Resolved"
+    }
+    $ResolvedAhpWorkspaces += $Resolved
 }
 
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
@@ -98,6 +106,7 @@ Copy-Item `
 $ManagedScriptsDirectory = Join-Path $InstallDirectory "scripts"
 New-Item -ItemType Directory -Path $ManagedScriptsDirectory -Force | Out-Null
 foreach ($ManagedScript in @(
+    "add-workspace.ps1",
     "switch-vscode-integration.ps1",
     "register-startup.ps1"
 )) {
@@ -170,17 +179,26 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     }
 }
 else {
-    Write-Warning "Existing config retained: $ConfigPath"
+    $AddWorkspaceArgs = @("--config", $ConfigPath, "add-workspace")
+    foreach ($Path in $ResolvedWorkspaces) {
+        $AddWorkspaceArgs += @("--workspace", $Path)
+    }
+    & $Bridge @AddWorkspaceArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "qq-bridge add-workspace failed with exit code $LASTEXITCODE"
+    }
 }
 
-if ($AhpWorkspace) {
-    $ResolvedAhpWorkspace = (Resolve-Path -LiteralPath $AhpWorkspace).Path
-    & $Bridge `
-        --config $ConfigPath `
-        configure-ahp `
-        --workspace $ResolvedAhpWorkspace `
-        --node $NodeCommand.Source `
-        --adapter-script (Join-Path $AdapterDirectory "dist\main.js")
+if ($ResolvedAhpWorkspaces.Count -gt 0) {
+    $ConfigureAhpArgs = @("--config", $ConfigPath, "configure-ahp")
+    foreach ($Path in $ResolvedAhpWorkspaces) {
+        $ConfigureAhpArgs += @("--workspace", $Path)
+    }
+    $ConfigureAhpArgs += @(
+        "--node", $NodeCommand.Source,
+        "--adapter-script", (Join-Path $AdapterDirectory "dist\main.js")
+    )
+    & $Bridge @ConfigureAhpArgs
     if ($LASTEXITCODE -ne 0) {
         throw "qq-bridge configure-ahp failed with exit code $LASTEXITCODE"
     }
@@ -255,9 +273,9 @@ Write-Host "Config: $ConfigPath"
 Write-Host "AHP Adapter: $AdapterDirectory"
 Write-Host "VS Code status extension: $StatusExtensionSource"
 Write-Host "Next: set qq.app_id, run qq-bridge store-secret, then start qq-bridge run."
-if ($AhpWorkspace) {
+if ($ResolvedAhpWorkspaces.Count -gt 0) {
     Write-Host "Next: run scripts\switch-vscode-integration.ps1 -Mode Ahp, reload VS Code,"
-    Write-Host "then create/list/bind the shared Agents Window Session."
+    Write-Host "then create/list/bind an Agents Window Session in a target workspace."
 }
 else {
     Write-Host "Legacy mode: register mcp.json, copy qq-remote.agent.md to ~/.copilot/agents,"
