@@ -115,12 +115,36 @@ pub struct AhpConfig {
     pub typing_refresh_seconds: u8,
 }
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AhpToolNotificationMode {
     Full,
     #[default]
     Compact,
+    ApprovalOnly,
+}
+
+impl AhpToolNotificationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+            Self::ApprovalOnly => "approval_only",
+        }
+    }
+}
+
+impl std::str::FromStr for AhpToolNotificationMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "compact" => Ok(Self::Compact),
+            "approval_only" => Ok(Self::ApprovalOnly),
+            _ => Err(()),
+        }
+    }
 }
 
 impl Default for AhpConfig {
@@ -637,6 +661,35 @@ mod tests {
         assert!(config.bridge.database_path.is_absolute());
         assert!(!config.qq.voice_input_enabled);
         AppConfig::load(&config_path).expect("reload config");
+    }
+
+    #[test]
+    fn approval_only_notification_mode_round_trips() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let mut config = AppConfig::write_new(&config_path, vec![directory.path().to_path_buf()])
+            .expect("write config");
+        config.ahp.tool_notification_mode = AhpToolNotificationMode::ApprovalOnly;
+
+        config.save(&config_path).expect("save config");
+
+        let serialized = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(serialized.contains("tool_notification_mode = \"approval_only\""));
+        let loaded = AppConfig::load(&config_path).expect("reload config");
+        assert!(loaded.ahp.tool_notification_mode == AhpToolNotificationMode::ApprovalOnly);
+    }
+
+    #[test]
+    fn notification_mode_command_values_parse_and_format() {
+        for mode in [
+            AhpToolNotificationMode::ApprovalOnly,
+            AhpToolNotificationMode::Compact,
+            AhpToolNotificationMode::Full,
+        ] {
+            assert_eq!(mode.as_str().parse(), Ok(mode));
+            assert_eq!(mode.as_str().to_ascii_uppercase().parse(), Ok(mode));
+        }
+        assert_eq!("unknown".parse::<AhpToolNotificationMode>(), Err(()));
     }
 
     #[test]

@@ -1,0 +1,27 @@
+diff --git a/types/version/registry.ts b/types/version/registry.ts
+--- a/types/version/registry.ts
++++ b/types/version/registry.ts
+@@ -17,4 +17,4 @@
+  */
+-export const PROTOCOL_VERSION = '1.0.0';
+-
++export const PROTOCOL_VERSION = '0.9.0';
++
+ /**
+@@ -35,6 +35,7 @@ export const PROTOCOL_VERSION = '1.0.0';
+  */
+ export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = Object.freeze([
+   '1.0.0',
++  '0.9.0',
+   '0.8.0',
+   '0.7.0',
+   '0.6.0',
+@@ -123,7 +124,7 @@ export const ACTION_INTRODUCED_IN: { readonly [K in StateAction['type']]: string
+   [ActionType.ChatTurnComplete]: '0.4.0',
+   [ActionType.ChatTurnCancelled]: '0.4.0',
+   [ActionType.ChatError]: '0.4.0',
+-  [ActionType.ChatTurnResume]: '1.0.0',
++  [ActionType.ChatTurnResume]: '0.9.0',
+   [ActionType.ChatActivityChanged]: '0.5.0',
+   [ActionType.ChatWorkingDirectorySet]: '0.7.0',
+   [ActionType.ChatWorkingDirectoryRemoved]: '0.7.0',

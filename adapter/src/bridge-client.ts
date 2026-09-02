@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 
-const IPC_VERSION = 1;
+const IPC_VERSION = 2;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 

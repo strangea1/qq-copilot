@@ -24,8 +24,15 @@ interface AhpStatus {
   };
   readonly binding?: {
     readonly state: string;
+    readonly active_turn_id?: string;
   };
+  readonly bindings?: ReadonlyArray<{
+    readonly state: string;
+    readonly active_turn_id?: string;
+  }>;
   readonly pending_commands: number;
+  readonly pending_approvals?: number;
+  readonly pending_inputs?: number;
   readonly pending_projections: number;
 }
 
@@ -35,7 +42,11 @@ interface CombinedStatus {
   readonly gatewayState: string;
   readonly adapterState: string;
   readonly bindingState: string;
+  readonly bindingsReady: boolean;
+  readonly bindingCount: number;
+  readonly activeTurnCount: number;
   readonly pendingCommands: number;
+  readonly pendingInteractions: number;
   readonly pendingProjections: number;
   readonly error?: string;
 }
@@ -94,8 +105,10 @@ class StatusController implements vscode.Disposable {
       `Bridge: ${status.bridgeOnline ? "online" : "offline"}`,
       `QQ Gateway: ${status.gatewayState}`,
       `AHP Adapter: ${status.adapterState}`,
-      `Session binding: ${status.bindingState}`,
+      `Session bindings: ${status.bindingState}`,
+      `Active Turns: ${status.activeTurnCount}`,
       `Pending Adapter commands: ${status.pendingCommands}`,
+      `Pending interactions: ${status.pendingInteractions}`,
       `Pending QQ deliveries: ${status.pendingProjections}`,
     ];
     if (status.error) {
@@ -108,13 +121,27 @@ class StatusController implements vscode.Disposable {
     try {
       const legacy = await runBridgeCommand<LegacyStatus>("status");
       const ahp = legacy.ahp;
+      const bindings = ahp?.bindings ?? (ahp?.binding ? [ahp.binding] : []);
+      const boundCount = bindings.filter((binding) => binding.state === "bound").length;
+      const bindingCount = bindings.length;
       this.#status = {
         bridgeOnline: true,
         ownerEnabled: legacy.owner_bound && legacy.owner_enabled,
         gatewayState: legacy.qq_gateway.state,
         adapterState: ahp?.adapter?.state ?? "not registered",
-        bindingState: ahp?.binding?.state ?? "unbound",
+        bindingState:
+          bindingCount === 0
+            ? "unbound"
+            : boundCount === bindingCount
+              ? `${bindingCount} bound`
+              : `${boundCount}/${bindingCount} bound`,
+        bindingsReady:
+          bindingCount > 0 && bindings.every((binding) => binding.state === "bound"),
+        bindingCount,
+        activeTurnCount: bindings.filter((binding) => binding.active_turn_id).length,
         pendingCommands: ahp?.pending_commands ?? 0,
+        pendingInteractions:
+          (ahp?.pending_approvals ?? 0) + (ahp?.pending_inputs ?? 0),
         pendingProjections: ahp?.pending_projections ?? 0,
       };
     } catch (error) {
@@ -139,21 +166,22 @@ class StatusController implements vscode.Disposable {
       !status.ownerEnabled ||
       status.gatewayState !== "connected" ||
       status.adapterState !== "connected" ||
-      status.bindingState !== "bound"
+      !status.bindingsReady
     ) {
       this.#item.text = "$(warning) QQ AHP 未就绪";
       this.#item.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground",
       );
     } else {
-      this.#item.text = "$(radio-tower) QQ AHP 已连接";
+      this.#item.text = `$(radio-tower) QQ AHP 已连接 ${status.bindingCount}`;
       this.#item.backgroundColor = undefined;
     }
     this.#item.tooltip = new vscode.MarkdownString(
       [
         `**QQ Gateway:** ${status.gatewayState}`,
         `**AHP Adapter:** ${status.adapterState}`,
-        `**Session:** ${status.bindingState}`,
+        `**Sessions:** ${status.bindingState}（运行中 ${status.activeTurnCount}）`,
+        `**待交互:** ${status.pendingInteractions}`,
         `**待补发:** ${status.pendingProjections}`,
       ].join("  \n"),
     );
@@ -214,7 +242,11 @@ function unavailableStatus(error: string): CombinedStatus {
     gatewayState: "unknown",
     adapterState: "unknown",
     bindingState: "unknown",
+    bindingsReady: false,
+    bindingCount: 0,
+    activeTurnCount: 0,
     pendingCommands: 0,
+    pendingInteractions: 0,
     pendingProjections: 0,
     error,
   };

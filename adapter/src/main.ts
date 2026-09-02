@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@microsoft/agent-host-protocol";
 
 import {
   AhpCore,
   AhpOperationError,
+  type AhpCoreOptions,
   type AhpSessionBinding,
   type CatalogueSnapshot,
   type ChatSnapshotEvent,
@@ -13,7 +15,11 @@ import {
   type IncompatibilityEvent,
   type SessionSnapshotEvent,
 } from "./ahp-core.js";
-import { BridgeClient, BridgeRpcError } from "./bridge-client.js";
+import {
+  BridgeClient,
+  BridgeRpcError,
+  type BridgeRequest,
+} from "./bridge-client.js";
 import {
   loadAdapterConfig,
   parseAdapterArguments,
@@ -29,7 +35,8 @@ const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
 const RETRY_DELAY_MS = 1_000;
 
-interface BridgeBinding {
+export interface BridgeBinding {
+  readonly binding_id: string;
   readonly generation: number;
   readonly endpoint_id: string;
   readonly host_instance_id?: string;
@@ -39,13 +46,15 @@ interface BridgeBinding {
   readonly last_server_sequence: number;
 }
 
-interface RegisterResult {
-  readonly binding?: BridgeBinding;
+export interface RegisterResult {
+  readonly bindings: readonly BridgeBinding[];
+  readonly foreground_binding_id?: string;
 }
 
-interface AdapterCommand {
+export interface AdapterCommand {
   readonly command_id: number;
   readonly command_key: string;
+  readonly binding_id: string;
   readonly binding_generation: number;
   readonly kind:
     | "bind_session"
@@ -62,7 +71,19 @@ interface PollResult {
   readonly commands: readonly AdapterCommand[];
 }
 
+interface PendingBinding {
+  readonly bindingId: string;
+  readonly generation: number;
+  readonly endpointId: string;
+  readonly hostInstanceId: string;
+  readonly sessionUri: string;
+  chatUri?: string;
+  normalizer?: AhpEventNormalizer;
+  lastServerSequence: number;
+}
+
 interface ActiveBinding {
+  readonly bindingId: string;
   readonly generation: number;
   readonly endpointId: string;
   readonly hostInstanceId: string;
@@ -70,6 +91,22 @@ interface ActiveBinding {
   readonly chatUri: string;
   readonly binding: AhpSessionBinding;
   readonly normalizer: AhpEventNormalizer;
+}
+
+export interface BridgeClientLike {
+  call<T>(request: BridgeRequest, timeoutMs?: number): Promise<T>;
+}
+
+export interface AhpCoreLike {
+  readonly catalogue: CatalogueSnapshot;
+  start(): Promise<CatalogueSnapshot | void>;
+  stop(): Promise<void>;
+  bindSession(endpointId: string, sessionUri: string): Promise<AhpSessionBinding>;
+}
+
+export interface RuntimeDependencies {
+  readonly createBridgeClient?: (config: AdapterConfig) => BridgeClientLike;
+  readonly createCore?: (options: AhpCoreOptions) => AhpCoreLike;
 }
 
 class SerialQueue {
@@ -85,45 +122,38 @@ class SerialQueue {
   }
 }
 
-class AdapterRuntime {
+export class AdapterRuntime {
   readonly #config: AdapterConfig;
 
-  readonly #bridge: BridgeClient;
+  readonly #bridge: BridgeClientLike;
 
   readonly #adapterInstanceId = randomUUID();
 
-  readonly #core: AhpCore;
+  readonly #core: AhpCoreLike;
 
   readonly #callbackQueue = new SerialQueue();
 
-  readonly #events = new Map<string, PublishedEvent>();
+  readonly #events = new Map<string, Map<string, PublishedEvent>>();
 
-  #binding: ActiveBinding | undefined;
+  readonly #bindings = new Map<string, ActiveBinding>();
 
-  #pendingBinding:
-    | {
-        readonly generation: number;
-        readonly endpointId: string;
-        readonly hostInstanceId: string;
-        readonly sessionUri: string;
-        normalizer?: AhpEventNormalizer;
-        lastServerSequence: number;
-      }
-    | undefined;
+  readonly #pendingBindings = new Map<string, PendingBinding>();
 
-  #eventFlush: Promise<void> | undefined;
+  readonly #eventFlushes = new Map<string, Promise<void>>();
 
   readonly #readOnlyEndpoints = new Set<string>();
 
   #stopping = false;
 
-  constructor(config: AdapterConfig) {
+  constructor(
+    config: AdapterConfig,
+    dependencies: RuntimeDependencies = {},
+  ) {
     this.#config = config;
-    this.#bridge = new BridgeClient(
-      config.bridgePipePath,
-      config.bridgeToken,
-    );
-    this.#core = new AhpCore({
+    this.#bridge =
+      dependencies.createBridgeClient?.(config) ??
+      new BridgeClient(config.bridgePipePath, config.bridgeToken);
+    const coreOptions: AhpCoreOptions = {
       userDataDirectory: config.userDataDirectory,
       clientId: config.adapterId,
       locale: "zh-CN",
@@ -153,28 +183,31 @@ class AdapterRuntime {
           });
         },
       },
-    });
+    };
+    this.#core = dependencies.createCore?.(coreOptions) ?? new AhpCore(coreOptions);
   }
 
   async run(signal: AbortSignal): Promise<void> {
-    const registration = await this.#bridge.call<RegisterResult>({
-      operation: "ahp_adapter_register",
-      registration: {
-        adapter_id: this.#config.adapterId,
-        adapter_instance_id: this.#adapterInstanceId,
-        version: ADAPTER_VERSION,
-        supported_protocols: [...SUPPORTED_PROTOCOL_VERSIONS],
-      },
-    });
+    const registration = parseRegisterResult(
+      await this.#bridge.call<unknown>({
+        operation: "ahp_adapter_register",
+        registration: {
+          adapter_id: this.#config.adapterId,
+          adapter_instance_id: this.#adapterInstanceId,
+          version: ADAPTER_VERSION,
+          supported_protocols: [...SUPPORTED_PROTOCOL_VERSIONS],
+        },
+      }),
+    );
     await this.#core.start();
     await this.#publishCatalogue(this.#core.catalogue);
-    if (
-      registration.binding &&
-      (registration.binding.state === "binding" ||
-        registration.binding.state === "bound")
-    ) {
-      await this.#activateBinding(registration.binding).catch((error) => {
+    for (const binding of registration.bindings) {
+      if (binding.state !== "binding" && binding.state !== "bound") {
+        continue;
+      }
+      await this.#activateBinding(binding).catch((error) => {
         safeLog("warn", "Failed to restore AHP binding", {
+          bindingId: binding.binding_id,
           code: errorCode(error),
         });
       });
@@ -215,64 +248,84 @@ class AdapterRuntime {
     }
     this.#stopping = true;
     await this.#callbackQueue.drain();
-    await this.#eventFlush?.catch(() => undefined);
-    await this.#binding?.binding.close().catch(() => undefined);
-    await this.#core.stop();
+
+    let failure: unknown;
+    try {
+      await Promise.all([...this.#eventFlushes.values()]);
+    } catch (error) {
+      failure = error;
+    }
+
+    const bindings = [...this.#bindings.values()];
+    this.#bindings.clear();
+    this.#pendingBindings.clear();
+    this.#events.clear();
+    this.#eventFlushes.clear();
+
+    try {
+      await Promise.all(bindings.map((binding) => binding.binding.close()));
+    } catch (error) {
+      failure ??= error;
+    }
+
+    try {
+      await this.#core.stop();
+    } catch (error) {
+      failure ??= error;
+    }
+
+    if (failure !== undefined) {
+      throw failure;
+    }
   }
 
   async #executeCommand(command: AdapterCommand): Promise<void> {
     if (
       !Number.isSafeInteger(command.command_id) ||
       command.command_id <= 0 ||
+      typeof command.binding_id !== "string" ||
+      command.binding_id.length === 0 ||
       !Number.isSafeInteger(command.binding_generation)
     ) {
       await this.#ack(command.command_id, "rejected", "invalid-command");
       return;
     }
     try {
-      if (
-        this.#binding &&
-        this.#readOnlyEndpoints.has(this.#binding.endpointId) &&
-        command.kind !== "bind_session" &&
-        command.kind !== "unbind_session"
-      ) {
-        throw new AhpOperationError(
-          "binding-unavailable",
-          "AHP compatibility gate is read-only",
-        );
+      if (command.kind !== "bind_session" && command.kind !== "unbind_session") {
+        const active = this.#requireBinding(command);
+        if (this.#readOnlyEndpoints.has(active.endpointId)) {
+          throw new AhpOperationError(
+            "binding-unavailable",
+            "AHP compatibility gate is read-only",
+          );
+        }
       }
       switch (command.kind) {
         case "bind_session":
           await this.#activateBinding(parseBindingCommand(command));
           break;
         case "unbind_session":
-          await this.#binding?.binding.close();
-          this.#binding = undefined;
-          this.#pendingBinding = undefined;
-          this.#events.clear();
+          await this.#unbindBinding(command);
           break;
         case "send_message": {
           const data = requireRecord(command.data);
           const content = requireString(data.content, "content");
-          await this.#requireBinding(command).queueUserText(
+          await this.#requireBinding(command).binding.queueUserText(
             content,
             command.command_id,
           );
           break;
         }
         case "cancel_turn":
-          await this.#requireBinding(command).cancelActiveTurn(
+          await this.#requireBinding(command).binding.cancelActiveTurn(
             command.command_id,
           );
           break;
         case "approve_tool": {
           const data = requireRecord(command.data);
-          await this.#requireBinding(command).reviewToolParameters(
+          await this.#requireBinding(command).binding.reviewToolParameters(
             {
-              requestId: requireString(
-                data.approval_key,
-                "approval_key",
-              ),
+              requestId: requireString(data.approval_key, "approval_key"),
               decision: requireBoolean(data.approved, "approved")
                 ? "approve"
                 : "deny",
@@ -283,12 +336,9 @@ class AdapterRuntime {
         }
         case "review_tool_result": {
           const data = requireRecord(command.data);
-          await this.#requireBinding(command).reviewToolResult(
+          await this.#requireBinding(command).binding.reviewToolResult(
             {
-              requestId: requireString(
-                data.approval_key,
-                "approval_key",
-              ),
+              requestId: requireString(data.approval_key, "approval_key"),
               approved: requireBoolean(data.approved, "approved"),
             },
             command.command_id,
@@ -297,15 +347,20 @@ class AdapterRuntime {
         }
         case "complete_input": {
           const data = requireRecord(command.data);
-          const binding = this.#requireBinding(command);
+          const active = this.#requireBinding(command).binding;
           const inputKey = requireString(data.input_key, "input_key");
           const answer = requireString(data.answer, "answer");
-          await binding.completeCurrentInput(
-            buildInputCompletion(binding, inputKey, answer),
+          await active.completeCurrentInput(
+            buildInputCompletion(active, inputKey, answer),
             command.command_id,
           );
           break;
         }
+        default:
+          throw new AhpOperationError(
+            "invalid-command",
+            `Unsupported command kind ${String(command.kind)}`,
+          );
       }
       await this.#ack(command.command_id, "applied");
     } catch (error) {
@@ -317,24 +372,46 @@ class AdapterRuntime {
       );
       safeLog("warn", "AHP command failed", {
         commandId: command.command_id,
+        bindingId: command.binding_id,
         kind: command.kind,
         code: errorCode(error),
       });
     }
   }
 
-  #requireBinding(command: AdapterCommand): AhpSessionBinding {
-    const active = this.#binding;
+  #requireBinding(command: AdapterCommand): ActiveBinding {
+    const active = this.#bindings.get(command.binding_id);
+    if (!active || active.generation !== command.binding_generation) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "Command targets a stale binding",
+      );
+    }
+    return active;
+  }
+
+  async #unbindBinding(command: AdapterCommand): Promise<void> {
+    const active = this.#bindings.get(command.binding_id);
+    const pending = this.#pendingBindings.get(command.binding_id);
     if (
-      !active ||
-      active.generation !== command.binding_generation
+      active?.generation !== command.binding_generation &&
+      pending?.generation !== command.binding_generation
     ) {
       throw new AhpOperationError(
         "binding-unavailable",
         "Command targets a stale binding",
       );
     }
-    return active.binding;
+    if (active) {
+      await this.#flushEvents(command.binding_id);
+    }
+    this.#pendingBindings.delete(command.binding_id);
+    this.#events.delete(command.binding_id);
+    if (!active) {
+      return;
+    }
+    this.#bindings.delete(command.binding_id);
+    await active.binding.close();
   }
 
   async #activateBinding(binding: BridgeBinding): Promise<void> {
@@ -351,30 +428,52 @@ class AdapterRuntime {
         "Bound Agent Host is not connected",
       );
     }
-    if (this.#binding) {
-      const current = this.#binding.binding.snapshot().defaultChat;
-      if (
-        current?.activeTurn ||
-        (current?.queuedMessages && current.queuedMessages.length > 0)
-      ) {
-        throw new AhpOperationError(
-          "binding-unavailable",
-          "Cannot switch Session while a Turn or queued message is active",
-        );
-      }
-      await this.#binding.binding.close();
-      this.#binding = undefined;
+
+    const existing = this.#bindings.get(binding.binding_id);
+    if (
+      existing &&
+      existing.generation === binding.generation &&
+      existing.endpointId === binding.endpoint_id &&
+      existing.hostInstanceId === binding.host_instance_id &&
+      existing.sessionUri === binding.session_uri
+    ) {
+      await this.#bridge.call({
+        operation: "ahp_binding_ready",
+        adapter_id: this.#config.adapterId,
+        adapter_instance_id: this.#adapterInstanceId,
+        binding_id: existing.bindingId,
+        endpoint_id: existing.endpointId,
+        host_instance_id: existing.hostInstanceId,
+        binding_generation: existing.generation,
+        session_uri: existing.sessionUri,
+        chat_uri: existing.chatUri,
+        last_server_sequence: binding.last_server_sequence,
+      });
+      await this.#flushEvents(binding.binding_id);
+      return;
     }
-    this.#events.clear();
-    this.#pendingBinding = {
+
+    if (existing) {
+      this.#bindings.delete(binding.binding_id);
+      this.#events.delete(binding.binding_id);
+      await existing.binding.close();
+    } else {
+      this.#events.delete(binding.binding_id);
+    }
+
+    const pending: PendingBinding = {
+      bindingId: binding.binding_id,
       generation: binding.generation,
       endpointId: binding.endpoint_id,
       hostInstanceId: endpoint.endpoint.instanceId,
       sessionUri: binding.session_uri,
-      lastServerSequence: 0,
+      lastServerSequence: binding.last_server_sequence,
     };
+    this.#pendingBindings.set(binding.binding_id, pending);
+
+    let sessionBinding: AhpSessionBinding | undefined;
     try {
-      const sessionBinding = await this.#core.bindSession(
+      sessionBinding = await this.#core.bindSession(
         binding.endpoint_id,
         binding.session_uri,
       );
@@ -386,17 +485,9 @@ class AdapterRuntime {
           "Bound session has no default chat",
         );
       }
-      const normalizer =
-        this.#pendingBinding.normalizer ??
-        new AhpEventNormalizer({
-          adapterId: this.#config.adapterId,
-          endpointId: binding.endpoint_id,
-          hostInstanceId: endpoint.endpoint.instanceId,
-          generation: binding.generation,
-          sessionUri: binding.session_uri,
-          chatUri,
-        });
+      const normalizer = this.#ensurePendingNormalizer(pending, chatUri);
       const active: ActiveBinding = {
+        bindingId: binding.binding_id,
         generation: binding.generation,
         endpointId: binding.endpoint_id,
         hostInstanceId: endpoint.endpoint.instanceId,
@@ -405,105 +496,157 @@ class AdapterRuntime {
         binding: sessionBinding,
         normalizer,
       };
-      this.#binding = active;
-      const lastServerSequence =
-        this.#pendingBinding.lastServerSequence;
+      this.#bindings.set(binding.binding_id, active);
       await this.#bridge.call({
         operation: "ahp_binding_ready",
         adapter_id: this.#config.adapterId,
         adapter_instance_id: this.#adapterInstanceId,
+        binding_id: active.bindingId,
         endpoint_id: active.endpointId,
         host_instance_id: active.hostInstanceId,
         binding_generation: active.generation,
         session_uri: active.sessionUri,
         chat_uri: active.chatUri,
-        last_server_sequence: lastServerSequence,
+        last_server_sequence: pending.lastServerSequence,
       });
-      this.#pendingBinding = undefined;
-      await this.#flushEvents();
+      this.#pendingBindings.delete(binding.binding_id);
+      await this.#flushEvents(binding.binding_id);
     } catch (error) {
-      this.#pendingBinding = undefined;
-      await this.#bridge
-        .call({
+      this.#pendingBindings.delete(binding.binding_id);
+      this.#events.delete(binding.binding_id);
+      this.#bindings.delete(binding.binding_id);
+      await sessionBinding?.close().catch((closeError: unknown) => {
+        safeLog("warn", "Failed to close rejected AHP binding", {
+          bindingId: binding.binding_id,
+          code: errorCode(closeError),
+        });
+      });
+      try {
+        await this.#bridge.call({
           operation: "ahp_binding_failed",
           adapter_id: this.#config.adapterId,
           adapter_instance_id: this.#adapterInstanceId,
+          binding_id: binding.binding_id,
           binding_generation: binding.generation,
           reason_code: errorCode(error),
-        })
-        .catch(() => undefined);
+        });
+      } catch (reportError) {
+        safeLog("warn", "Failed to report rejected AHP binding", {
+          bindingId: binding.binding_id,
+          code: errorCode(reportError),
+        });
+      }
       throw error;
     }
   }
 
+  #ensurePendingNormalizer(
+    pending: PendingBinding,
+    chatUri: string,
+  ): AhpEventNormalizer {
+    if (!pending.normalizer || pending.chatUri !== chatUri) {
+      pending.chatUri = chatUri;
+      pending.normalizer = this.#createNormalizer(pending, chatUri);
+    }
+    return pending.normalizer;
+  }
+
+  #createNormalizer(
+    binding: Pick<
+      PendingBinding | ActiveBinding,
+      "endpointId" | "hostInstanceId" | "generation" | "sessionUri"
+    >,
+    chatUri: string,
+  ): AhpEventNormalizer {
+    return new AhpEventNormalizer({
+      adapterId: this.#config.adapterId,
+      endpointId: binding.endpointId,
+      hostInstanceId: binding.hostInstanceId,
+      generation: binding.generation,
+      sessionUri: binding.sessionUri,
+      chatUri,
+    });
+  }
+
   #onSessionSnapshot(event: SessionSnapshotEvent): void {
-    const pending = this.#pendingBinding;
-    if (
-      pending &&
-      event.endpointId === pending.endpointId &&
-      event.sessionUri === pending.sessionUri &&
-      event.state.defaultChat
-    ) {
-      pending.lastServerSequence = Math.max(
-        pending.lastServerSequence,
-        event.serverSeq,
-      );
-      pending.normalizer ??= new AhpEventNormalizer({
-        adapterId: this.#config.adapterId,
-        endpointId: pending.endpointId,
-        hostInstanceId: pending.hostInstanceId,
-        generation: pending.generation,
-        sessionUri: pending.sessionUri,
-        chatUri: event.state.defaultChat,
-      });
-      this.#queueEvents(pending.normalizer.sessionSnapshot(event));
+    const binding = this.#matchSessionBinding(event.endpointId, event.sessionUri);
+    if (!binding) {
       return;
     }
-    const active = this.#binding;
-    if (active) {
-      this.#queueEvents(active.normalizer.sessionSnapshot(event));
+    if ("binding" in binding) {
+      this.#queueEvents(
+        binding.bindingId,
+        binding.normalizer.sessionSnapshot(event),
+      );
+      return;
     }
+    binding.lastServerSequence = Math.max(
+      binding.lastServerSequence,
+      event.serverSeq,
+    );
+    if (!event.state.defaultChat) {
+      return;
+    }
+    const normalizer = this.#ensurePendingNormalizer(
+      binding,
+      event.state.defaultChat,
+    );
+    this.#queueEvents(binding.bindingId, normalizer.sessionSnapshot(event));
   }
 
   #onChatSnapshot(event: ChatSnapshotEvent): void {
-    const pending = this.#pendingBinding;
-    if (
-      pending?.normalizer &&
-      event.endpointId === pending.endpointId &&
-      event.sessionUri === pending.sessionUri
-    ) {
-      pending.lastServerSequence = Math.max(
-        pending.lastServerSequence,
-        event.serverSeq,
-      );
-      this.#queueEvents(pending.normalizer.chatSnapshot(event));
+    const binding = this.#matchChatBinding(
+      event.endpointId,
+      event.sessionUri,
+      event.chatUri,
+    );
+    if (!binding) {
       return;
     }
-    const active = this.#binding;
-    if (active) {
-      this.#queueEvents(active.normalizer.chatSnapshot(event));
+    if ("binding" in binding) {
+      this.#queueEvents(binding.bindingId, binding.normalizer.chatSnapshot(event));
+      return;
     }
+    binding.lastServerSequence = Math.max(
+      binding.lastServerSequence,
+      event.serverSeq,
+    );
+    if (!binding.normalizer) {
+      return;
+    }
+    this.#queueEvents(binding.bindingId, binding.normalizer.chatSnapshot(event));
   }
 
   #onAction(event: DomainActionEvent): void {
-    const sequence = event.envelope.serverSeq;
-    if (this.#pendingBinding) {
-      this.#pendingBinding.lastServerSequence = Math.max(
-        this.#pendingBinding.lastServerSequence,
-        sequence,
-      );
-      if (this.#pendingBinding.normalizer) {
-        this.#queueEvents(this.#pendingBinding.normalizer.action(event));
+    if (event.scope === "root") {
+      return;
+    }
+    const binding =
+      event.scope === "chat"
+        ? this.#matchChatBinding(
+            event.endpointId,
+            event.sessionUri,
+            event.chatUri,
+          )
+        : this.#matchSessionBinding(event.endpointId, event.sessionUri);
+    if (!binding) {
+      return;
+    }
+    if ("binding" in binding) {
+      if (event.envelope.rejectionReason !== undefined) {
+        return;
       }
+      this.#queueEvents(binding.bindingId, binding.normalizer.action(event));
       return;
     }
-    if (event.envelope.rejectionReason !== undefined) {
+    binding.lastServerSequence = Math.max(
+      binding.lastServerSequence,
+      event.envelope.serverSeq,
+    );
+    if (event.envelope.rejectionReason !== undefined || !binding.normalizer) {
       return;
     }
-    const active = this.#binding;
-    if (active) {
-      this.#queueEvents(active.normalizer.action(event));
-    }
+    this.#queueEvents(binding.bindingId, binding.normalizer.action(event));
   }
 
   #onConnection(event: ConnectionEvent): void {
@@ -514,12 +657,15 @@ class AdapterRuntime {
     ) {
       this.#readOnlyEndpoints.delete(event.endpoint.id);
     }
-    if (
-      this.#binding?.endpointId === event.endpoint.id &&
-      event.status === "disconnected"
-    ) {
-      this.#queueEvents([
-        this.#binding.normalizer.hostDisconnected(
+    if (event.status !== "disconnected") {
+      return;
+    }
+    for (const binding of this.#bindings.values()) {
+      if (binding.endpointId !== event.endpoint.id) {
+        continue;
+      }
+      this.#queueEvents(binding.bindingId, [
+        binding.normalizer.hostDisconnected(
           "VS Code Agent Host 连接已中断，Adapter 正在重连。",
         ),
       ]);
@@ -534,40 +680,125 @@ class AdapterRuntime {
     });
   }
 
-  #queueEvents(events: readonly PublishedEvent[]): void {
-    for (const event of events) {
-      this.#events.set(event.event_id, event);
+  #matchSessionBinding(
+    endpointId: string,
+    sessionUri: string,
+  ): PendingBinding | ActiveBinding | undefined {
+    return this.#resolveCallbackBinding(
+      [...this.#pendingBindings.values()].filter(
+        (binding) =>
+          binding.endpointId === endpointId && binding.sessionUri === sessionUri,
+      ),
+      [...this.#bindings.values()].filter(
+        (binding) =>
+          binding.endpointId === endpointId && binding.sessionUri === sessionUri,
+      ),
+      { endpointId, sessionUri },
+    );
+  }
+
+  #matchChatBinding(
+    endpointId: string,
+    sessionUri: string,
+    chatUri: string,
+  ): PendingBinding | ActiveBinding | undefined {
+    return this.#resolveCallbackBinding(
+      [...this.#pendingBindings.values()].filter(
+        (binding) =>
+          binding.endpointId === endpointId &&
+          binding.sessionUri === sessionUri &&
+          binding.chatUri === chatUri,
+      ),
+      [...this.#bindings.values()].filter(
+        (binding) =>
+          binding.endpointId === endpointId &&
+          binding.sessionUri === sessionUri &&
+          binding.chatUri === chatUri,
+      ),
+      { endpointId, sessionUri, chatUri },
+    );
+  }
+
+  #resolveCallbackBinding(
+    pendingMatches: readonly PendingBinding[],
+    activeMatches: readonly ActiveBinding[],
+    route: Readonly<Record<string, string>>,
+  ): PendingBinding | ActiveBinding | undefined {
+    const matches = [...pendingMatches, ...activeMatches];
+    if (matches.length === 0) {
+      return undefined;
     }
-    if (this.#binding) {
-      void this.#flushEvents();
+    if (matches.length > 1) {
+      safeLog("warn", "AHP callback routing was ambiguous", {
+        ...route,
+        bindingIds: matches.map((binding) => binding.bindingId).join(","),
+      });
+      return undefined;
+    }
+    return matches[0];
+  }
+
+  #queueEvents(bindingId: string, events: readonly PublishedEvent[]): void {
+    if (events.length === 0) {
+      return;
+    }
+    let pending = this.#events.get(bindingId);
+    if (!pending) {
+      pending = new Map<string, PublishedEvent>();
+      this.#events.set(bindingId, pending);
+    }
+    for (const event of events) {
+      pending.set(event.event_id, event);
+    }
+    if (this.#bindings.has(bindingId)) {
+      void this.#flushEvents(bindingId);
     }
   }
 
-  #flushEvents(): Promise<void> {
-    if (this.#eventFlush) {
-      return this.#eventFlush;
+  #flushEvents(bindingId: string): Promise<void> {
+    const existing = this.#eventFlushes.get(bindingId);
+    if (existing) {
+      return existing;
     }
-    this.#eventFlush = this.#flushEventsInner().finally(() => {
-      this.#eventFlush = undefined;
-      if (this.#events.size > 0 && !this.#stopping) {
-        setTimeout(() => void this.#flushEvents(), RETRY_DELAY_MS).unref();
+    const flush = this.#flushEventsInner(bindingId).finally(() => {
+      if (this.#eventFlushes.get(bindingId) === flush) {
+        this.#eventFlushes.delete(bindingId);
+      }
+      const pending = this.#events.get(bindingId);
+      if (
+        pending &&
+        pending.size > 0 &&
+        this.#bindings.has(bindingId) &&
+        !this.#stopping
+      ) {
+        setTimeout(() => void this.#flushEvents(bindingId), RETRY_DELAY_MS).unref();
       }
     });
-    return this.#eventFlush;
+    this.#eventFlushes.set(bindingId, flush);
+    return flush;
   }
 
-  async #flushEventsInner(): Promise<void> {
-    while (this.#binding && this.#events.size > 0) {
-      const batch = [...this.#events.values()].slice(0, EVENT_BATCH_SIZE);
+  async #flushEventsInner(bindingId: string): Promise<void> {
+    for (;;) {
+      const active = this.#bindings.get(bindingId);
+      const pending = this.#events.get(bindingId);
+      if (!active || !pending || pending.size === 0) {
+        return;
+      }
+      const batch = [...pending.values()].slice(0, EVENT_BATCH_SIZE);
       await this.#bridge.call({
         operation: "ahp_publish_events",
         adapter_id: this.#config.adapterId,
         adapter_instance_id: this.#adapterInstanceId,
-        binding_generation: this.#binding.generation,
+        binding_id: bindingId,
+        binding_generation: active.generation,
         events: batch,
       });
       for (const event of batch) {
-        this.#events.delete(event.event_id);
+        pending.delete(event.event_id);
+      }
+      if (pending.size === 0) {
+        this.#events.delete(bindingId);
       }
     }
   }
@@ -626,19 +857,91 @@ class AdapterRuntime {
   }
 }
 
+function parseRegisterResult(value: unknown): RegisterResult {
+  const data = requirePlainRecord(value, "Bridge registration result");
+  const bindings = data.bindings;
+  if (!Array.isArray(bindings)) {
+    throw new Error("Bridge registration result bindings are invalid");
+  }
+  const foregroundBindingId = requireOptionalPlainString(
+    data.foreground_binding_id,
+    "foreground_binding_id",
+  );
+  return {
+    bindings: bindings.map((binding) => parseBridgeBinding(binding)),
+    ...(foregroundBindingId
+      ? { foreground_binding_id: foregroundBindingId }
+      : {}),
+  };
+}
+
+function parseBridgeBinding(value: unknown): BridgeBinding {
+  const data = requirePlainRecord(value, "Bridge binding");
+  const hostInstanceId = requireOptionalPlainString(
+    data.host_instance_id,
+    "host_instance_id",
+  );
+  const chatUri = requireOptionalPlainString(data.chat_uri, "chat_uri");
+  return {
+    binding_id: requirePlainString(data.binding_id, "binding_id"),
+    generation: requirePlainInteger(data.generation, "generation"),
+    endpoint_id: requirePlainString(data.endpoint_id, "endpoint_id"),
+    ...(hostInstanceId ? { host_instance_id: hostInstanceId } : {}),
+    session_uri: requirePlainString(data.session_uri, "session_uri"),
+    ...(chatUri ? { chat_uri: chatUri } : {}),
+    state: requirePlainString(data.state, "state"),
+    last_server_sequence: requirePlainInteger(
+      data.last_server_sequence,
+      "last_server_sequence",
+    ),
+  };
+}
+
 function parseBindingCommand(command: AdapterCommand): BridgeBinding {
   const data = requireRecord(command.data);
   return {
+    binding_id: command.binding_id,
     generation: command.binding_generation,
     endpoint_id: requireString(data.endpoint_id, "endpoint_id"),
-    host_instance_id: requireString(
-      data.host_instance_id,
-      "host_instance_id",
-    ),
+    host_instance_id: requireString(data.host_instance_id, "host_instance_id"),
     session_uri: requireString(data.session_uri, "session_uri"),
     state: "binding",
     last_server_sequence: 0,
   };
+}
+
+function requirePlainRecord(
+  value: unknown,
+  name: string,
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${name} is invalid`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requirePlainString(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${name} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireOptionalPlainString(
+  value: unknown,
+  name: string,
+): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return requirePlainString(value, name);
+}
+
+function requirePlainInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an integer`);
+  }
+  return value;
 }
 
 function requireRecord(value: unknown): Record<string, unknown> {
@@ -728,7 +1031,14 @@ async function main(): Promise<void> {
   await runtime.run(abort.signal);
 }
 
-void main().catch((error: unknown) => {
-  safeLog("warn", "AHP Adapter stopped", { code: errorCode(error) });
-  process.exitCode = 1;
-});
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  return typeof entry === "string" && import.meta.url === pathToFileURL(entry).href;
+}
+
+if (isMainModule()) {
+  void main().catch((error: unknown) => {
+    safeLog("warn", "AHP Adapter stopped", { code: errorCode(error) });
+    process.exitCode = 1;
+  });
+}

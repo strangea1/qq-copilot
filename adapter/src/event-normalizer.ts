@@ -61,14 +61,23 @@ export interface NormalizerBinding {
   readonly chatUri: string;
 }
 
+interface OpenAssistantPart {
+  readonly partId: string;
+  readonly content: string;
+}
+
 export class AhpEventNormalizer {
   readonly #binding: NormalizerBinding;
 
   readonly #seenUserTurns = new Set<string>();
 
-  readonly #seenAssistantTurns = new Set<string>();
+  readonly #seenAssistantParts = new Set<string>();
+
+  readonly #openAssistantParts = new Map<string, OpenAssistantPart>();
 
   readonly #seenStartedTurns = new Set<string>();
+
+  readonly #seenFailedTurns = new Set<string>();
 
   readonly #toolStatuses = new Map<string, string>();
 
@@ -171,6 +180,12 @@ export class AhpEventNormalizer {
           historical,
           undefined,
         ),
+        ...this.#activeTurnAssistantEvents(
+          event.state.activeTurn,
+          event.serverSeq,
+          event.chatUri,
+          historical,
+        ),
       );
     }
     events.push(
@@ -194,6 +209,7 @@ export class AhpEventNormalizer {
     switch (action.type) {
       case ActionType.ChatTurnStarted:
         this.#activeTurnId = action.turnId;
+        this.#openAssistantParts.delete(action.turnId);
         this.#seenStartedTurns.add(action.turnId);
         return [
           this.#event(
@@ -215,6 +231,57 @@ export class AhpEventNormalizer {
             originClientId,
           ),
         ];
+      case ActionType.ChatDelta: {
+        const openPart = this.#openAssistantParts.get(action.turnId);
+        if (
+          openPart?.partId === action.partId &&
+          !this.#seenAssistantParts.has(
+            assistantPartKey(action.turnId, action.partId),
+          )
+        ) {
+          this.#openAssistantParts.set(action.turnId, {
+            partId: action.partId,
+            content: openPart.content + action.content,
+          });
+        }
+        return [];
+      }
+      case ActionType.ChatResponsePart: {
+        const events = this.#flushAssistantPart(
+          action.turnId,
+          sequence,
+          event.chatUri,
+          false,
+        );
+        if (
+          action.part.kind === ResponsePartKind.Markdown &&
+          !this.#seenAssistantParts.has(
+            assistantPartKey(action.turnId, action.part.id),
+          )
+        ) {
+          this.#openAssistantParts.set(action.turnId, {
+            partId: action.part.id,
+            content: action.part.content,
+          });
+        }
+        return events;
+      }
+      case ActionType.ChatToolCallStart:
+        return this.#flushAssistantPart(
+          action.turnId,
+          sequence,
+          event.chatUri,
+          false,
+        );
+      case ActionType.ChatInputRequested:
+        return this.#activeTurnId
+          ? this.#flushAssistantPart(
+              this.#activeTurnId,
+              sequence,
+              event.chatUri,
+              false,
+            )
+          : [];
       case ActionType.ChatToolCallConfirmed: {
         const approvalKey = this.#approvalKeyByTool.get(
           approvalMapKey("parameter", action.turnId, action.toolCallId),
@@ -279,11 +346,18 @@ export class AhpEventNormalizer {
             ]
           : [];
       }
-      case ActionType.ChatTurnComplete:
+      case ActionType.ChatTurnComplete: {
+        const assistantEvents = this.#flushAssistantPart(
+          action.turnId,
+          sequence,
+          event.chatUri,
+          true,
+        );
         if (this.#activeTurnId === action.turnId) {
           this.#activeTurnId = undefined;
         }
         return [
+          ...assistantEvents,
           this.#event(
             "turn_completed",
             sequence,
@@ -293,11 +367,19 @@ export class AhpEventNormalizer {
             originClientId,
           ),
         ];
-      case ActionType.ChatTurnCancelled:
+      }
+      case ActionType.ChatTurnCancelled: {
+        const assistantEvents = this.#flushAssistantPart(
+          action.turnId,
+          sequence,
+          event.chatUri,
+          false,
+        );
         if (this.#activeTurnId === action.turnId) {
           this.#activeTurnId = undefined;
         }
         return [
+          ...assistantEvents,
           this.#event(
             "turn_cancelled",
             sequence,
@@ -307,22 +389,44 @@ export class AhpEventNormalizer {
             originClientId,
           ),
         ];
-      case ActionType.ChatError:
+      }
+      case ActionType.ChatError: {
+        const assistantEvents = this.#flushAssistantPart(
+          action.turnId,
+          sequence,
+          event.chatUri,
+          false,
+        );
         if (this.#activeTurnId === action.turnId) {
           this.#activeTurnId = undefined;
         }
+        if (this.#seenFailedTurns.has(action.turnId)) {
+          return assistantEvents;
+        }
+        this.#seenFailedTurns.add(action.turnId);
         return [
+          ...assistantEvents,
           this.#event(
             "turn_failed",
             sequence,
             event.chatUri,
             action.turnId,
             {
-              summary: action.error.message || "当前 Turn 执行失败",
+              summary: action.part.error.message || "当前 Turn 执行失败",
             },
             originClientId,
           ),
         ];
+      }
+      case ActionType.ChatTurnResume:
+        this.#activeTurnId = action.turnId;
+        return [];
+      case ActionType.ChatTruncated:
+        if (this.#activeTurnId) {
+          this.#openAssistantParts.delete(this.#activeTurnId);
+          this.#activeTurnId = undefined;
+        }
+        return [];
       default:
         return [];
     }
@@ -418,10 +522,20 @@ export class AhpEventNormalizer {
       historical,
       undefined,
     );
-    if (!this.#seenAssistantTurns.has(turn.id)) {
-      this.#seenAssistantTurns.add(turn.id);
+    this.#openAssistantParts.delete(turn.id);
+    const markdownParts = turn.responseParts.filter(
+      (part) => part.kind === ResponsePartKind.Markdown,
+    );
+    if (historical) {
+      const unseenParts = markdownParts.filter(
+        (part) =>
+          !this.#seenAssistantParts.has(assistantPartKey(turn.id, part.id)),
+      );
+      for (const part of unseenParts) {
+        this.#seenAssistantParts.add(assistantPartKey(turn.id, part.id));
+      }
       const content = assistantText(turn.responseParts);
-      if (content.length > 0) {
+      if (unseenParts.length > 0 && content.length > 0) {
         events.push(
           this.#event(
             "assistant_message",
@@ -433,14 +547,137 @@ export class AhpEventNormalizer {
               content,
               complete: true,
               historical,
+              final_response: true,
             },
             undefined,
             turn.startedAt,
           ),
         );
       }
+      return events;
+    }
+
+    const finalPart = [...markdownParts]
+      .reverse()
+      .find((part) => part.content.trim().length > 0);
+    for (const part of markdownParts) {
+      events.push(
+        ...this.#assistantPartEvent(
+          turn.id,
+          part.id,
+          part.content,
+          sequence,
+          chatUri,
+          part === finalPart,
+          false,
+          turn.startedAt,
+        ),
+      );
     }
     return events;
+  }
+
+  #activeTurnAssistantEvents(
+    turn: Pick<Turn, "id" | "startedAt" | "responseParts">,
+    sequence: number,
+    chatUri: string,
+    historical: boolean,
+  ): PublishedEvent[] {
+    const events: PublishedEvent[] = [];
+    const finalPartIndex = turn.responseParts.length - 1;
+    for (const [index, part] of turn.responseParts.entries()) {
+      if (part.kind !== ResponsePartKind.Markdown) {
+        continue;
+      }
+      const key = assistantPartKey(turn.id, part.id);
+      if (this.#seenAssistantParts.has(key)) {
+        continue;
+      }
+      if (index < finalPartIndex) {
+        if (historical) {
+          this.#seenAssistantParts.add(key);
+        } else {
+          events.push(
+            ...this.#assistantPartEvent(
+              turn.id,
+              part.id,
+              part.content,
+              sequence,
+              chatUri,
+              false,
+              false,
+              turn.startedAt,
+            ),
+          );
+        }
+        continue;
+      }
+      this.#openAssistantParts.set(turn.id, {
+        partId: part.id,
+        content: part.content,
+      });
+    }
+    return events;
+  }
+
+  #flushAssistantPart(
+    turnId: string,
+    sequence: number,
+    chatUri: string,
+    finalResponse: boolean,
+  ): PublishedEvent[] {
+    const part = this.#openAssistantParts.get(turnId);
+    if (!part) {
+      return [];
+    }
+    this.#openAssistantParts.delete(turnId);
+    return this.#assistantPartEvent(
+      turnId,
+      part.partId,
+      part.content,
+      sequence,
+      chatUri,
+      finalResponse,
+      false,
+    );
+  }
+
+  #assistantPartEvent(
+    turnId: string,
+    partId: string,
+    rawContent: string,
+    sequence: number,
+    chatUri: string,
+    finalResponse: boolean,
+    historical: boolean,
+    occurredAt?: string,
+  ): PublishedEvent[] {
+    const key = assistantPartKey(turnId, partId);
+    if (this.#seenAssistantParts.has(key)) {
+      return [];
+    }
+    this.#seenAssistantParts.add(key);
+    const content = rawContent.trim();
+    if (content.length === 0) {
+      return [];
+    }
+    return [
+      this.#event(
+        "assistant_message",
+        sequence,
+        chatUri,
+        turnId,
+        {
+          message_id: `turn:${turnId}:assistant:${partId}`,
+          content,
+          complete: true,
+          historical,
+          final_response: finalResponse,
+        },
+        undefined,
+        occurredAt,
+      ),
+    ];
   }
 
   #userMessageEvents(
@@ -579,6 +816,10 @@ function assistantText(parts: readonly ResponsePart[]): string {
     .map((part) => part.content)
     .join("")
     .trim();
+}
+
+function assistantPartKey(turnId: string, partId: string): string {
+  return `${turnId}\0${partId}`;
 }
 
 function toolSummary(tool: ToolCallState): string {

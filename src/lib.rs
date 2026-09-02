@@ -8,5 +8,5 @@ pub mod qq;
 pub mod security;
 pub mod service;
 
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_IPC_MESSAGE_BYTES: usize = 1024 * 1024;

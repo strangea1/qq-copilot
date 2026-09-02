@@ -1,7 +1,7 @@
 {
   "name": "qq-copilot-ahp-status",
   "displayName": "QQ Copilot AHP Status",
-  "description": "Shows QQ Bridge, AHP binding, and pending QQ delivery status.",
+  "description": "Shows QQ Bridge, AHP bindings, active Turns, interactions, and pending QQ delivery status.",
   "version": "0.1.0",
   "publisher": "guoyu-local",
   "private": true,

@@ -1,6 +1,6 @@
 # VS Code Copilot 与 QQ Bot 远程交互设计
 
-状态：AHP 双客户端、多目标目录和单绑定切换已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
+状态：AHP 双客户端、多目标目录和最多 5 个并发 Binding 已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
 日期：2026-08-29<br>
 目标环境：Windows、单个 QQ 单聊用户、VS Code 本地 Agent、当前 Windows 标准用户权限
 
@@ -9,7 +9,7 @@
 - `src/bin/qq-bridge.rs`：QQ Bridge Daemon 和本机管理命令。
 - `src/bin/copilot-qq-hook.rs`：四类 VS Code Hook Helper。
 - `src/bin/qq-mcp.rs`：stdio MCP Adapter。
-- `adapter/`：与 VS Code 1.135 精确协议 revision 匹配的 TypeScript AHP Client。
+- `adapter/`：与 VS Code 1.136 精确协议 revision 匹配的 TypeScript AHP Client。
 - `src/ahp_store.rs`：AHP Host/Session 目录、绑定、事件、命令 outbox、审批和输入。
 - `vscode-extension/`：QQ/AHP 连接与待补发状态栏。
 - `src/db.rs`：SQLite 状态机、去重、幂等和审计。
@@ -30,36 +30,54 @@ flowchart LR
 ```
 
 - Agent Host 是 Session、Chat、Turn 和工具审批的唯一权威状态源。
-- VS Code 与 QQ Adapter 同时订阅同一个已由用户创建并在本机绑定的 Session；Bridge
-  数据库使用 singleton binding，任一时刻只绑定一个 Session。
-- PC 或 QQ 消息进入同一 Chat；Agent 忙碌时 QQ 消息使用 AHP queued message。
+- VS Code 与 QQ Adapter 同时订阅用户已创建的 Session。Adapter 以 `binding_id` 为键
+  维护独立的 SessionBinding、事件 normalizer 和发布队列，最多同时监控 5 个 Session。
+- SQLite `ahp_bindings` 保存所有 Binding，`ahp_foreground_binding` 只保存 QQ 前台
+  指针。普通 QQ 文本/语音进入前台 Chat；`/send <code>` 可定向进入后台 Chat；
+  Agent 忙碌时继续使用 AHP queued message。
 - `bridge.workspace_roots` 定义本地操作安全边界；`ahp.shared_workspaces` 定义 QQ
   可见的精确目标目录集合。目标目录必须被某个安全根目录覆盖，共同父目录不会隐式包含
   子目录 Session。
 - Bridge 为所有目标目录中的 Session 分配稳定短码；QQ `/sessions` 同时显示短码、
-  标题、完整目录和空闲状态，`/switch` 返回全部 Session 的一次性回调按钮，
-  `/switch <code>` 作为文本兜底。
-- 切换要求当前绑定没有 active Turn、queued message 或 Pending 交互，并且目标
-  Session 处于 `SessionStatus.Idle`。目录配置变化、Session 目录变化、过期或已使用的
-  按钮都会 fail-closed。每个 Keyboard 最多 25 项，最多 4 页。
+  标题、完整目录，以及前台、后台、运行中和未监控状态。`/switch` 返回一次性回调按钮，
+  `/switch <code>` 作为文本兜底，两者都只改变前台指针，不停止旧 Session。
+- 最近活跃 Session 自动加入监控。达到 5 个时，LRU 只能选择非前台、无 active Turn、
+  queued message、Pending Adapter command、审批或澄清的 Binding；所有槽位受保护时
+  新 Session 明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。
+- 目录配置变化、Session 目录变化、过期或已使用的按钮都会 fail-closed。每个 Keyboard
+  最多 25 项，最多 4 页。不同通知的“切换到该 Session”按钮使用独立 group，互不失效。
 - `qq-bridge add-workspace` 规范化并去重目录，同时追加安全根和 AHP 目标列表；
   `scripts/add-workspace.ps1` 在确认当前绑定空闲后完成配置和 Bridge/Adapter 重启。
 - 旧的标量 `ahp.shared_workspace` 可读取，配置保存后迁移为
   `ahp.shared_workspaces = [...]`。
-- PC 或 QQ 首个有效审批/澄清回答生效，Host 终态再广播给另一端。
+- PC 或 QQ 首个有效审批/澄清回答生效。QQ 提交后的 Host 终态只确认数据库状态，不重复
+  发送“另一端处理”；PC 端终态仍通知 QQ。审批码、问题码和按钮保存来源 Session/Chat，
+  前台变化后仍路由回原 Binding。
 - QQ 只提供 Allow once / Deny；PC 可使用原生 Session Allow。
-- Assistant 仅在完整消息形成后推送 QQ；reasoning 和原始工具输出不外发。
-- 工具通知支持 `compact`（默认，仅终态）与 `full`。
-- Turn active 时通过 QQ C2C `msg_type=6/input_notify` 显示“正在输入”，60 秒状态
-  每 45 秒续期；完成、取消、失败、审批或澄清等待时停止。
+- Assistant Markdown response part 在边界闭合后立即推送 QQ；流式 token 不逐条外发，
+  已发送的过程段不再并入最终回复，reasoning 和原始工具输出不外发。所有响应段均带
+  `[短码 · 标题]`；审批、澄清和最终回复另提供独立前台切换按钮，通知本身不抢占前台。
+- 工具通知支持 `approval_only`（不发送工具状态，仅保留审批与 Assistant 响应）、
+  `compact`（默认，仅终态）与 `full`。Owner 可用 `/notify` 查询或即时切换，
+  结果持久化到配置，无需重启。
+- Turn active 时通过 QQ C2C `msg_type=6/input_notify` 显示“正在输入”，按
+  `session_uri + turn_id` 独立跟踪；60 秒状态每 45 秒续期，完成、取消、失败、审批或
+  澄清等待时只停止对应 Session。
 - QQ Keyboard 用于审批和 Boolean/单选问题，文本命令始终作为兜底。
 - Bridge 保存 30 天脱敏事件和 projection outbox；下次 QQ 入站被动回复补发遗漏。
 - VS Code 完全退出时编辑器托管 Host 终止，QQ 不能继续执行。
-- Host 实例变化时进行中 Turn、未决审批、输入和未 ACK 命令 fail-closed。
+- Host 实例变化时只让受影响 Binding 的进行中 Turn、未决审批、输入和未 ACK 命令
+  fail-closed；其他 Host/Session 继续运行。
+- Bridge/Adapter IPC v2 在 ready、failed、event 和 command 上显式携带
+  `binding_id + generation`。两端必须成对升级；不能把只含 generation 的 v1 Adapter
+  与多 Binding Bridge 混用。
+- 同一精确工作区的多个活动 Turn 不被强制阻断，但 Bridge 发送幂等冲突警告并建议写任务
+  使用独立 Git worktree。
 
-VS Code 1.135 实际使用 AHP `1.0.0`，精确源码 revision 为
-`f770e26b8483de59050e8de71b65a20efdab62d4`。公开 npm 0.8 tarball 与该 Host
-不完全匹配，因此安装包由 `scripts/vendor-ahp-client.ps1` 固定 revision 生成。
+VS Code 1.136 宣告 AHP `0.9.0`，其类型和 reducer 基于 revision
+`a0bc67f840788f816c9b44bb1325181cb4c4661d`，并带有 VS Code stable 的
+registry overlay。公开 npm 0.8 tarball 与该 Host 不完全匹配，因此安装包由
+`scripts/vendor-ahp-client.ps1` 固定 revision 并应用仓库 overlay 后生成。
 
 下文第 1–20 节保留最初 Hooks/MCP 设计和安全分析，作为 Legacy 模式与演进记录；
 其“不能从 QQ 创建空闲回合”等结论不适用于当前已绑定的 AHP Session。
@@ -734,6 +752,7 @@ SQLite 建议包含以下表：
 - Agent 读取 Secret 后通过 QQ 或其他网络工具外传。
 - 恶意仓库修改 Hook、MCP 或 Bridge 配置。
 - 多个 Session 的审批被用户混淆。
+- 同一工作区的并发 Session 相互覆盖文件或干扰 Git 索引。
 - Bridge 崩溃或网络中断导致误放行。
 
 ### 14.2 控制措施
@@ -747,6 +766,9 @@ SQLite 建议包含以下表：
 - Hook Helper 和 Bridge 安装在工作区外。
 - 默认不发送工具原始输出。
 - 对 Secret 文件和参数执行静态规则与模式脱敏。
+- AHP 通知显示来源 Session 短码和标题；审批/问题 token 固定来源 Binding，通知按钮只
+  改变前台，不改变 token 的路由。
+- 同工作区第二个活动 Turn 触发显著警告；有写操作的并发任务建议使用独立 Git worktree。
 - 保留不可变审计日志，但不记录 Secret。
 - 提供本机紧急停用开关和 QQ `/cancel`。
 

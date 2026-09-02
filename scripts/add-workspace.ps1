@@ -28,14 +28,26 @@ if (-not $Status.ahp) {
     throw "AHP mode is not configured."
 }
 
-$Binding = $Status.ahp.binding
-if ($Binding) {
-    if ($Binding.active_turn_id -or [int]($Binding.queued_message_count) -ne 0) {
-        throw "Wait for the current Turn and queued messages to finish before adding a workspace."
-    }
+$Bindings = @()
+if ($Status.ahp.bindings) {
+    $Bindings = @($Status.ahp.bindings)
+} elseif ($Status.ahp.binding) {
+    $Bindings = @($Status.ahp.binding)
+}
+$BusyBindings = @($Bindings | Where-Object {
+    $_.active_turn_id -or [int]($_.queued_message_count) -ne 0
+})
+if ($BusyBindings.Count -ne 0) {
+    throw "Wait for all active Turns and queued messages to finish before adding a workspace."
 }
 if ([int]($Status.ahp.pending_commands) -ne 0) {
     throw "Wait for pending Adapter commands to finish before adding a workspace."
+}
+if (
+    [int]($Status.ahp.pending_approvals) -ne 0 -or
+    [int]($Status.ahp.pending_inputs) -ne 0
+) {
+    throw "Wait for pending approvals and clarification inputs to finish before adding a workspace."
 }
 
 $Arguments = @("--config", $ConfigPath, "add-workspace")

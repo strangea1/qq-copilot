@@ -31,6 +31,35 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Bridge config not found: $ConfigPath"
 }
 
+$StatusOutput = & $Bridge --config $ConfigPath status 2>$null
+if ($LASTEXITCODE -eq 0) {
+    $Status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    if ($Status.ahp) {
+        $Bindings = @()
+        if ($Status.ahp.bindings) {
+            $Bindings = @($Status.ahp.bindings)
+        }
+        elseif ($Status.ahp.binding) {
+            $Bindings = @($Status.ahp.binding)
+        }
+        $BusyBindings = @($Bindings | Where-Object {
+            $_.active_turn_id -or [int]($_.queued_message_count) -ne 0
+        })
+        if ($BusyBindings.Count -ne 0) {
+            throw "Wait for all active Turns and queued messages to finish before switching integration."
+        }
+        if ([int]($Status.ahp.pending_commands) -ne 0) {
+            throw "Wait for pending Adapter commands to finish before switching integration."
+        }
+        if (
+            [int]($Status.ahp.pending_approvals) -ne 0 -or
+            [int]($Status.ahp.pending_inputs) -ne 0
+        ) {
+            throw "Wait for pending approvals and clarification inputs to finish before switching integration."
+        }
+    }
+}
+
 New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $UserAgentDirectory -Force | Out-Null
 

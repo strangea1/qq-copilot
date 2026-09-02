@@ -11,6 +11,8 @@ import {
   type URI,
 } from "@microsoft/agent-host-protocol";
 
+import { normalizeLegacyChatStateErrors } from "./protocol-compatibility.js";
+
 export type MirrorApplyResult =
   | "applied"
   | "invalid-action"
@@ -105,7 +107,9 @@ export class ProviderSessionStateMirror {
       );
     }
     assertSequence(snapshot.fromSeq);
-    this.#chatState = structuredClone(snapshot.state);
+    this.#chatState = structuredClone(
+      normalizeLegacyChatStateErrors(snapshot.state),
+    );
     this.#chatSeq = snapshot.fromSeq;
     return structuredClone(this.#chatState);
   }
@@ -234,6 +238,7 @@ function isChatAction(action: ActionEnvelope["action"]): action is ChatAction {
     case ActionType.ChatTurnComplete:
     case ActionType.ChatTurnCancelled:
     case ActionType.ChatError:
+    case ActionType.ChatTurnResume:
     case ActionType.ChatActivityChanged:
     case ActionType.ChatWorkingDirectorySet:
     case ActionType.ChatWorkingDirectoryRemoved:

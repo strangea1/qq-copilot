@@ -53,6 +53,7 @@ import {
   ProviderSessionStateMirror,
   type MirrorApplyResult,
 } from "./provider-state-mirror.js";
+import { normalizeLegacyActionEnvelope } from "./protocol-compatibility.js";
 
 const ROOT: "ahp-root://" = "ahp-root://";
 const MAX_SESSION_PAGES = 100;
@@ -1643,11 +1644,12 @@ class SessionBinding implements AhpSessionBinding {
           ) {
             return;
           }
-          const result = this.#mirror.applyDefaultChat(event.params);
+          const envelope = normalizeLegacyActionEnvelope(event.params);
+          const result = this.#mirror.applyDefaultChat(envelope);
           this.#handleMirrorResult(
             result,
             "chat-stream",
-            event.params,
+            envelope,
             chatUri,
           );
           if (result === "applied") {
@@ -1730,7 +1732,15 @@ class SessionBinding implements AhpSessionBinding {
     envelope: ActionEnvelope,
     chatUri?: URI,
   ): void {
-    if (result === "stale") {
+    if (result === "invalid-action" || result === "wrong-channel") {
+      this.#runtime.emitError(
+        operation,
+        new Error("invalid action envelope"),
+        chatUri,
+      );
+      return;
+    }
+    if (result === "stale" || result === "unhydrated") {
       return;
     }
     this.#runtime.emitAction(
@@ -1738,13 +1748,6 @@ class SessionBinding implements AhpSessionBinding {
       envelope,
       chatUri,
     );
-    if (result === "invalid-action" || result === "wrong-channel") {
-      this.#runtime.emitError(
-        operation,
-        new Error("invalid action envelope"),
-        chatUri,
-      );
-    }
     if (
       envelope.origin?.clientId === this.#runtime.clientId &&
       envelope.origin.clientSeq === this.#pendingTurnStartClientSeq

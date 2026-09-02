@@ -30,6 +30,7 @@ import {
   AhpOperationError,
   type ChatSnapshotEvent,
   type ConnectionEvent,
+  type CoreErrorEvent,
   type DomainActionEvent,
   type IncompatibilityEvent,
   type SessionSnapshotEvent,
@@ -44,6 +45,7 @@ interface ResourceSnapshot {
 interface FakeServerConfig {
   readonly summary: SessionSummary;
   readonly resources: ReadonlyMap<URI, ResourceSnapshot>;
+  readonly protocolVersion?: string;
   readonly beforeSubscribe?: (
     channel: URI,
     server: FakeAhpServer,
@@ -53,6 +55,8 @@ interface FakeServerConfig {
 
 class FakeAhpServer {
   readonly initializeClientIds: string[] = [];
+
+  readonly initializeProtocolVersions: string[][] = [];
 
   readonly dispatches: unknown[] = [];
 
@@ -109,8 +113,15 @@ class FakeAhpServer {
           if (clientId) {
             this.initializeClientIds.push(clientId);
           }
+          const protocolVersions = stringArrayProperty(
+            params,
+            "protocolVersions",
+          );
+          if (protocolVersions) {
+            this.initializeProtocolVersions.push(protocolVersions);
+          }
           await this.#respond(message.id, {
-            protocolVersion: "1.0.0",
+            protocolVersion: this.#config.protocolVersion ?? "0.9.0",
             serverSeq: 1,
             snapshots: [
               {
@@ -276,6 +287,10 @@ test("core gates protocols, lists all endpoints, keeps clientId stable, and reda
     ]);
     assert.deepEqual(serverA.initializeClientIds, ["stable-client-id"]);
     assert.deepEqual(serverB.initializeClientIds, ["stable-client-id"]);
+    assert.equal(
+      serverA.initializeProtocolVersions[0]?.includes("0.9.0"),
+      true,
+    );
     assert.equal(incompatibilities.length, 1);
     assert.equal(incompatibilities[0]?.reason, "advertised-version");
 
@@ -306,6 +321,45 @@ test("core gates protocols, lists all endpoints, keeps clientId stable, and reda
   } finally {
     await core.stop();
     await Promise.all([serverA.done, serverB.done]);
+  }
+});
+
+test("core rejects a negotiated protocol that differs from the endpoint advertisement", async () => {
+  const entry = fakeEndpoint(
+    "n",
+    "endpoint_N_123456",
+    "token_N_123456789012345678901234",
+    "\\\\.\\pipe\\secret-ahp-n",
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.pair();
+  const server = new FakeAhpServer(serverTransport, {
+    summary: summary("opaque-session-n", "Negotiation mismatch"),
+    resources: new Map(),
+    protocolVersion: "1.0.0",
+  });
+  const incompatibilities: IncompatibilityEvent[] = [];
+  const core = new AhpCore({
+    userDataDirectory: "unused",
+    clientId: "protocol-gate-client",
+    watch: false,
+    callbacks: {
+      onIncompatibility: (event) => incompatibilities.push(event),
+    },
+    dependencies: {
+      discoverEndpoints: async () => [entry],
+      openTransport: async () => clientTransport,
+    },
+  });
+
+  try {
+    const catalogue = await core.start();
+    assert.equal(catalogue.endpoints[0]?.connection, "incompatible");
+    assert.equal(catalogue.endpoints[0]?.selectedProtocol, "1.0.0");
+    assert.equal(incompatibilities[0]?.reason, "negotiated-version");
+    assert.equal(incompatibilities[0]?.selectedProtocol, "1.0.0");
+  } finally {
+    await core.stop();
+    await server.done;
   }
 });
 
@@ -451,6 +505,7 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
   const sessionSnapshots: SessionSnapshotEvent[] = [];
   const chatSnapshots: ChatSnapshotEvent[] = [];
   const actions: DomainActionEvent[] = [];
+  const errors: CoreErrorEvent[] = [];
   let monotonicNow = 500;
   const ids = ["new-turn", "queued-message"];
   const core = new AhpCore({
@@ -461,6 +516,7 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
       onSessionSnapshot: (event) => sessionSnapshots.push(event),
       onChatSnapshot: (event) => chatSnapshots.push(event),
       onAction: (event) => actions.push(event),
+      onError: (event) => errors.push(event),
     },
     dependencies: {
       discoverEndpoints: async () => [entry],
@@ -503,6 +559,14 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
     await waitFor(
       () => binding.snapshot().defaultChat?.activeTurn === undefined,
     );
+    const actionCount = actions.length;
+    await server.emitAction(
+      chatB,
+      { type: "chat/unknown" },
+      23,
+    );
+    await waitFor(() => errors.length > 0);
+    assert.equal(actions.length, actionCount);
 
     const firstPromise = binding.queueUserText("start now");
     const secondPromise = binding.queueUserText("queue next");
@@ -610,7 +674,7 @@ function fakeEndpoint(
   instanceId: string,
   connectionToken: string,
   pipePath: string,
-  protocolVersion = "1.0.0",
+  protocolVersion = "0.9.0",
 ): EndpointRegistryEntry {
   return {
     schemaVersion: 2,
@@ -673,6 +737,24 @@ function numberProperty(
 ): number | undefined {
   const value = record[key];
   return typeof value === "number" ? value : undefined;
+}
+
+function stringArrayProperty(
+  record: Record<string, unknown>,
+  key: string,
+): string[] | undefined {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return undefined;
+    }
+    strings.push(item);
+  }
+  return strings;
 }
 
 interface DispatchDetails {

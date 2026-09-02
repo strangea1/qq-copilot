@@ -43,7 +43,7 @@ test("registry watcher detects editor endpoint creation and aborts cleanly", asy
         type: "editor",
         pid: process.pid,
         instanceId,
-        protocolVersion: "1.0.0",
+        protocolVersion: "0.9.0",
         connectionToken,
         endpoint: {
           type: "socket",

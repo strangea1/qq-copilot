@@ -10,14 +10,17 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     task::JoinHandle,
     time::{Instant, sleep},
 };
 use uuid::Uuid;
 
 use crate::{
-    ahp_store::{AhpApprovalRecord, AhpInputRecord, AhpStatus, NewAhpApproval, NewAhpInput},
+    ahp_store::{
+        AhpApprovalRecord, AhpInputRecord, AhpStatus, MAX_TRACKED_AHP_SESSIONS, NewAhpApproval,
+        NewAhpInput,
+    },
     config::{AhpToolNotificationMode, AppConfig},
     db::{
         ApprovalRecord, BeginDelivery, BindOutcome, Database, NewApproval, NewDelivery,
@@ -50,6 +53,7 @@ pub struct BridgeService {
     config_path: PathBuf,
     database: Database,
     qq: Arc<dyn QqMessenger>,
+    tool_notification_mode: RwLock<AhpToolNotificationMode>,
     final_delivery_lock: Mutex<()>,
     typing_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
 }
@@ -70,6 +74,8 @@ struct AhpTextEventData {
     complete: bool,
     #[serde(default)]
     historical: bool,
+    #[serde(default)]
+    final_response: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,11 +142,13 @@ impl BridgeService {
         database: Database,
         qq: Arc<dyn QqMessenger>,
     ) -> Self {
+        let tool_notification_mode = config.ahp.tool_notification_mode;
         Self {
             config,
             config_path,
             database,
             qq,
+            tool_notification_mode: RwLock::new(tool_notification_mode),
             final_delivery_lock: Mutex::new(()),
             typing_tasks: Mutex::new(HashMap::new()),
         }
@@ -299,11 +307,13 @@ impl BridgeService {
                     &hosts,
                     &sessions,
                 )?;
+                self.reconcile_recent_ahp_sessions(&sessions)?;
                 Ok(json!({"accepted": true}))
             }
             BridgeRequest::AhpBindingReady {
                 adapter_id,
                 adapter_instance_id,
+                binding_id,
                 endpoint_id,
                 host_instance_id,
                 binding_generation,
@@ -312,9 +322,11 @@ impl BridgeService {
                 last_server_sequence,
             } => {
                 self.require_ahp_enabled()?;
+                validate_identifier("binding_id", &binding_id)?;
                 self.database.ahp_binding_ready(
                     &adapter_id,
                     &adapter_instance_id,
+                    &binding_id,
                     &endpoint_id,
                     &host_instance_id,
                     binding_generation,
@@ -327,14 +339,17 @@ impl BridgeService {
             BridgeRequest::AhpBindingFailed {
                 adapter_id,
                 adapter_instance_id,
+                binding_id,
                 binding_generation,
                 reason_code,
             } => {
                 self.require_ahp_enabled()?;
+                validate_identifier("binding_id", &binding_id)?;
                 validate_short_code("reason_code", &reason_code)?;
                 self.database.ahp_binding_failed(
                     &adapter_id,
                     &adapter_instance_id,
+                    &binding_id,
                     binding_generation,
                     &reason_code,
                 )?;
@@ -343,10 +358,12 @@ impl BridgeService {
             BridgeRequest::AhpPublishEvents {
                 adapter_id,
                 adapter_instance_id,
+                binding_id,
                 binding_generation,
                 events,
             } => {
                 self.require_ahp_enabled()?;
+                validate_identifier("binding_id", &binding_id)?;
                 validate_ahp_events(&events)?;
                 let events: Vec<_> = events
                     .into_iter()
@@ -358,6 +375,7 @@ impl BridgeService {
                 let pending_event_ids = self.database.ahp_publish_events(
                     &adapter_id,
                     &adapter_instance_id,
+                    &binding_id,
                     binding_generation,
                     &events,
                 )?;
@@ -706,7 +724,7 @@ impl BridgeService {
                         (
                             0,
                             Some(format!(
-                                "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
+                                "前台已切换到 {}：{}\n目录: {}\nBinding: {}",
                                 submission
                                     .session
                                     .short_code
@@ -714,7 +732,7 @@ impl BridgeService {
                                     .unwrap_or("[unknown]"),
                                 submission.session.title,
                                 workspace.display(),
-                                submission.binding.generation
+                                submission.binding.state
                             )),
                         )
                     } else {
@@ -1194,6 +1212,40 @@ impl BridgeService {
                     }
                 }
             }
+            "/cancel" if !argument.is_empty() && remainder.is_empty() => {
+                let Some(session) = self.database.ahp_session_by_code(argument)? else {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_cancel_invalid")?;
+                    return Ok(Some(format!(
+                        "Session 编号 {} 不存在，发送 /sessions 查看。",
+                        argument.to_ascii_uppercase()
+                    )));
+                };
+                if !ahp_session_matches_workspace(&self.config, &session) {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_cancel_forbidden")?;
+                    return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
+                }
+                match self
+                    .database
+                    .ahp_enqueue_cancel_for_session(message_id, &session.session_uri)
+                {
+                    Ok(_) => {
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_cancel_target")?;
+                        Ok(Some(format!(
+                            "Session {} 的取消请求已排队。",
+                            session.short_code.as_deref().unwrap_or("[unknown]")
+                        )))
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "targeted AHP cancel request rejected");
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_cancel_target_rejected")?;
+                        Ok(Some("指定 Session 当前没有可取消的活动 Turn。".to_owned()))
+                    }
+                }
+            }
             "/ask" if !argument.is_empty() => {
                 let content = if remainder.is_empty() {
                     argument.to_owned()
@@ -1201,6 +1253,54 @@ impl BridgeService {
                     format!("{argument} {remainder}")
                 };
                 self.queue_ahp_owner_message(message_id, &content)
+            }
+            "/send" if !argument.is_empty() && !remainder.is_empty() => {
+                let Some(session) = self.database.ahp_session_by_code(argument)? else {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_send_invalid")?;
+                    return Ok(Some(format!(
+                        "Session 编号 {} 不存在，发送 /sessions 查看。",
+                        argument.to_ascii_uppercase()
+                    )));
+                };
+                if !ahp_session_matches_workspace(&self.config, &session) {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_send_forbidden")?;
+                    return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
+                }
+                if let Err(error) = self
+                    .database
+                    .ahp_track_session(&session.endpoint_id, &session.session_uri)
+                {
+                    tracing::warn!(error = %error, "target AHP Session could not be tracked");
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_send_capacity_rejected")?;
+                    return Ok(Some(
+                        "无法加入该 Session：5 个后台槽位均正在运行、排队或等待交互。".to_owned(),
+                    ));
+                }
+                match self.database.ahp_enqueue_message_to_session(
+                    message_id,
+                    &session.session_uri,
+                    remainder,
+                ) {
+                    Ok(_) => {
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_send_target")?;
+                        Ok(Some(format!(
+                            "消息已发送到 Session {}，前台 Session 未改变。",
+                            session.short_code.as_deref().unwrap_or("[unknown]")
+                        )))
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "targeted AHP message rejected");
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_send_target_rejected")?;
+                        Ok(Some(
+                            "目标 Session 的 Adapter Binding 尚未就绪。".to_owned(),
+                        ))
+                    }
+                }
             }
             "/answer" if !argument.is_empty() && !remainder.is_empty() => {
                 let input = self.database.ahp_input_by_code(argument)?;
@@ -1227,7 +1327,7 @@ impl BridgeService {
                     .mark_inbound_kind(message_id, "ahp_sessions")?;
                 Ok(Some(format_ahp_sessions(
                     &self.config,
-                    self.database.ahp_binding()?.as_ref(),
+                    &self.database.ahp_bindings()?,
                     &self.database.ahp_list_sessions()?,
                 )))
             }
@@ -1251,18 +1351,6 @@ impl BridgeService {
                         .mark_inbound_kind(message_id, "ahp_switch_forbidden")?;
                     return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
                 }
-                let already_bound = self.database.ahp_binding()?.is_some_and(|binding| {
-                    binding.endpoint_id == session.endpoint_id
-                        && binding.session_uri == session.session_uri
-                });
-                if !already_bound && !ahp_session_is_idle(&session) {
-                    self.database
-                        .mark_inbound_kind(message_id, "ahp_switch_busy_target")?;
-                    return Ok(Some(format!(
-                        "目标 Session {} 当前正忙，请等待其空闲后再切换。",
-                        session.short_code.as_deref().unwrap_or("[unknown]")
-                    )));
-                }
                 match self
                     .database
                     .ahp_bind_session(&session.endpoint_id, &session.session_uri)
@@ -1270,34 +1358,126 @@ impl BridgeService {
                     Ok(binding) => {
                         self.database.mark_inbound_kind(message_id, "ahp_switch")?;
                         Ok(Some(format!(
-                            "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
+                            "前台已切换到 {}：{}\n目录: {}\nBinding: {}",
                             session.short_code.as_deref().unwrap_or("[unknown]"),
                             session.title,
                             ahp_session_target_workspace(&self.config, &session)
                                 .expect("filtered target workspace")
                                 .display(),
-                            binding.generation
+                            binding.state
                         )))
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "AHP Session switch rejected");
                         self.database
                             .mark_inbound_kind(message_id, "ahp_switch_rejected")?;
-                        Ok(Some("当前绑定或目标 Session 正忙，暂不能切换。".to_owned()))
+                        Ok(Some(
+                            "无法切换：5 个后台槽位均正在运行、排队或等待交互。".to_owned(),
+                        ))
+                    }
+                }
+            }
+            "/detach" if !argument.is_empty() && remainder.is_empty() => {
+                let Some(session) = self.database.ahp_session_by_code(argument)? else {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_detach_invalid")?;
+                    return Ok(Some(format!(
+                        "Session 编号 {} 不存在，发送 /sessions 查看。",
+                        argument.to_ascii_uppercase()
+                    )));
+                };
+                if !ahp_session_matches_workspace(&self.config, &session) {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_detach_forbidden")?;
+                    return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
+                }
+                match self.database.ahp_detach_session(&session.session_uri) {
+                    Ok(true) => {
+                        self.database.mark_inbound_kind(message_id, "ahp_detach")?;
+                        Ok(Some(format!(
+                            "Session {} 已进入安全解绑队列。",
+                            session.short_code.as_deref().unwrap_or("[unknown]")
+                        )))
+                    }
+                    Ok(false) => {
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_detach_not_tracked")?;
+                        Ok(Some("该 Session 当前未被后台监控。".to_owned()))
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "AHP Session detach rejected");
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_detach_rejected")?;
+                        Ok(Some(
+                            "该 Session 正在运行、排队或等待交互，不能安全解绑。".to_owned(),
+                        ))
                     }
                 }
             }
             "/status" if argument.is_empty() && remainder.is_empty() => {
                 self.database.mark_inbound_kind(message_id, "ahp_status")?;
+                let mode = self.current_tool_notification_mode().await;
                 Ok(Some(format_ahp_status(
                     &self
                         .database
                         .ahp_status(self.config.ahp.adapter_stale_seconds)?,
+                    mode,
                 )))
+            }
+            "/notify" if remainder.is_empty() => {
+                if argument.is_empty() {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_notify_status")?;
+                    return Ok(Some(format_notification_mode(
+                        self.current_tool_notification_mode().await,
+                    )));
+                }
+                let Ok(mode) = argument.parse::<AhpToolNotificationMode>() else {
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_notify_invalid")?;
+                    return Ok(Some(
+                        "未知通知模式。使用 /notify approval_only、/notify compact 或 /notify full。"
+                            .to_owned(),
+                    ));
+                };
+                match self.set_tool_notification_mode(mode).await {
+                    Ok(changed) => {
+                        self.database.mark_inbound_kind(
+                            message_id,
+                            if changed {
+                                "ahp_notify_changed"
+                            } else {
+                                "ahp_notify_unchanged"
+                            },
+                        )?;
+                        Ok(Some(format!(
+                            "通知模式{} {}，已写入配置；后续事件立即生效，无需重启。\n{}",
+                            if changed { "已切换为" } else { "已经是" },
+                            mode.as_str(),
+                            notification_mode_description(mode)
+                        )))
+                    }
+                    Err(error) => {
+                        let current = self.current_tool_notification_mode().await;
+                        tracing::warn!(
+                            error = %error,
+                            requested_mode = mode.as_str(),
+                            "notification mode update failed"
+                        );
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_notify_failed")?;
+                        Ok(Some(format!(
+                            "通知模式切换失败，仍保持 {}。请检查本机 Bridge 日志和配置文件权限。",
+                            current.as_str()
+                        )))
+                    }
+                }
             }
             "/help" if argument.is_empty() && remainder.is_empty() => {
                 self.database.mark_inbound_kind(message_id, "ahp_help")?;
-                Ok(Some(ahp_help_text()))
+                Ok(Some(ahp_help_text(
+                    self.current_tool_notification_mode().await,
+                )))
             }
             _ if verb.starts_with('/') => {
                 self.database
@@ -1395,7 +1575,17 @@ impl BridgeService {
         match self.database.ahp_enqueue_message(message_id, content) {
             Ok(_) => {
                 self.database.mark_inbound_kind(message_id, "ahp_message")?;
-                Ok(Some("消息已进入共享会话队列。".to_owned()))
+                let session_code = if let Some(binding) = self.database.ahp_binding()? {
+                    self.database
+                        .ahp_session_by_uri(&binding.session_uri)?
+                        .and_then(|session| session.short_code)
+                        .unwrap_or_else(|| "[unknown]".to_owned())
+                } else {
+                    "[unknown]".to_owned()
+                };
+                Ok(Some(format!(
+                    "消息已进入前台 Session {session_code} 的队列。"
+                )))
             }
             Err(error) => {
                 tracing::warn!(error = %error, "AHP shared message rejected");
@@ -1408,7 +1598,24 @@ impl BridgeService {
         }
     }
 
+    async fn current_tool_notification_mode(&self) -> AhpToolNotificationMode {
+        *self.tool_notification_mode.read().await
+    }
+
+    async fn set_tool_notification_mode(&self, mode: AhpToolNotificationMode) -> Result<bool> {
+        let mut current = self.tool_notification_mode.write().await;
+        let mut config = AppConfig::load(&self.config_path)?;
+        let changed = *current != mode || config.ahp.tool_notification_mode != mode;
+        if config.ahp.tool_notification_mode != mode {
+            config.ahp.tool_notification_mode = mode;
+            config.save(&self.config_path)?;
+        }
+        *current = mode;
+        Ok(changed)
+    }
+
     async fn handle_ahp_event(&self, adapter_id: &str, event: &AhpPublishedEvent) -> Result<()> {
+        let session_label = self.ahp_session_label(&event.session_uri)?;
         match event.kind {
             AhpEventKind::UserMessage => {
                 let data: AhpTextEventData = serde_json::from_value(event.data.clone())?;
@@ -1421,11 +1628,11 @@ impl BridgeService {
                 self.try_deliver_ahp_event_projection(
                     &event.event_id,
                     "ahp_user_message",
-                    &format!("[PC]\n{}", data.content),
+                    &format!("{session_label}\n[PC]\n{}", data.content),
                 )
                 .await;
                 if let Some(turn_id) = event.turn_id.as_deref() {
-                    self.start_ahp_typing(turn_id).await;
+                    self.start_ahp_typing(&event.session_uri, turn_id).await;
                 }
             }
             AhpEventKind::AssistantMessage => {
@@ -1433,34 +1640,47 @@ impl BridgeService {
                 if !data.complete || data.historical {
                     return Ok(());
                 }
-                self.stop_ahp_typing(event.turn_id.as_deref()).await;
+                let final_response = data.final_response.unwrap_or(data.complete);
+                if final_response {
+                    self.stop_ahp_typing(&event.session_uri, event.turn_id.as_deref())
+                        .await;
+                }
                 self.try_deliver_ahp_event_projection(
                     &event.event_id,
                     "ahp_assistant_message",
-                    &data.content,
+                    &format!("{session_label}\n{}", data.content),
                 )
                 .await;
+                if final_response {
+                    self.try_send_ahp_focus_button(
+                        &event.session_uri,
+                        &format!("assistant:{}", event.event_id),
+                        &session_label,
+                    )
+                    .await;
+                }
             }
             AhpEventKind::ToolStatus => {
                 let data: AhpToolEventData = serde_json::from_value(event.data.clone())?;
-                if !should_notify_tool(self.config.ahp.tool_notification_mode, &data.status) {
+                if !should_notify_tool(self.current_tool_notification_mode().await, &data.status) {
                     return Ok(());
                 }
                 self.try_deliver_ahp_event_projection(
                     &event.event_id,
                     "ahp_tool_status",
                     &format!(
-                        "[工具 {}]\n状态: {}\n{}",
+                        "{session_label}\n[工具 {}]\n状态: {}\n{}",
                         data.tool_name, data.status, data.summary
                     ),
                 )
                 .await;
                 if let Some(turn_id) = event.turn_id.as_deref() {
-                    self.start_ahp_typing(turn_id).await;
+                    self.start_ahp_typing(&event.session_uri, turn_id).await;
                 }
             }
             AhpEventKind::ApprovalPending => {
-                self.stop_ahp_typing(event.turn_id.as_deref()).await;
+                self.stop_ahp_typing(&event.session_uri, event.turn_id.as_deref())
+                    .await;
                 let data: AhpApprovalPendingData = serde_json::from_value(event.data.clone())?;
                 let chat_uri = event
                     .chat_uri
@@ -1483,7 +1703,8 @@ impl BridgeService {
                         + i64::try_from(self.config.bridge.approval_ttl_seconds)?,
                 })?;
                 if approval.created {
-                    self.send_ahp_approval_notification(&approval.record).await;
+                    self.send_ahp_approval_notification(&approval.record, &session_label)
+                        .await;
                 }
             }
             AhpEventKind::ApprovalResolved => {
@@ -1497,7 +1718,7 @@ impl BridgeService {
                         &event.event_id,
                         "ahp_approval_resolved",
                         &format!(
-                            "审批 {} 已由 {} {}。",
+                            "{session_label}\n审批 {} 已由 {} {}。",
                             record.short_code,
                             data.client_id.as_deref().unwrap_or("Agent Host"),
                             if data.approved { "批准" } else { "拒绝" }
@@ -1505,12 +1726,13 @@ impl BridgeService {
                     )
                     .await;
                     if let Some(turn_id) = event.turn_id.as_deref() {
-                        self.start_ahp_typing(turn_id).await;
+                        self.start_ahp_typing(&event.session_uri, turn_id).await;
                     }
                 }
             }
             AhpEventKind::InputPending => {
-                self.stop_ahp_typing(event.turn_id.as_deref()).await;
+                self.stop_ahp_typing(&event.session_uri, event.turn_id.as_deref())
+                    .await;
                 let data: AhpInputPendingData = serde_json::from_value(event.data.clone())?;
                 let input = self.database.ahp_begin_input(&NewAhpInput {
                     input_key: data.input_key,
@@ -1528,31 +1750,50 @@ impl BridgeService {
                         + i64::try_from(self.config.bridge.question_ttl_seconds)?,
                 })?;
                 if input.created {
-                    self.send_ahp_input_notification(&input.record).await;
+                    self.send_ahp_input_notification(&input.record, &session_label)
+                        .await;
                 }
             }
             AhpEventKind::InputResolved => {
                 let data: AhpInputResolvedData = serde_json::from_value(event.data.clone())?;
-                if let Some(input) = self.database.ahp_resolve_input(
-                    &data.input_key,
-                    &data.outcome,
-                    data.client_id.as_deref(),
-                )? {
-                    self.try_deliver_ahp_event_projection(
-                        &event.event_id,
-                        "ahp_input_resolved",
-                        &format!("问题 {} 已由另一端处理。", input.short_code),
-                    )
-                    .await;
+                if let Some(resolution) = self
+                    .database
+                    .ahp_resolve_input(&data.input_key, &data.outcome, data.client_id.as_deref())?
+                    .filter(|resolution| resolution.transitioned)
+                {
+                    let resolved_by_qq = match data.client_id.as_deref() {
+                        Some(client_id) => client_id == adapter_id,
+                        None => resolution
+                            .decided_by_surface
+                            .as_deref()
+                            .is_some_and(|surface| surface.starts_with("qq_")),
+                    };
+                    if !resolved_by_qq {
+                        let resolution_message = if data.client_id.is_some() {
+                            format!("问题 {} 已在 PC 端处理。", resolution.record.short_code)
+                        } else {
+                            format!(
+                                "问题 {} 已由 Agent Host 处理。",
+                                resolution.record.short_code
+                            )
+                        };
+                        self.try_deliver_ahp_event_projection(
+                            &event.event_id,
+                            "ahp_input_resolved",
+                            &format!("{session_label}\n{resolution_message}"),
+                        )
+                        .await;
+                    }
                     if let Some(turn_id) = event.turn_id.as_deref() {
-                        self.start_ahp_typing(turn_id).await;
+                        self.start_ahp_typing(&event.session_uri, turn_id).await;
                     }
                 }
             }
             AhpEventKind::TurnCancelled
             | AhpEventKind::TurnFailed
             | AhpEventKind::HostDisconnected => {
-                self.stop_ahp_typing(event.turn_id.as_deref()).await;
+                self.stop_ahp_typing(&event.session_uri, event.turn_id.as_deref())
+                    .await;
                 let data: AhpTurnEventData = serde_json::from_value(event.data.clone())?;
                 let default_summary = match event.kind {
                     AhpEventKind::TurnCancelled => "当前 Turn 已取消",
@@ -1563,19 +1804,75 @@ impl BridgeService {
                 self.try_deliver_ahp_event_projection(
                     &event.event_id,
                     "ahp_turn_state",
-                    data.summary.as_deref().unwrap_or(default_summary),
+                    &format!(
+                        "{session_label}\n{}",
+                        data.summary.as_deref().unwrap_or(default_summary)
+                    ),
                 )
                 .await;
             }
             AhpEventKind::TurnStarted => {
                 if let Some(turn_id) = event.turn_id.as_deref() {
-                    self.start_ahp_typing(turn_id).await;
+                    self.start_ahp_typing(&event.session_uri, turn_id).await;
                 }
+                self.warn_on_shared_workspace_turns(event, &session_label)
+                    .await?;
             }
             AhpEventKind::TurnCompleted => {
-                self.stop_ahp_typing(event.turn_id.as_deref()).await;
+                self.stop_ahp_typing(&event.session_uri, event.turn_id.as_deref())
+                    .await;
             }
             AhpEventKind::SessionSnapshot | AhpEventKind::ChatSnapshot => {}
+        }
+        Ok(())
+    }
+
+    async fn warn_on_shared_workspace_turns(
+        &self,
+        event: &AhpPublishedEvent,
+        session_label: &str,
+    ) -> Result<()> {
+        let Some(current_session) = self.database.ahp_session_by_uri(&event.session_uri)? else {
+            return Ok(());
+        };
+        let Some(current_workspace) = ahp_session_target_workspace(&self.config, &current_session)
+        else {
+            return Ok(());
+        };
+        for binding in self.database.ahp_bindings()? {
+            if binding.session_uri == event.session_uri || binding.active_turn_id.is_none() {
+                continue;
+            }
+            let Some(other_session) = self.database.ahp_session_by_uri(&binding.session_uri)?
+            else {
+                continue;
+            };
+            let Some(other_workspace) = ahp_session_target_workspace(&self.config, &other_session)
+            else {
+                continue;
+            };
+            if other_workspace != current_workspace {
+                continue;
+            }
+            let other_label = self.ahp_session_label(&binding.session_uri)?;
+            let warning_key = sha256_hex(
+                format!(
+                    "{}:{}:{}",
+                    event.event_id,
+                    binding.binding_id,
+                    binding.active_turn_id.as_deref().unwrap_or_default()
+                )
+                .as_bytes(),
+            );
+            self.try_send_ahp_projection(
+                "ahp_workspace_conflict",
+                &format!("ahp-workspace-conflict:{warning_key}"),
+                &format!(
+                    "⚠ 同工作区并发警告\n{session_label} 与 {other_label} 正在同时执行 Turn。\n\
+                     两个 Agent 可能互相覆盖文件、干扰测试或 Git 索引；写任务建议使用独立 Git worktree。"
+                ),
+            )
+            .await;
         }
         Ok(())
     }
@@ -1586,7 +1883,7 @@ impl BridgeService {
         }
     }
 
-    async fn start_ahp_typing(&self, turn_id: &str) {
+    async fn start_ahp_typing(&self, session_uri: &str, turn_id: &str) {
         if !self.config.ahp.typing_indicator_enabled {
             return;
         }
@@ -1595,7 +1892,8 @@ impl BridgeService {
             _ => return,
         };
         let mut tasks = self.typing_tasks.lock().await;
-        for (_, task) in tasks.drain() {
+        let task_key = format!("{session_uri}\0{turn_id}");
+        if let Some(task) = tasks.remove(&task_key) {
             task.abort();
         }
         let qq = self.qq.clone();
@@ -1611,18 +1909,26 @@ impl BridgeService {
                 sleep(Duration::from_secs(u64::from(refresh))).await;
             }
         });
-        tasks.insert(turn_id.to_owned(), task);
+        tasks.insert(task_key, task);
     }
 
-    async fn stop_ahp_typing(&self, turn_id: Option<&str>) {
+    async fn stop_ahp_typing(&self, session_uri: &str, turn_id: Option<&str>) {
         let mut tasks = self.typing_tasks.lock().await;
         if let Some(turn_id) = turn_id {
-            if let Some(task) = tasks.remove(turn_id) {
+            if let Some(task) = tasks.remove(&format!("{session_uri}\0{turn_id}")) {
                 task.abort();
             }
         } else {
-            for (_, task) in tasks.drain() {
-                task.abort();
+            let prefix = format!("{session_uri}\0");
+            let matching: Vec<_> = tasks
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for key in matching {
+                if let Some(task) = tasks.remove(&key) {
+                    task.abort();
+                }
             }
         }
     }
@@ -1713,10 +2019,25 @@ impl BridgeService {
         (Some(content), selected)
     }
 
-    async fn send_ahp_approval_notification(&self, approval: &AhpApprovalRecord) {
+    async fn send_ahp_approval_notification(
+        &self,
+        approval: &AhpApprovalRecord,
+        session_label: &str,
+    ) {
         if self.config.qq.approval_buttons_enabled {
-            match self.send_ahp_approval_buttons(approval).await {
-                Ok(()) => return,
+            match self
+                .send_ahp_approval_buttons(approval, session_label)
+                .await
+            {
+                Ok(()) => {
+                    self.try_send_ahp_focus_button(
+                        &approval.session_uri,
+                        &format!("approval:{}", approval.approval_key),
+                        session_label,
+                    )
+                    .await;
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(
                         approval_key = %approval.approval_key,
@@ -1729,12 +2050,22 @@ impl BridgeService {
         self.try_send_ahp_projection(
             "ahp_approval",
             &format!("ahp-approval:{}:text", approval.approval_key),
-            &format_ahp_approval(approval),
+            &format_ahp_approval(approval, session_label),
+        )
+        .await;
+        self.try_send_ahp_focus_button(
+            &approval.session_uri,
+            &format!("approval:{}", approval.approval_key),
+            session_label,
         )
         .await;
     }
 
-    async fn send_ahp_approval_buttons(&self, approval: &AhpApprovalRecord) -> Result<()> {
+    async fn send_ahp_approval_buttons(
+        &self,
+        approval: &AhpApprovalRecord,
+        session_label: &str,
+    ) -> Result<()> {
         let owner = self.database.owner()?.context("no QQ owner is bound")?;
         if !owner.enabled {
             bail!("QQ remote control is disabled by the local emergency switch");
@@ -1751,7 +2082,8 @@ impl BridgeService {
             return Ok(());
         }
         let markdown = format!(
-            "## 工具{}审批 {}\n工具：{}\n{}\n\n按钮不可用时：`/allow {}` 或 `/deny {}`",
+            "{}\n## 工具{}审批 {}\n工具：{}\n{}\n\n按钮不可用时：`/allow {}` 或 `/deny {}`",
+            escape_qq_markdown(session_label),
             if approval.stage == "result" {
                 "结果复核"
             } else {
@@ -1798,13 +2130,21 @@ impl BridgeService {
         }
     }
 
-    async fn send_ahp_input_notification(&self, input: &AhpInputRecord) {
+    async fn send_ahp_input_notification(&self, input: &AhpInputRecord, session_label: &str) {
         if self.config.qq.approval_buttons_enabled
             && input.selection_mode == "single"
             && !input.buttons.is_empty()
         {
-            match self.send_ahp_input_buttons(input).await {
-                Ok(()) => return,
+            match self.send_ahp_input_buttons(input, session_label).await {
+                Ok(()) => {
+                    self.try_send_ahp_focus_button(
+                        &input.session_uri,
+                        &format!("input:{}", input.input_key),
+                        session_label,
+                    )
+                    .await;
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(
                         input_key = %input.input_key,
@@ -1817,12 +2157,22 @@ impl BridgeService {
         self.try_send_ahp_projection(
             "ahp_input",
             &format!("ahp-input:{}:text", input.input_key),
-            &format_ahp_input(input),
+            &format_ahp_input(input, session_label),
+        )
+        .await;
+        self.try_send_ahp_focus_button(
+            &input.session_uri,
+            &format!("input:{}", input.input_key),
+            session_label,
         )
         .await;
     }
 
-    async fn send_ahp_input_buttons(&self, input: &AhpInputRecord) -> Result<()> {
+    async fn send_ahp_input_buttons(
+        &self,
+        input: &AhpInputRecord,
+        session_label: &str,
+    ) -> Result<()> {
         let owner = self.database.owner()?.context("no QQ owner is bound")?;
         if !owner.enabled {
             bail!("QQ remote control is disabled by the local emergency switch");
@@ -1858,10 +2208,12 @@ impl BridgeService {
                 &owner.user_openid,
                 &ChoiceButtons {
                     markdown: format!(
-                        "## Agent 提问 {}\n{}\n\n{}\n\n按钮不可用时可直接回复选项文本。",
+                        "{}\n## Agent 提问 {}\n{}\n\n{}\n\n按钮不可用时使用 `/answer {} <文本>`。",
+                        escape_qq_markdown(session_label),
                         escape_qq_markdown(&input.short_code),
                         escape_qq_markdown(&input.prompt),
-                        options
+                        options,
+                        escape_qq_markdown(&input.short_code)
                     ),
                     button_id_prefix: "choice".to_owned(),
                     choices,
@@ -1894,8 +2246,96 @@ impl BridgeService {
         }
     }
 
+    async fn try_send_ahp_focus_button(&self, session_uri: &str, key: &str, session_label: &str) {
+        if !self.config.qq.approval_buttons_enabled {
+            return;
+        }
+        if let Err(error) = self
+            .send_ahp_focus_button(session_uri, key, session_label)
+            .await
+        {
+            tracing::warn!(error = %error, "AHP Session focus button was not delivered");
+        }
+    }
+
+    async fn send_ahp_focus_button(
+        &self,
+        session_uri: &str,
+        key: &str,
+        session_label: &str,
+    ) -> Result<()> {
+        let owner = self.database.owner()?.context("no QQ owner is bound")?;
+        if !owner.enabled {
+            bail!("QQ remote control is disabled by the local emergency switch");
+        }
+        let buttons = self.database.ahp_create_session_switch_buttons(
+            &[session_uri.to_owned()],
+            self.config.bridge.question_ttl_seconds,
+        )?;
+        let button = buttons
+            .into_iter()
+            .next()
+            .context("AHP Session disappeared while creating a focus button")?;
+        let code = button
+            .session
+            .short_code
+            .clone()
+            .unwrap_or_else(|| "Session".to_owned());
+        let delivery = self.database.begin_delivery(NewDelivery {
+            delivery_id: Uuid::new_v4(),
+            idempotency_key: format!("ahp-session-focus:{key}"),
+            kind: "ahp_session_focus_button".to_owned(),
+            session_id: None,
+        })?;
+        if !delivery.created {
+            self.wait_for_existing_delivery(delivery).await?;
+            return Ok(());
+        }
+        let result = self
+            .qq
+            .send_choice_buttons(
+                &owner.user_openid,
+                &ChoiceButtons {
+                    markdown: format!(
+                        "{}\n任务仍在其原 Session 中，可按需切换前台查看或继续对话。",
+                        escape_qq_markdown(session_label)
+                    ),
+                    button_id_prefix: "session".to_owned(),
+                    choices: vec![ChoiceButton {
+                        label: format!("切换到 {code}"),
+                        button_data: button.button_data,
+                    }],
+                },
+                None,
+                0,
+            )
+            .await;
+        match result {
+            Ok(receipt) => {
+                self.database
+                    .record_sent_message(delivery.record.delivery_id, 1)?;
+                self.database.finish_delivery(
+                    delivery.record.delivery_id,
+                    "sent",
+                    Some(&receipt.message_id),
+                    None,
+                )?;
+                Ok(())
+            }
+            Err(error) => {
+                self.database.finish_delivery(
+                    delivery.record.delivery_id,
+                    "in_doubt",
+                    None,
+                    Some("qq_session_focus_delivery_error"),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
     async fn send_ahp_session_switch_menu(&self, message_id: &str) -> Result<Option<String>> {
-        let binding = self.database.ahp_binding()?;
+        let bindings = self.database.ahp_bindings()?;
         let sessions: Vec<_> = self
             .database
             .ahp_list_sessions()?
@@ -1939,15 +2379,22 @@ impl BridgeService {
             let session_lines = page
                 .iter()
                 .map(|button| {
-                    let current = binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.session_uri == button.session.session_uri);
+                    let binding = bindings
+                        .iter()
+                        .find(|binding| binding.session_uri == button.session.session_uri);
+                    let current = binding.is_some_and(|binding| binding.foreground);
                     let state = if current {
-                        "当前"
+                        "前台"
+                    } else if let Some(binding) = binding {
+                        if binding.active_turn_id.is_some() {
+                            "后台运行中"
+                        } else {
+                            "后台"
+                        }
                     } else if ahp_session_is_idle(&button.session) {
-                        "可切换"
+                        "空闲"
                     } else {
-                        "忙碌"
+                        "忙碌·未监控"
                     };
                     let workspace = ahp_session_target_workspace(&self.config, &button.session)
                         .expect("filtered target workspace");
@@ -1980,7 +2427,7 @@ impl BridgeService {
                     &owner.user_openid,
                     &ChoiceButtons {
                         markdown: format!(
-                            "## 切换 AHP Session（{}/{page_count}）\n{session_lines}\n\n当前绑定和目标 Session 均空闲时可切换；按钮有效期 {} 秒。",
+                            "## 切换前台 AHP Session（{}/{page_count}）\n{session_lines}\n\n切换不会停止其他后台任务；按钮有效期 {} 秒。",
                             page_index + 1,
                             self.config.bridge.question_ttl_seconds
                         ),
@@ -2312,6 +2759,56 @@ impl BridgeService {
             .map_or_else(|| "[unknown]".to_owned(), |session| session.short_code))
     }
 
+    fn reconcile_recent_ahp_sessions(&self, sessions: &[AhpSessionDescriptor]) -> Result<()> {
+        let foreground_session_uri = self
+            .database
+            .ahp_binding()?
+            .map(|binding| binding.session_uri);
+        let mut candidates: Vec<_> = sessions
+            .iter()
+            .filter(|session| ahp_session_matches_workspace(&self.config, session))
+            .collect();
+        candidates.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+        if let Some(foreground_session_uri) = foreground_session_uri
+            && let Some(index) = candidates
+                .iter()
+                .position(|session| session.session_uri == foreground_session_uri)
+        {
+            let foreground = candidates.remove(index);
+            candidates.insert(0, foreground);
+        }
+
+        let mut seen = HashSet::new();
+        for session in candidates
+            .into_iter()
+            .filter(|session| seen.insert(session.session_uri.as_str()))
+            .take(MAX_TRACKED_AHP_SESSIONS)
+        {
+            if let Err(error) = self
+                .database
+                .ahp_track_session(&session.endpoint_id, &session.session_uri)
+            {
+                tracing::warn!(
+                    session_code = session.short_code.as_deref().unwrap_or("[unknown]"),
+                    error = %error,
+                    "recent AHP Session could not be tracked"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ahp_session_label(&self, session_uri: &str) -> Result<String> {
+        let Some(session) = self.database.ahp_session_by_uri(session_uri)? else {
+            return Ok("[Session unknown]".to_owned());
+        };
+        Ok(format!(
+            "[{} · {}]",
+            session.short_code.as_deref().unwrap_or("[unknown]"),
+            session.title
+        ))
+    }
+
     fn require_ahp_enabled(&self) -> Result<()> {
         if !self.config.ahp.enabled {
             bail!("AHP mode is disabled");
@@ -2506,7 +3003,11 @@ fn validate_short_code(name: &str, value: &str) -> Result<()> {
 }
 
 fn should_notify_tool(mode: AhpToolNotificationMode, status: &str) -> bool {
-    mode == AhpToolNotificationMode::Full || matches!(status, "completed" | "cancelled")
+    match mode {
+        AhpToolNotificationMode::Full => true,
+        AhpToolNotificationMode::Compact => matches!(status, "completed" | "cancelled"),
+        AhpToolNotificationMode::ApprovalOnly => false,
+    }
 }
 
 fn deny(reason: &str) -> PermissionResult {
@@ -2633,32 +3134,59 @@ fn format_status(status: &crate::db::StatusSnapshot) -> String {
     format!("Owner: 已启用\n会话:\n{sessions}\n待审批:\n{approvals}")
 }
 
-fn format_ahp_status(status: &AhpStatus) -> String {
+fn format_ahp_status(status: &AhpStatus, mode: AhpToolNotificationMode) -> String {
     let adapter = status.adapter.as_ref().map_or_else(
         || "未连接".to_owned(),
         |adapter| format!("{} ({})", adapter.state, adapter.version),
     );
-    let binding = status.binding.as_ref().map_or_else(
-        || "未绑定".to_owned(),
-        |binding| {
-            format!(
-                "{} / generation {} / {}",
-                binding.state, binding.generation, binding.session_uri
-            )
-        },
-    );
+    let bindings = if status.bindings.is_empty() {
+        "未绑定".to_owned()
+    } else {
+        status
+            .bindings
+            .iter()
+            .map(|binding| {
+                let session = status
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_uri == binding.session_uri);
+                let code = session
+                    .and_then(|session| session.short_code.as_deref())
+                    .unwrap_or("[unknown]");
+                let title = session.map_or("[unknown]", |session| session.title.as_str());
+                format!(
+                    "{}{} · {} / {}{}",
+                    if binding.foreground { "* " } else { "  " },
+                    code,
+                    title,
+                    binding.state,
+                    if binding.active_turn_id.is_some() {
+                        " / 运行中"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
-        "AHP Adapter: {adapter}\n共享 Session: {binding}\n可见 Host: {}\n可见 Session: {}\n待处理命令: {}\nQQ 待补发事件: {}",
+        "AHP Adapter: {adapter}\n监控 Session ({}/{}):\n{bindings}\n通知模式: {}\n可见 Host: {}\n可见 Session: {}\n待处理命令: {}\n待审批/待回答: {}/{}\nQQ 待补发事件: {}",
+        status.bindings.len(),
+        MAX_TRACKED_AHP_SESSIONS,
+        mode.as_str(),
         status.hosts.len(),
         status.sessions.len(),
         status.pending_commands,
+        status.pending_approvals,
+        status.pending_inputs,
         status.pending_projections
     )
 }
 
-fn format_ahp_approval(approval: &AhpApprovalRecord) -> String {
+fn format_ahp_approval(approval: &AhpApprovalRecord, session_label: &str) -> String {
     format!(
-        "[工具{}审批 {}]\n工具: {}\n{}\n\n批准一次: /allow {}\n拒绝: /deny {}",
+        "{session_label}\n[工具{}审批 {}]\n工具: {}\n{}\n\n批准一次: /allow {}\n拒绝: /deny {}",
         if approval.stage == "result" {
             "结果复核"
         } else {
@@ -2696,40 +3224,81 @@ fn truncate_for_qq(value: &str, maximum: usize) -> String {
     }
 }
 
-fn format_ahp_input(input: &AhpInputRecord) -> String {
+fn format_ahp_input(input: &AhpInputRecord, session_label: &str) -> String {
     let choices = if input.choices.is_empty() {
         String::new()
     } else {
         format!("\n选项: {}", input.choices.join(" / "))
     };
     format!(
-        "[Agent 提问 {}]\n{}{}\n\n直接回复可回答当前问题；或使用 /answer {} <文本>。",
+        "{session_label}\n[Agent 提问 {}]\n{}{}\n\n使用 /answer {} <文本> 显式回答；仅前台 Session 的唯一待输入可直接回复。",
         input.short_code, input.prompt, choices, input.short_code
     )
 }
 
-fn ahp_help_text() -> String {
-    [
-        "AHP 双端共享会话命令:",
-        "普通文本：发送到共享对话；若 Agent 正等待澄清，则优先作为回答",
-        "QQ 语音：使用内置 ASR；优先回答澄清，否则发送到共享对话；不会执行控制命令",
-        "/ask <文本>：即使存在澄清问题，也把文本排队为新消息",
-        "/sessions：列出所有目标目录内的 Session",
-        "/switch：显示 Session 切换按钮",
-        "/switch <编号>：文本兜底，仅在当前绑定和目标 Session 均空闲时切换",
-        "/allow <审批码>：单次批准",
-        "/deny <审批码>：拒绝",
-        "/answer <问题码> <文本>：显式回答 Agent 问题",
-        "/cancel：取消当前 Turn",
-        "/status",
-        "/help",
-    ]
-    .join("\n")
+fn ahp_help_text(mode: AhpToolNotificationMode) -> String {
+    format!(
+        "AHP 多 Session 共享会话命令:
+【消息】
+普通文本：发送到前台 Session；仅优先回答前台 Session 的待澄清问题
+QQ 语音：使用内置 ASR；不会执行控制命令
+/ask <文本>：忽略待回答问题，排队为新消息
+/send <编号> <文本>：发送到指定 Session，不改变前台
+
+【Session】
+/sessions：列出前台、后台和未监控 Session
+/switch：显示前台切换按钮
+/switch <编号>：切换前台，其他任务继续后台运行
+/detach <编号>：安全停止后台监控
+/cancel：取消前台 Session 的当前 Turn
+/cancel <编号>：取消指定 Session 的当前 Turn
+最多同时监控 {} 个最近活跃 Session；活动、排队或待交互 Session 不会被 LRU 淘汰
+
+【审批与回答】
+/allow <审批码>：单次批准
+/deny <审批码>：拒绝
+/answer <问题码> <文本>：显式回答 Agent 问题
+
+【通知】
+/notify：查看当前模式
+/notify approval_only：仅审批和最终回复
+/notify compact：审批、工具终态和最终回复
+/notify full：审批、全部工具状态和最终回复
+当前模式: {}
+
+【状态】
+/status：查看连接、绑定、通知模式和待处理状态
+/help：显示本帮助",
+        MAX_TRACKED_AHP_SESSIONS,
+        mode.as_str()
+    )
+}
+
+fn format_notification_mode(mode: AhpToolNotificationMode) -> String {
+    format!(
+        "当前通知模式: {}\n{}\n\n切换命令:\n/notify approval_only\n/notify compact\n/notify full\n切换后立即生效并持久化，无需重启。",
+        mode.as_str(),
+        notification_mode_description(mode)
+    )
+}
+
+fn notification_mode_description(mode: AhpToolNotificationMode) -> &'static str {
+    match mode {
+        AhpToolNotificationMode::ApprovalOnly => {
+            "仅发送工具审批和完整 Assistant 最终回复，不发送普通工具状态。"
+        }
+        AhpToolNotificationMode::Compact => {
+            "发送工具完成/取消状态；工具审批和完整 Assistant 最终回复照常发送。"
+        }
+        AhpToolNotificationMode::Full => {
+            "发送工具全部状态变化；工具审批和完整 Assistant 最终回复照常发送。"
+        }
+    }
 }
 
 fn format_ahp_sessions(
     config: &AppConfig,
-    binding: Option<&crate::protocol::AhpBindingRecord>,
+    bindings: &[crate::protocol::AhpBindingRecord],
     sessions: &[AhpSessionDescriptor],
 ) -> String {
     let visible: Vec<_> = sessions
@@ -2742,13 +3311,26 @@ fn format_ahp_sessions(
     let lines = visible
         .into_iter()
         .map(|session| {
-            let current = binding.is_some_and(|binding| binding.session_uri == session.session_uri);
-            let state = if current {
-                "当前"
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.session_uri == session.session_uri);
+            let current = binding.is_some_and(|binding| binding.foreground);
+            let state = if let Some(binding) = binding {
+                if current {
+                    if binding.active_turn_id.is_some() {
+                        "前台 · 运行中"
+                    } else {
+                        "前台"
+                    }
+                } else if binding.active_turn_id.is_some() {
+                    "后台 · 运行中"
+                } else {
+                    "后台"
+                }
             } else if ahp_session_is_idle(session) {
-                "可切换"
+                "未监控 · 空闲"
             } else {
-                "忙碌"
+                "未监控 · 忙碌"
             };
             let workspace =
                 ahp_session_target_workspace(config, session).expect("filtered target workspace");
@@ -2763,7 +3345,10 @@ fn format_ahp_sessions(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("AHP Sessions:\n{lines}\n\n发送 /switch 显示按钮。")
+    format!(
+        "AHP Sessions（最多后台监控 {} 个）:\n{lines}\n\n/switch <编号> 切换前台；/send <编号> <文本> 定向发送。",
+        MAX_TRACKED_AHP_SESSIONS
+    )
 }
 
 fn ahp_session_matches_workspace(config: &AppConfig, session: &AhpSessionDescriptor) -> bool {
@@ -2832,7 +3417,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_tool_notifications_emit_only_terminal_states() {
+    fn tool_notification_modes_filter_states() {
         assert!(!should_notify_tool(
             AhpToolNotificationMode::Compact,
             "streaming"
@@ -2850,6 +3435,508 @@ mod tests {
             "cancelled"
         ));
         assert!(should_notify_tool(AhpToolNotificationMode::Full, "running"));
+        for status in ["streaming", "running", "completed", "cancelled"] {
+            assert!(!should_notify_tool(
+                AhpToolNotificationMode::ApprovalOnly,
+                status
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_only_mode_sends_approvals_and_final_reply_without_tool_status() {
+        let fixture =
+            Fixture::new_ahp_with_notification_mode(AhpToolNotificationMode::ApprovalOnly);
+        let events = vec![
+            AhpPublishedEvent {
+                event_id: sha256_hex(b"approval-only-tool"),
+                host_instance_id: "host-1".to_owned(),
+                server_sequence: Some(2),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                turn_id: Some("turn-1".to_owned()),
+                kind: AhpEventKind::ToolStatus,
+                origin_client_id: None,
+                occurred_at: "2026-08-27T00:00:01Z".to_owned(),
+                data: json!({
+                    "tool_call_id": "tool-without-approval",
+                    "tool_name": "View",
+                    "status": "completed",
+                    "summary": "Read README without approval"
+                }),
+            },
+            AhpPublishedEvent {
+                event_id: sha256_hex(b"approval-only-approval"),
+                host_instance_id: "host-1".to_owned(),
+                server_sequence: Some(3),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                turn_id: Some("turn-1".to_owned()),
+                kind: AhpEventKind::ApprovalPending,
+                origin_client_id: None,
+                occurred_at: "2026-08-27T00:00:02Z".to_owned(),
+                data: json!({
+                    "approval_key": "approval-only-request",
+                    "stage": "parameter",
+                    "tool_call_id": "tool-requiring-approval",
+                    "tool_name": "Terminal",
+                    "summary": "Run deployment"
+                }),
+            },
+            AhpPublishedEvent {
+                event_id: sha256_hex(b"approval-only-final"),
+                host_instance_id: "host-1".to_owned(),
+                server_sequence: Some(4),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                turn_id: Some("turn-1".to_owned()),
+                kind: AhpEventKind::AssistantMessage,
+                origin_client_id: None,
+                occurred_at: "2026-08-27T00:00:03Z".to_owned(),
+                data: json!({
+                    "message_id": "approval-only-assistant",
+                    "content": "Deployment complete",
+                    "complete": true,
+                    "historical": false
+                }),
+            },
+        ];
+
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events,
+            })
+            .await
+            .expect("publish AHP events");
+
+        let messages = fixture.qq.messages().await;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].kind, "approval_buttons");
+        assert!(messages[0].content.contains("Run deployment"));
+        assert!(messages[0].content.contains("Shared"));
+        assert_eq!(messages[1].kind, "choice_buttons");
+        assert_eq!(messages[2].kind, "text");
+        assert!(messages[2].content.contains("Deployment complete"));
+        assert!(messages[2].content.contains("Shared"));
+        assert_eq!(messages[3].kind, "choice_buttons");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("Read README without approval"))
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_progress_is_delivered_without_stopping_typing_or_adding_focus_button() {
+        let fixture = Fixture::new_ahp();
+        let base_event = AhpPublishedEvent {
+            event_id: sha256_hex(b"assistant-progress-turn"),
+            host_instance_id: "host-1".to_owned(),
+            server_sequence: Some(2),
+            session_uri: "copilot:/session-1".to_owned(),
+            chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+            turn_id: Some("turn-progress".to_owned()),
+            kind: AhpEventKind::TurnStarted,
+            origin_client_id: None,
+            occurred_at: "2026-08-27T00:00:01Z".to_owned(),
+            data: json!({}),
+        };
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![
+                    base_event.clone(),
+                    AhpPublishedEvent {
+                        event_id: sha256_hex(b"assistant-progress-part"),
+                        server_sequence: Some(3),
+                        kind: AhpEventKind::AssistantMessage,
+                        data: json!({
+                            "message_id": "turn:turn-progress:assistant:progress",
+                            "content": "Inspecting the implementation.",
+                            "complete": true,
+                            "historical": false,
+                            "final_response": false
+                        }),
+                        ..base_event.clone()
+                    },
+                ],
+            })
+            .await
+            .expect("deliver progress response part");
+        assert_eq!(fixture.service.typing_tasks.lock().await.len(), 1);
+        let progress_messages = fixture.qq.messages().await;
+        assert!(progress_messages.iter().any(|message| {
+            message.kind == "text" && message.content.contains("Inspecting the implementation.")
+        }));
+        assert!(
+            progress_messages
+                .iter()
+                .all(|message| message.kind != "choice_buttons")
+        );
+
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"assistant-final-part"),
+                    server_sequence: Some(4),
+                    kind: AhpEventKind::AssistantMessage,
+                    data: json!({
+                        "message_id": "turn:turn-progress:assistant:final",
+                        "content": "Implementation complete.",
+                        "complete": true,
+                        "historical": false,
+                        "final_response": true
+                    }),
+                    ..base_event
+                }],
+            })
+            .await
+            .expect("deliver final response part");
+        assert!(fixture.service.typing_tasks.lock().await.is_empty());
+        let messages = fixture.qq.messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.kind == "text"
+                        && message.content.contains("Inspecting the implementation.")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.kind == "text" && message.content.contains("Implementation complete.")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.kind == "choice_buttons")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn qq_input_resolution_confirmation_is_silent_with_or_without_action_origin() {
+        let fixture = Fixture::new_ahp();
+        let text_input = fixture
+            .service
+            .database()
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "input-qq-text".to_owned(),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: "ahp-chat://default/session-1".to_owned(),
+                request_id: "request-qq-text".to_owned(),
+                prompt: "Enter a value".to_owned(),
+                choices: Vec::new(),
+                allow_freeform: true,
+                selection_mode: "none".to_owned(),
+                expires_at: Utc::now().timestamp() + 600,
+            })
+            .expect("begin QQ text input");
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_submit_input(&text_input.record.input_key, "value", "qq-text-message")
+                .expect("submit QQ text input")
+        );
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"input-qq-text-resolved"),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(5),
+                    session_uri: "copilot:/session-1".to_owned(),
+                    chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                    turn_id: Some("turn-qq-text".to_owned()),
+                    kind: AhpEventKind::InputResolved,
+                    origin_client_id: None,
+                    occurred_at: "2026-08-27T00:00:05Z".to_owned(),
+                    data: json!({
+                        "input_key": "input-qq-text",
+                        "outcome": "answered",
+                        "client_id": null
+                    }),
+                }],
+            })
+            .await
+            .expect("confirm QQ text input without origin");
+
+        let button_input = fixture
+            .service
+            .database()
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "input-qq-button".to_owned(),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: "ahp-chat://default/session-1".to_owned(),
+                request_id: "request-qq-button".to_owned(),
+                prompt: "Choose a value".to_owned(),
+                choices: vec!["one".to_owned(), "two".to_owned()],
+                allow_freeform: false,
+                selection_mode: "single".to_owned(),
+                expires_at: Utc::now().timestamp() + 600,
+            })
+            .expect("begin QQ button input");
+        let first_button = button_input
+            .record
+            .buttons
+            .first()
+            .expect("input choice button");
+        let button_submission = fixture
+            .service
+            .database()
+            .ahp_submit_input_by_button(&first_button.button_data, "qq-button-interaction")
+            .expect("submit QQ button input")
+            .expect("button exists");
+        assert!(button_submission.accepted);
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"input-qq-button-resolved"),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(6),
+                    session_uri: "copilot:/session-1".to_owned(),
+                    chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                    turn_id: Some("turn-qq-button".to_owned()),
+                    kind: AhpEventKind::InputResolved,
+                    origin_client_id: Some("adapter-stable".to_owned()),
+                    occurred_at: "2026-08-27T00:00:06Z".to_owned(),
+                    data: json!({
+                        "input_key": "input-qq-button",
+                        "outcome": "answered",
+                        "client_id": "adapter-stable"
+                    }),
+                }],
+            })
+            .await
+            .expect("confirm QQ button input");
+
+        let messages = fixture.qq.messages().await;
+        assert!(
+            messages.iter().all(|message| message.kind != "text"),
+            "QQ-originated input confirmations must not emit a resolution message"
+        );
+    }
+
+    #[tokio::test]
+    async fn pc_input_resolution_is_notified_once() {
+        let fixture = Fixture::new_ahp();
+        fixture
+            .service
+            .database()
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "input-pc".to_owned(),
+                session_uri: "copilot:/session-1".to_owned(),
+                chat_uri: "ahp-chat://default/session-1".to_owned(),
+                request_id: "request-pc".to_owned(),
+                prompt: "Enter a value".to_owned(),
+                choices: Vec::new(),
+                allow_freeform: true,
+                selection_mode: "none".to_owned(),
+                expires_at: Utc::now().timestamp() + 600,
+            })
+            .expect("begin PC input");
+        let resolved = AhpPublishedEvent {
+            event_id: sha256_hex(b"input-pc-resolved"),
+            host_instance_id: "host-1".to_owned(),
+            server_sequence: Some(7),
+            session_uri: "copilot:/session-1".to_owned(),
+            chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+            turn_id: Some("turn-pc".to_owned()),
+            kind: AhpEventKind::InputResolved,
+            origin_client_id: Some("vscode".to_owned()),
+            occurred_at: "2026-08-27T00:00:07Z".to_owned(),
+            data: json!({
+                "input_key": "input-pc",
+                "outcome": "answered",
+                "client_id": "vscode"
+            }),
+        };
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![resolved.clone()],
+            })
+            .await
+            .expect("resolve input from PC");
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"input-pc-resolved-replay"),
+                    server_sequence: Some(8),
+                    ..resolved
+                }],
+            })
+            .await
+            .expect("ignore repeated PC resolution");
+
+        let messages = fixture.qq.messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.kind == "text" && message.content.contains("已在 PC 端处理")
+                })
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("已由另一端处理"))
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_mode_commands_persist_and_apply_without_restart() {
+        let fixture =
+            Fixture::new_ahp_with_notification_mode(AhpToolNotificationMode::ApprovalOnly);
+
+        let initial = fixture
+            .service
+            .process_ahp_owner_message("notify-status", "/notify")
+            .await
+            .expect("read notification mode")
+            .expect("notification mode response");
+        assert!(initial.contains("当前通知模式: approval_only"));
+
+        let changed = fixture
+            .service
+            .process_ahp_owner_message("notify-full", "/notify full")
+            .await
+            .expect("change notification mode")
+            .expect("notification mode change response");
+        assert!(changed.contains("已切换为 full"));
+        assert!(changed.contains("立即生效"));
+        assert_eq!(
+            AppConfig::load(&fixture.service.config_path)
+                .expect("reload persisted config")
+                .ahp
+                .tool_notification_mode,
+            AhpToolNotificationMode::Full
+        );
+
+        let help = fixture
+            .service
+            .process_ahp_owner_message("notify-help", "/help")
+            .await
+            .expect("read help")
+            .expect("help response");
+        assert!(help.contains("/notify approval_only"));
+        assert!(help.contains("/notify compact"));
+        assert!(help.contains("/notify full"));
+        assert!(help.contains("当前模式: full"));
+
+        let status = fixture
+            .service
+            .process_ahp_owner_message("notify-bridge-status", "/status")
+            .await
+            .expect("read status")
+            .expect("status response");
+        assert!(status.contains("通知模式: full"));
+
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"full-mode-running-tool"),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(2),
+                    session_uri: "copilot:/session-1".to_owned(),
+                    chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                    turn_id: Some("turn-1".to_owned()),
+                    kind: AhpEventKind::ToolStatus,
+                    origin_client_id: None,
+                    occurred_at: "2026-09-02T00:00:00Z".to_owned(),
+                    data: json!({
+                        "tool_call_id": "tool-running",
+                        "tool_name": "Terminal",
+                        "status": "running",
+                        "summary": "Run tests"
+                    }),
+                }],
+            })
+            .await
+            .expect("publish full-mode tool event");
+        assert!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .iter()
+                .any(|message| message.content.contains("Run tests"))
+        );
+
+        let invalid = fixture
+            .service
+            .process_ahp_owner_message("notify-invalid", "/notify noisy")
+            .await
+            .expect("reject invalid notification mode")
+            .expect("invalid mode response");
+        assert!(invalid.contains("未知通知模式"));
+        assert_eq!(
+            fixture.service.current_tool_notification_mode().await,
+            AhpToolNotificationMode::Full
+        );
+
+        let reverted = fixture
+            .service
+            .process_ahp_owner_message("notify-approval-only", "/notify approval_only")
+            .await
+            .expect("restore approval-only mode")
+            .expect("approval-only response");
+        assert!(reverted.contains("已切换为 approval_only"));
+        assert_eq!(
+            AppConfig::load(&fixture.service.config_path)
+                .expect("reload restored config")
+                .ahp
+                .tool_notification_mode,
+            AhpToolNotificationMode::ApprovalOnly
+        );
     }
 
     #[tokio::test]
@@ -3213,13 +4300,17 @@ mod tests {
             .expect("approval");
         fixture
             .service
-            .send_ahp_approval_notification(&approval.record)
+            .send_ahp_approval_notification(&approval.record, "[ABCDE · Shared]")
             .await;
         let messages = fixture.qq.messages().await;
-        assert_eq!(
-            messages.last().expect("approval message").kind,
-            "approval_buttons"
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.kind == "approval_buttons")
         );
+        assert!(messages.iter().any(|message| {
+            message.kind == "choice_buttons" && message.content.contains("任务仍在其原 Session")
+        }));
 
         fixture
             .service
@@ -3299,7 +4390,7 @@ mod tests {
             .expect("input");
         fixture
             .service
-            .send_ahp_input_notification(&input.record)
+            .send_ahp_input_notification(&input.record, "[ABCDE · Shared]")
             .await;
         assert_eq!(
             fixture
@@ -3379,6 +4470,7 @@ mod tests {
             .dispatch(BridgeRequest::AhpPublishEvents {
                 adapter_id: "adapter-stable".to_owned(),
                 adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
                 binding_generation: 1,
                 events: vec![AhpPublishedEvent {
                     event_id: sha256_hex(b"offline-assistant-event"),
@@ -3652,6 +4744,17 @@ mod tests {
             .expect("bound");
         assert_eq!(binding.session_uri, "copilot:/session-2");
         assert_eq!(binding.state, "binding");
+        let bindings = fixture
+            .service
+            .database()
+            .ahp_bindings()
+            .expect("tracked bindings");
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.session_uri == "copilot:/session-1")
+        );
         assert_eq!(
             fixture
                 .service
@@ -3663,6 +4766,405 @@ mod tests {
                 .session_uri,
             "copilot:/session-2"
         );
+    }
+
+    #[tokio::test]
+    async fn recent_catalogue_sessions_are_auto_tracked_without_changing_foreground() {
+        let fixture = Fixture::new_ahp();
+        let sessions: Vec<_> = (1..=6)
+            .map(|number| test_ahp_session(number, &fixture.workspace, 1))
+            .collect();
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpCatalogReplace {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                hosts: vec![test_ahp_host()],
+                sessions,
+            })
+            .await
+            .expect("replace catalogue");
+
+        let bindings = fixture
+            .service
+            .database()
+            .ahp_bindings()
+            .expect("tracked bindings");
+        assert_eq!(bindings.len(), MAX_TRACKED_AHP_SESSIONS);
+        assert_eq!(
+            bindings
+                .iter()
+                .find(|binding| binding.foreground)
+                .expect("foreground")
+                .session_uri,
+            "copilot:/session-1"
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.session_uri == "copilot:/session-6")
+        );
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.session_uri != "copilot:/session-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_send_tracks_session_without_changing_foreground() {
+        let fixture = Fixture::new_ahp();
+        fixture
+            .service
+            .database()
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &[
+                    test_ahp_session(1, &fixture.workspace, 1),
+                    test_ahp_session(2, &fixture.workspace, 1),
+                ],
+            )
+            .expect("catalogue");
+        let second = fixture
+            .service
+            .database()
+            .ahp_session_by_uri("copilot:/session-2")
+            .expect("session query")
+            .expect("second session");
+        let response = fixture
+            .service
+            .process_ahp_owner_message(
+                "targeted-send",
+                &format!(
+                    "/send {} continue in background",
+                    second.short_code.as_deref().expect("short code")
+                ),
+            )
+            .await
+            .expect("targeted send")
+            .expect("response");
+        assert!(response.contains("前台 Session 未改变"));
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_binding()
+                .expect("foreground")
+                .expect("binding")
+                .session_uri,
+            "copilot:/session-1"
+        );
+        let commands = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0].kind,
+            crate::protocol::AhpCommandKind::BindSession
+        );
+        assert_eq!(
+            commands[1].kind,
+            crate::protocol::AhpCommandKind::SendMessage
+        );
+        assert_eq!(commands[0].binding_id, commands[1].binding_id);
+    }
+
+    #[tokio::test]
+    async fn targeted_cancel_routes_to_a_background_session() {
+        let fixture = Fixture::new_ahp();
+        let (session, binding) = track_ready_test_ahp_session(&fixture, 2);
+        fixture
+            .service
+            .database()
+            .ahp_publish_events(
+                "adapter-stable",
+                "adapter-run-1",
+                &binding.binding_id,
+                binding.generation,
+                &[AhpPublishedEvent {
+                    event_id: sha256_hex(b"background-turn-started"),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(2),
+                    session_uri: session.session_uri.clone(),
+                    chat_uri: Some("ahp-chat://default/session-2".to_owned()),
+                    turn_id: Some("turn-background".to_owned()),
+                    kind: AhpEventKind::TurnStarted,
+                    origin_client_id: None,
+                    occurred_at: "2026-09-02T00:02:30Z".to_owned(),
+                    data: json!({}),
+                }],
+            )
+            .expect("start background Turn");
+
+        let response = fixture
+            .service
+            .process_ahp_owner_message(
+                "targeted-cancel",
+                &format!(
+                    "/cancel {}",
+                    session.short_code.as_deref().expect("short code")
+                ),
+            )
+            .await
+            .expect("targeted cancel")
+            .expect("response");
+        assert!(response.contains("取消请求已排队"));
+        let commands = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("cancel command");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].kind,
+            crate::protocol::AhpCommandKind::CancelTurn
+        );
+        assert_eq!(commands[0].binding_id, binding.binding_id);
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_binding()
+                .expect("foreground")
+                .expect("binding")
+                .session_uri,
+            "copilot:/session-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_safely_unbinds_an_idle_background_session() {
+        let fixture = Fixture::new_ahp();
+        let (session, binding) = track_ready_test_ahp_session(&fixture, 2);
+        let response = fixture
+            .service
+            .process_ahp_owner_message(
+                "targeted-detach",
+                &format!(
+                    "/detach {}",
+                    session.short_code.as_deref().expect("short code")
+                ),
+            )
+            .await
+            .expect("targeted detach")
+            .expect("response");
+        assert!(response.contains("安全解绑队列"));
+        let commands = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("unbind command");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].kind,
+            crate::protocol::AhpCommandKind::UnbindSession
+        );
+        assert_eq!(commands[0].binding_id, binding.binding_id);
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_bindings()
+                .expect("bindings")
+                .iter()
+                .all(|tracked| tracked.binding_id != binding.binding_id)
+        );
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_binding()
+                .expect("foreground")
+                .expect("binding")
+                .session_uri,
+            "copilot:/session-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_in_same_workspace_send_conflict_warning() {
+        let fixture = Fixture::new_ahp();
+        fixture
+            .service
+            .database()
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &[
+                    test_ahp_session(1, &fixture.workspace, 1),
+                    test_ahp_session(2, &fixture.workspace, 1),
+                ],
+            )
+            .expect("catalogue");
+        let second = fixture
+            .service
+            .database()
+            .ahp_track_session("endpoint-1", "copilot:/session-2")
+            .expect("track second");
+        let bind_command = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("bind command");
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                bind_command[0].command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+            )
+            .expect("ack bind");
+        fixture
+            .service
+            .database()
+            .ahp_binding_ready(
+                "adapter-stable",
+                "adapter-run-1",
+                &second.binding_id,
+                "endpoint-1",
+                "host-1",
+                second.generation,
+                "copilot:/session-2",
+                "ahp-chat://default/session-2",
+                1,
+            )
+            .expect("second ready");
+        let first = fixture
+            .service
+            .database()
+            .ahp_binding_for_session("copilot:/session-1")
+            .expect("first query")
+            .expect("first binding");
+
+        for (binding, turn, sequence) in [
+            (&first, "turn-first", 2_u64),
+            (&second, "turn-second", 3_u64),
+        ] {
+            fixture
+                .service
+                .dispatch(BridgeRequest::AhpPublishEvents {
+                    adapter_id: "adapter-stable".to_owned(),
+                    adapter_instance_id: "adapter-run-1".to_owned(),
+                    binding_id: binding.binding_id.clone(),
+                    binding_generation: binding.generation,
+                    events: vec![AhpPublishedEvent {
+                        event_id: sha256_hex(format!("{turn}-started").as_bytes()),
+                        host_instance_id: "host-1".to_owned(),
+                        server_sequence: Some(sequence),
+                        session_uri: binding.session_uri.clone(),
+                        chat_uri: binding.chat_uri.clone(),
+                        turn_id: Some(turn.to_owned()),
+                        kind: AhpEventKind::TurnStarted,
+                        origin_client_id: None,
+                        occurred_at: "2026-09-02T00:00:00Z".to_owned(),
+                        data: json!({}),
+                    }],
+                })
+                .await
+                .expect("publish turn");
+        }
+
+        let messages = fixture.qq.messages().await;
+        assert!(messages.iter().any(|message| {
+            message.kind == "text"
+                && message.content.contains("同工作区并发警告")
+                && message.content.contains("Git worktree")
+        }));
+    }
+
+    fn test_ahp_host() -> AhpHostDescriptor {
+        AhpHostDescriptor {
+            endpoint_id: "endpoint-1".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            pid: 42,
+            advertised_protocol: "1.0.0".to_owned(),
+            selected_protocol: Some("1.0.0".to_owned()),
+            state: crate::protocol::AhpHostState::Connected,
+        }
+    }
+
+    fn track_ready_test_ahp_session(
+        fixture: &Fixture,
+        number: usize,
+    ) -> (AhpSessionDescriptor, crate::protocol::AhpBindingRecord) {
+        let database = fixture.service.database();
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &[
+                    test_ahp_session(1, &fixture.workspace, 1),
+                    test_ahp_session(number, &fixture.workspace, 1),
+                ],
+            )
+            .expect("catalogue");
+        let session = database
+            .ahp_session_by_uri(&format!("copilot:/session-{number}"))
+            .expect("session query")
+            .expect("target Session");
+        let binding = database
+            .ahp_track_session(&session.endpoint_id, &session.session_uri)
+            .expect("track Session");
+        let command = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("bind command")
+            .into_iter()
+            .find(|command| {
+                command.binding_id == binding.binding_id
+                    && command.kind == crate::protocol::AhpCommandKind::BindSession
+            })
+            .expect("target bind command");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                command.command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+            )
+            .expect("ack bind");
+        database
+            .ahp_binding_ready(
+                "adapter-stable",
+                "adapter-run-1",
+                &binding.binding_id,
+                &binding.endpoint_id,
+                binding.host_instance_id.as_deref().expect("host instance"),
+                binding.generation,
+                &binding.session_uri,
+                &format!("ahp-chat://default/session-{number}"),
+                1,
+            )
+            .expect("binding ready");
+        (session, binding)
+    }
+
+    fn test_ahp_session(number: usize, workspace: &Path, status: u32) -> AhpSessionDescriptor {
+        AhpSessionDescriptor {
+            short_code: None,
+            endpoint_id: "endpoint-1".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            session_uri: format!("copilot:/session-{number}"),
+            provider: "copilot".to_owned(),
+            title: format!("Session {number}"),
+            status,
+            workspace_uris: vec![
+                url::Url::from_file_path(workspace)
+                    .expect("workspace URI")
+                    .to_string(),
+            ],
+            created_at: format!("2026-09-02T00:{number:02}:00Z"),
+            modified_at: format!("2026-09-02T00:{number:02}:00Z"),
+        }
     }
 
     struct Fixture {
@@ -3712,18 +5214,35 @@ mod tests {
         }
 
         fn new_ahp() -> Self {
-            Self::new_ahp_with_voice_input(false)
+            Self::new_ahp_with_options(false, false, AhpToolNotificationMode::Compact)
+        }
+
+        fn ahp_binding_id(&self) -> String {
+            self.service
+                .database()
+                .ahp_binding()
+                .expect("binding query")
+                .expect("foreground binding")
+                .binding_id
         }
 
         fn new_ahp_multi_workspace() -> Self {
-            Self::new_ahp_with_options(false, true)
+            Self::new_ahp_with_options(false, true, AhpToolNotificationMode::Compact)
         }
 
         fn new_ahp_with_voice_input(voice_input_enabled: bool) -> Self {
-            Self::new_ahp_with_options(voice_input_enabled, false)
+            Self::new_ahp_with_options(voice_input_enabled, false, AhpToolNotificationMode::Compact)
         }
 
-        fn new_ahp_with_options(voice_input_enabled: bool, multi_workspace: bool) -> Self {
+        fn new_ahp_with_notification_mode(tool_notification_mode: AhpToolNotificationMode) -> Self {
+            Self::new_ahp_with_options(false, false, tool_notification_mode)
+        }
+
+        fn new_ahp_with_options(
+            voice_input_enabled: bool,
+            multi_workspace: bool,
+            tool_notification_mode: AhpToolNotificationMode,
+        ) -> Self {
             let directory = tempfile::tempdir().expect("tempdir");
             let workspace = directory.path().join("workspace");
             let other_workspace = directory.path().join("other-workspace");
@@ -3746,10 +5265,12 @@ mod tests {
             config.qq.intents |= 1_u64 << 26;
             config.ahp.enabled = true;
             config.ahp.shared_workspaces = vec![workspace.clone()];
+            config.ahp.tool_notification_mode = tool_notification_mode;
             config
                 .ahp
                 .shared_workspaces
                 .extend(other_workspace.iter().cloned());
+            config.save(&config_path).expect("save AHP fixture config");
             let database = Database::open(&config.bridge.database_path).expect("database");
             let code = database.create_binding_code(600).expect("binding code");
             assert_eq!(
@@ -3815,6 +5336,7 @@ mod tests {
                 .ahp_binding_ready(
                     "adapter-stable",
                     "adapter-run-1",
+                    &binding.binding_id,
                     "endpoint-1",
                     "host-1",
                     binding.generation,

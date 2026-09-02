@@ -90,6 +90,7 @@ pub enum BridgeRequest {
     AhpBindingReady {
         adapter_id: String,
         adapter_instance_id: String,
+        binding_id: String,
         endpoint_id: String,
         host_instance_id: String,
         binding_generation: i64,
@@ -100,12 +101,14 @@ pub enum BridgeRequest {
     AhpBindingFailed {
         adapter_id: String,
         adapter_instance_id: String,
+        binding_id: String,
         binding_generation: i64,
         reason_code: String,
     },
     AhpPublishEvents {
         adapter_id: String,
         adapter_instance_id: String,
+        binding_id: String,
         binding_generation: i64,
         events: Vec<AhpPublishedEvent>,
     },
@@ -240,6 +243,7 @@ impl AhpEventKind {
 pub struct AhpAdapterCommand {
     pub command_id: i64,
     pub command_key: String,
+    pub binding_id: String,
     pub binding_generation: i64,
     pub kind: AhpCommandKind,
     pub data: Value,
@@ -308,6 +312,7 @@ impl AhpCommandOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpBindingRecord {
+    pub binding_id: String,
     pub generation: i64,
     pub endpoint_id: String,
     pub host_instance_id: Option<String>,
@@ -317,6 +322,8 @@ pub struct AhpBindingRecord {
     pub last_server_sequence: u64,
     pub active_turn_id: Option<String>,
     pub queued_message_count: u32,
+    pub last_activity_at: i64,
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

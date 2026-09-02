@@ -13,14 +13,15 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter ────┘
 ```
 
 - VS Code 必须保持运行。
-- QQ 与 VS Code 共享一个已绑定的 Agent Host Session。
+- QQ 与 VS Code 最多同时共享 5 个已监控的 Agent Host Session；一个作为 QQ 前台，
+  其余可继续后台运行。
 - Bridge、Adapter 和状态栏扩展安装在 Agent 可编辑工作区之外。
 - 旧 Hooks/MCP 链只作为回滚模式。
 
 ## 2. 系统要求
 
 - Windows 10/11，推荐使用非管理员标准用户。
-- VS Code 1.135，或已完成兼容测试的后续版本。
+- VS Code 1.136，或已完成兼容测试的后续版本。
 - GitHub Copilot 已登录。
 - Rust 1.89 或更高版本。
 - Node.js 24.18 或更高版本。
@@ -43,26 +44,28 @@ Set-Location .\qq-copilot
 
 ## 4. 构建固定 AHP 客户端
 
-VS Code 1.135 实际使用的 AHP revision 是：
+VS Code 1.136 实际使用的 AHP 类型/reducer revision 是：
 
 ```text
-f770e26b8483de59050e8de71b65a20efdab62d4
+a0bc67f840788f816c9b44bb1325181cb4c4661d
 ```
 
-仓库已经包含生成后的固定 tarball。需要重新生成时运行：
+该版本在 endpoint 和握手中宣告 `0.9.0`。仓库的
+`vendor/ahp-vscode-1.136.patch` 复现 VS Code stable 的 registry overlay，
+并包含生成后的固定 tarball。需要重新生成时运行：
 
 ```powershell
-.\scripts\vendor-ahp-client.ps1
+.\scripts\vendor-ahp-client.ps1 -Force
 ```
 
 预期 SHA-256：
 
 ```text
-d17e139368c0c9d97a86abe68ac2d1f111b5215710fab7106fa5aa907dcb17b0
+575eef7a2a166b08b804c56768cc727c65cf8be0e6d080fb2381affed8495185
 ```
 
 不要用 npm registry 中同名 `0.8.0` 包替换。其版本号相同，但 wire types
-并不与 VS Code 1.135 完全一致。
+并不与 VS Code 1.136 完全一致。
 
 ## 5. 构建和验证
 
@@ -198,8 +201,8 @@ Bridge/Adapter 重启。`-Workspace` 接受一个或多个目录：
 ```
 
 目标目录按精确路径匹配；只添加共同父目录不会展示其子目录中的 Session。脚本要求
-Bridge 正在运行且已配置 AHP，并会拒绝在当前 Turn、排队消息或 Adapter 命令未结束时
-重启。
+Bridge 正在运行且已配置 AHP，并会拒绝在任一 Binding 存在活动 Turn、排队消息、
+Pending 审批/澄清或 Adapter 命令时重启。
 
 只需要写入配置并稍后手动重启时，可运行：
 
@@ -236,12 +239,13 @@ Bridge 正在运行且已配置 AHP，并会拒绝在当前 Turn、排队消息�
 QQ `/sessions` 的示例输出：
 
 ```text
-AHP Sessions:
-* APYZB | Clone and deploy qq-copilot | D:\work\vscode\qq-copilot | 当前
-  AZ49U | 接入GitHub Copilot功能实现 | D:\work\vscode\CodexPlusPlus | 可切换
+AHP Sessions（最多后台监控 5 个）:
+* APYZB | Clone and deploy qq-copilot | D:\work\vscode\qq-copilot | 前台
+  AZ49U | 接入 GitHub Copilot 功能实现 | D:\work\vscode\CodexPlusPlus | 后台 · 运行中
+  A7K2P | 新任务 | D:\work\vscode\project-c | 未监控 · 空闲
 ```
 
-## 11. Session 切换
+## 11. 多 Session 路由
 
 QQ 中发送：
 
@@ -249,25 +253,31 @@ QQ 中发送：
 /switch
 ```
 
-Bot 会同时展示所有目标目录内的 Session、完整所在目录及空闲状态。任一时刻数据库中只
-有一个活动绑定。只有满足以下条件时才允许切换：
+Bot 会同时展示所有目标目录内的 Session、完整所在目录，以及前台、后台、运行中和
+未监控状态。`/switch` 只改变 QQ 普通文本和语音的默认路由，不会停止旧 Session，
+当前或目标 Session 正在运行时也可以切换前台。
 
-- 当前 Turn 已结束。
-- 没有排队消息。
-- 没有 Pending 审批。
-- 没有 Pending 澄清输入。
-- 目标 Session 处于空闲状态。
-
-文本兜底：
+常用命令：
 
 ```text
 /sessions
 /switch <Session短码>
+/send <Session短码> <文本>
+/cancel <Session短码>
+/detach <Session短码>
 ```
 
+Bridge 自动维护最近活跃的 5 个 Binding。前台、活动 Turn、排队消息、待执行命令、
+Pending 审批和 Pending 澄清不会被 LRU 淘汰；若 5 个槽位全部受保护，新的 `/switch`
+或 `/send` 会明确失败。`/detach` 只对安全空闲的后台 Session 生效。
+
 短码会跨 Adapter 重启保持稳定。单页最多 25 个 Session，最多 4 页；非目标目录的
-Session 不会显示，也不能通过旧按钮切换。按钮标签仍只使用短码，目录显示在按钮上方的
-Session 清单中。
+Session 不会显示，也不能通过旧按钮切换。Assistant 过程段会在形成后立即显示来源短码
+与标题，且不会在最终回复中重复；审批、澄清和最终回复还会附加独立的前台切换按钮。
+这些通知都不会自动抢占当前前台。
+
+同一个精确工作区出现第二个活动 Turn 时，Bridge 会警告潜在文件/Git 索引冲突，但不会
+阻断执行。有写操作的并发任务应使用独立 Git worktree。
 
 ## 12. QQ 命令
 
@@ -275,20 +285,41 @@ Session 清单中。
 普通文本
 QQ 私聊语音
 /ask <文本>
+/send <Session短码> <文本>
 /sessions
 /switch
 /switch <Session短码>
+/detach <Session短码>
 /allow <审批码>
 /deny <审批码>
 /answer <问题码> <文本>
 /cancel
+/cancel <Session短码>
+/notify
+/notify <approval_only|compact|full>
 /status
 /help
 ```
 
 ## 13. 通知配置
 
-默认工具通知为精简模式：
+Owner 可以直接在 QQ 查询或切换，切换会立即生效并持久化：
+
+```text
+/notify
+/notify approval_only
+/notify compact
+/notify full
+```
+
+- `approval_only`：不通知工具状态；仅在工具需要审批时发送审批，并保留完整 Assistant 过程段和最终回复。
+- `compact`：只在工具完成或取消后通知一次，审批始终通知。
+- `full`：通知工具全部状态变化。
+- Turn 执行时显示 QQ 官方“正在输入”状态。
+- 等待审批或澄清时暂停输入状态。
+- QQ 回答澄清后，Host 的本端确认只更新状态，不再误报“已由另一端处理”；PC 端回答仍通知 QQ。
+
+本机也可以编辑默认配置：
 
 ```toml
 [ahp]
@@ -298,12 +329,7 @@ typing_duration_seconds = 60
 typing_refresh_seconds = 45
 ```
 
-- `compact`：只在工具完成或取消后通知一次，审批始终通知。
-- `full`：通知工具全部状态变化。
-- Turn 执行时显示 QQ 官方“正在输入”状态。
-- 等待审批或澄清时暂停输入状态。
-
-修改配置后重启 Bridge。
+直接编辑 TOML 后需要重启 Bridge；通过 `/notify` 切换不需要。
 
 ## 14. 登录后自动启动
 
@@ -322,13 +348,17 @@ typing_refresh_seconds = 45
 1. 备份 `%LOCALAPPDATA%\CopilotQQBridge`。
 2. 保留 Windows Credential Manager 中的 AppSecret。
 3. 运行完整测试。
-4. 重新执行安装脚本，并向 `-AhpWorkspace` 传入要保留的完整目标目录列表。
-5. 重载 VS Code。
-6. 验证 `qq-bridge status` 中：
+4. IPC v2 为 Bridge/Adapter 多 Binding 契约，必须由同一次安装成对升级，不能混用
+   新 Bridge 与旧 Adapter。
+5. 重新执行安装脚本，并向 `-AhpWorkspace` 传入要保留的完整目标目录列表。
+6. 重载 VS Code。
+7. 验证 `qq-bridge status` 中：
    - `qq_gateway.state = connected`
    - `ahp.adapter.state = connected`
-   - `ahp.binding.state = bound`
+   - `ahp.bindings` 中每个被监控 Binding 的 `state = bound`
+   - `ahp.foreground_binding_id` 指向预期前台
    - `pending_commands = 0`
+   - `pending_approvals = 0`、`pending_inputs = 0`（无待处理交互时）
 
 VS Code 自动升级后如果 AHP Schema 不兼容，Adapter 会对相关 Host 降为只读。
 完成兼容性测试前，不要强行恢复 QQ 写入或审批。
@@ -364,7 +394,8 @@ VS Code 自动升级后如果 AHP Schema 不兼容，Adapter 会对相关 Host �
 & "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" status
 ```
 
-检查 Gateway、Adapter、binding 和 pending projection 数量。
+检查 Gateway、Adapter、全部 bindings、foreground binding、pending interaction 和
+pending projection 数量。
 
 ### 找不到 Session
 
@@ -375,12 +406,14 @@ VS Code 自动升级后如果 AHP Schema 不兼容，Adapter 会对相关 Host �
 - 运行 `qq-bridge ahp-sessions`，确认 Adapter 已发现该 Session 及其 `workspace_uris`。
 - 新增目录后若使用的是 `qq-bridge add-workspace`，需要重启 Bridge/Adapter。
 
-### Session 无法切换
+### Session 无法切换或加入监控
 
-- 当前绑定必须没有活动 Turn、排队消息、Pending 审批或 Pending 澄清。
-- 目标 Session 必须处于空闲状态；`/sessions` 和 `/switch` 会标为“可切换”或“忙碌”。
+- 前台切换不要求 Session 空闲。若失败，先确认短码仍存在且 Session 工作区仍与可信目录
+  精确匹配。
 - 配置变更、Session 目录变更、按钮过期或重复点击后，应重新发送 `/switch` 生成菜单。
-- Bridge 数据库只有一个绑定槽位；成功切换会替换旧绑定，不会同时绑定多个 Session。
+- 如果提示容量不足，说明 5 个槽位全部被前台、活动 Turn、排队消息或 Pending 交互保护；
+  等待任务结束，或对安全空闲的后台 Session 使用 `/detach <短码>`。
+- 使用 `/status` 确认所有 Binding 最终为 `bound` 且 `pending_commands = 0`。
 
 ### QQ 按钮不可用
 
@@ -397,4 +430,4 @@ VS Code 自动升级后如果 AHP Schema 不兼容，Adapter 会对相关 Host �
 ### VS Code 关闭后 QQ 无法继续
 
 这是编辑器托管 Agent Host 模式的预期边界。重新打开 VS Code 后，Adapter 会发现新
-Host 并恢复已绑定 Session。进行中的 Turn 不会自动重放。
+Host 并恢复所有已监控 Session。进行中的 Turn 不会自动重放。
