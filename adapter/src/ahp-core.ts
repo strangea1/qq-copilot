@@ -47,7 +47,7 @@ import {
   type EndpointRegistryEntry,
   type WatchEditorEndpointsOptions,
 } from "./endpoint-registry.js";
-import { openNamedPipeTransport } from "./named-pipe-transport.js";
+import { openEndpointTransport } from "./named-pipe-transport.js";
 import {
   MirrorSnapshotError,
   ProviderSessionStateMirror,
@@ -62,6 +62,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_SUBSCRIPTION_BUFFER = 16_384;
 const DEFAULT_RETRY_BASE_MS = 250;
 const MAX_RETRY_MS = 30_000;
+const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 
 export interface PublicEndpoint {
   readonly id: string;
@@ -748,7 +749,7 @@ export class AhpCore {
 
   async #connectOnce(record: EndpointRecord): Promise<void> {
     const entry = record.entry;
-    if (!SUPPORTED_PROTOCOL_VERSIONS.includes(entry.protocolVersion)) {
+    if (!NEGOTIATED_PROTOCOL_VERSIONS.includes(entry.protocolVersion)) {
       record.status = "incompatible";
       record.selectedProtocol = undefined;
       this.#emitConnection(record);
@@ -780,7 +781,7 @@ export class AhpCore {
           version: "0.1.0",
           title: "QQ Copilot AHP Adapter",
         },
-        protocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
+        protocolVersions: [...NEGOTIATED_PROTOCOL_VERSIONS],
         initialSubscriptions: [ROOT],
         ...(this.#locale ? { locale: this.#locale } : {}),
       };
@@ -790,7 +791,7 @@ export class AhpCore {
       );
       if (
         initialized.protocolVersion !== entry.protocolVersion ||
-        !SUPPORTED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)
+        !NEGOTIATED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)
       ) {
         throw new ProtocolGateError(initialized.protocolVersion);
       }
@@ -1185,7 +1186,7 @@ export class AhpCore {
     const event: IncompatibilityEvent = {
       endpoint: record.endpoint,
       reason,
-      supportedProtocols: [...SUPPORTED_PROTOCOL_VERSIONS],
+      supportedProtocols: [...NEGOTIATED_PROTOCOL_VERSIONS],
       ...(selectedProtocol ? { selectedProtocol } : {}),
     };
     this.#invokeCallback(
@@ -1953,16 +1954,7 @@ async function listAllSessions(client: AhpClient): Promise<SessionSummary[]> {
 async function defaultOpenTransport(
   entry: EndpointRegistryEntry,
 ): Promise<AhpTransport> {
-  if (entry.endpoint.type !== "socket") {
-    throw new TransportError(
-      "protocol",
-      "editor Agent Host did not advertise a named pipe",
-    );
-  }
-  return openNamedPipeTransport(
-    entry.endpoint.path,
-    entry.connectionToken,
-  );
+  return openEndpointTransport(entry.endpoint, entry.connectionToken);
 }
 
 function publicEndpoint(entry: EndpointRegistryEntry): PublicEndpoint {
@@ -1994,17 +1986,25 @@ function sameRegistryEntry(
       left.endpoint.path === right.endpoint.path
     );
   }
+  if (left.endpoint.type === "tcp") {
+    return (
+      right.endpoint.type === "tcp" &&
+      left.endpoint.host === right.endpoint.host &&
+      left.endpoint.port === right.endpoint.port
+    );
+  }
   return (
-    right.endpoint.type === "tcp" &&
-    left.endpoint.host === right.endpoint.host &&
-    left.endpoint.port === right.endpoint.port
+    right.endpoint.type === "websocket" &&
+    left.endpoint.url === right.endpoint.url
   );
 }
 
 function endpointSecrets(entry: EndpointRegistryEntry): readonly string[] {
   return entry.endpoint.type === "socket"
     ? [entry.connectionToken, entry.endpoint.path]
-    : [entry.connectionToken];
+    : entry.endpoint.type === "websocket"
+      ? [entry.connectionToken, entry.endpoint.url]
+      : [entry.connectionToken];
 }
 
 function sanitizeClone<T>(value: T, secrets: readonly string[]): T {

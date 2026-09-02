@@ -91,6 +91,8 @@ pub struct AhpConfig {
         deserialize_with = "deserialize_path_or_paths"
     )]
     pub shared_workspaces: Vec<PathBuf>,
+    #[serde(default)]
+    pub authorized_targets: Vec<AhpAuthorizedTarget>,
     #[serde(default = "default_ahp_event_retention_days")]
     pub event_retention_days: u32,
     #[serde(default = "default_ahp_command_lease_seconds")]
@@ -105,6 +107,12 @@ pub struct AhpConfig {
     pub node_executable: Option<PathBuf>,
     #[serde(default)]
     pub adapter_script: Option<PathBuf>,
+    #[serde(default)]
+    pub code_executable: Option<PathBuf>,
+    #[serde(default)]
+    pub code_launcher: Option<PathBuf>,
+    #[serde(default)]
+    pub ssh_executable: Option<PathBuf>,
     #[serde(default)]
     pub tool_notification_mode: AhpToolNotificationMode,
     #[serde(default = "default_typing_indicator_enabled")]
@@ -147,11 +155,29 @@ impl std::str::FromStr for AhpToolNotificationMode {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AhpAuthorizedTarget {
+    Local {
+        path: PathBuf,
+    },
+    Ssh {
+        alias: String,
+        path: String,
+        user: String,
+        host: String,
+        port: u16,
+        #[serde(default)]
+        host_key_fingerprints: Vec<String>,
+    },
+}
+
 impl Default for AhpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             shared_workspaces: Vec::new(),
+            authorized_targets: Vec::new(),
             event_retention_days: default_ahp_event_retention_days(),
             command_lease_seconds: default_ahp_command_lease_seconds(),
             poll_seconds: default_ahp_poll_seconds(),
@@ -159,11 +185,102 @@ impl Default for AhpConfig {
             adapter_auto_start: false,
             node_executable: None,
             adapter_script: None,
+            code_executable: None,
+            code_launcher: None,
+            ssh_executable: None,
             tool_notification_mode: AhpToolNotificationMode::Compact,
             typing_indicator_enabled: default_typing_indicator_enabled(),
             typing_duration_seconds: default_typing_duration_seconds(),
             typing_refresh_seconds: default_typing_refresh_seconds(),
         }
+    }
+}
+
+impl AhpAuthorizedTarget {
+    pub fn local(path: PathBuf) -> Self {
+        Self::Local { path }
+    }
+
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Local { .. } => "local".to_owned(),
+            Self::Ssh { alias, .. } => format!("ssh:{alias}"),
+        }
+    }
+
+    pub fn display_workspace(&self) -> String {
+        match self {
+            Self::Local { path } => path.display().to_string(),
+            Self::Ssh { path, .. } => path.clone(),
+        }
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local { path: left }, Self::Local { path: right }) => {
+                path_is_within(left, right) && path_is_within(right, left)
+            }
+            (
+                Self::Ssh {
+                    alias: left_alias,
+                    path: left_path,
+                    user: left_user,
+                    host: left_host,
+                    port: left_port,
+                    host_key_fingerprints: left_fingerprints,
+                },
+                Self::Ssh {
+                    alias: right_alias,
+                    path: right_path,
+                    user: right_user,
+                    host: right_host,
+                    port: right_port,
+                    host_key_fingerprints: right_fingerprints,
+                },
+            ) => {
+                left_alias == right_alias
+                    && left_path == right_path
+                    && left_user == right_user
+                    && left_host == right_host
+                    && left_port == right_port
+                    && left_fingerprints == right_fingerprints
+            }
+            _ => false,
+        }
+    }
+}
+
+impl AhpConfig {
+    pub fn effective_authorized_targets(&self) -> Vec<AhpAuthorizedTarget> {
+        let mut targets = self.authorized_targets.clone();
+        for workspace in &self.shared_workspaces {
+            let target = AhpAuthorizedTarget::local(workspace.clone());
+            if !targets.iter().any(|configured| configured.matches(&target)) {
+                targets.push(target);
+            }
+        }
+        targets
+    }
+
+    pub fn sync_authorized_targets(&mut self) {
+        let mut targets = Vec::new();
+        for target in self.effective_authorized_targets() {
+            if !targets
+                .iter()
+                .any(|configured: &AhpAuthorizedTarget| configured.matches(&target))
+            {
+                targets.push(target);
+            }
+        }
+        let shared_workspaces = targets
+            .iter()
+            .filter_map(|target| match target {
+                AhpAuthorizedTarget::Local { path } => Some(path.clone()),
+                AhpAuthorizedTarget::Ssh { .. } => None,
+            })
+            .collect();
+        self.authorized_targets = targets;
+        self.shared_workspaces = shared_workspaces;
     }
 }
 
@@ -191,8 +308,9 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(&content)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
+        config.ahp.sync_authorized_targets();
         config.validate()?;
         Ok(config)
     }
@@ -291,23 +409,62 @@ impl AppConfig {
             bail!("QQ approval buttons require INTERACTION intent (1 << 26)");
         }
         if self.ahp.enabled {
-            if self.ahp.shared_workspaces.is_empty() {
-                bail!("ahp.shared_workspaces requires at least one path when AHP is enabled");
-            }
-            for workspace in &self.ahp.shared_workspaces {
-                if !workspace.is_absolute() {
-                    bail!("ahp.shared_workspaces paths must be absolute");
-                }
-                if !self
-                    .bridge
-                    .workspace_roots
-                    .iter()
-                    .any(|root| path_is_within(workspace, root))
-                {
-                    bail!(
-                        "AHP target workspace {} is outside bridge.workspace_roots",
-                        workspace.display()
-                    );
+            let targets = self.ahp.effective_authorized_targets();
+            for target in &targets {
+                match target {
+                    AhpAuthorizedTarget::Local { path } => {
+                        if !path.is_absolute() {
+                            bail!("AHP local target paths must be absolute");
+                        }
+                        if !self
+                            .bridge
+                            .workspace_roots
+                            .iter()
+                            .any(|root| path_is_within(path, root))
+                        {
+                            bail!(
+                                "AHP target workspace {} is outside bridge.workspace_roots",
+                                path.display()
+                            );
+                        }
+                    }
+                    AhpAuthorizedTarget::Ssh {
+                        alias,
+                        path,
+                        user,
+                        host,
+                        port,
+                        host_key_fingerprints,
+                    } => {
+                        if alias.is_empty()
+                            || alias.starts_with('-')
+                            || alias.len() > 255
+                            || alias.chars().any(|character| {
+                                !(character.is_ascii_alphanumeric()
+                                    || matches!(character, '.' | '_' | '-'))
+                            })
+                        {
+                            bail!("AHP SSH target alias contains unsupported characters");
+                        }
+                        if !path.starts_with('/')
+                            || path
+                                .chars()
+                                .any(|character| character.is_control() || character == '\0')
+                        {
+                            bail!("AHP SSH target path must be an absolute POSIX path");
+                        }
+                        if user.trim().is_empty() || host.trim().is_empty() || *port == 0 {
+                            bail!("AHP SSH target identity is incomplete");
+                        }
+                        if host_key_fingerprints.is_empty()
+                            || host_key_fingerprints.iter().any(|fingerprint| {
+                                !fingerprint.starts_with("SHA256:")
+                                    || fingerprint.chars().any(char::is_whitespace)
+                            })
+                        {
+                            bail!("AHP SSH target host key fingerprints are invalid");
+                        }
+                    }
                 }
             }
             if self.ahp.event_retention_days == 0
@@ -319,13 +476,21 @@ impl AppConfig {
                 bail!("AHP retention, lease, poll, and stale intervals must be non-zero");
             }
             if self.ahp.adapter_auto_start
-                && (self.ahp.node_executable.is_none() || self.ahp.adapter_script.is_none())
+                && (self.ahp.node_executable.is_none()
+                    || self.ahp.adapter_script.is_none()
+                    || self.ahp.code_executable.is_none()
+                    || self.ahp.code_launcher.is_none())
             {
-                bail!("ahp.node_executable and ahp.adapter_script are required for auto-start");
+                bail!(
+                    "ahp.node_executable, ahp.adapter_script, ahp.code_executable, and ahp.code_launcher are required for auto-start"
+                );
             }
             for path in [
                 self.ahp.node_executable.as_ref(),
                 self.ahp.adapter_script.as_ref(),
+                self.ahp.code_executable.as_ref(),
+                self.ahp.code_launcher.as_ref(),
+                self.ahp.ssh_executable.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -333,6 +498,13 @@ impl AppConfig {
                 if !path.is_absolute() {
                     bail!("AHP executable and script paths must be absolute");
                 }
+            }
+            if targets
+                .iter()
+                .any(|target| matches!(target, AhpAuthorizedTarget::Ssh { .. }))
+                && self.ahp.ssh_executable.is_none()
+            {
+                bail!("ahp.ssh_executable is required when AHP SSH targets are configured");
             }
             if self.ahp.typing_duration_seconds == 0
                 || self.ahp.typing_duration_seconds > 60
@@ -434,8 +606,11 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
-        let serialized = toml::to_string_pretty(self).context("failed to serialize config")?;
+        let mut normalized = self.clone();
+        normalized.ahp.sync_authorized_targets();
+        normalized.validate()?;
+        let serialized =
+            toml::to_string_pretty(&normalized).context("failed to serialize config")?;
         fs::write(path, serialized)
             .with_context(|| format!("failed to update config {}", path.display()))
     }
@@ -723,10 +898,17 @@ mod tests {
         .expect("write legacy config");
 
         let loaded = AppConfig::load(&config_path).expect("load legacy config");
-        assert_eq!(loaded.ahp.shared_workspaces, vec![workspace]);
+        assert_eq!(loaded.ahp.shared_workspaces, vec![workspace.clone()]);
+        assert_eq!(
+            loaded.ahp.authorized_targets,
+            vec![AhpAuthorizedTarget::Local {
+                path: workspace.clone()
+            }]
+        );
         loaded.save(&config_path).expect("save migrated config");
         let migrated = std::fs::read_to_string(&config_path).expect("read migrated config");
         assert!(migrated.contains("shared_workspaces = ["));
+        assert!(migrated.contains("[[ahp.authorized_targets]]"));
         assert!(!migrated.contains("\nshared_workspace ="));
     }
 

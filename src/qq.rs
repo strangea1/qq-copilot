@@ -417,7 +417,10 @@ fn choice_buttons_payload(buttons: &ChoiceButtons) -> Result<Value> {
     if buttons.choices.is_empty() || buttons.choices.len() > 25 {
         bail!("QQ choice keyboard must contain 1 to 25 buttons");
     }
-    if !matches!(buttons.button_id_prefix.as_str(), "choice" | "session") {
+    if !matches!(
+        buttons.button_id_prefix.as_str(),
+        "choice" | "session" | "target" | "model" | "approval"
+    ) {
         bail!("QQ choice keyboard button prefix is invalid");
     }
     let rows: Vec<Value> = buttons

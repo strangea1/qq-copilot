@@ -4,6 +4,13 @@ import { promisify } from "node:util";
 
 import * as vscode from "vscode";
 
+import {
+  matchingTrustRequest,
+  userConfigurationValue,
+  workspaceTrustCommandArgs,
+  type PendingTrustRequest,
+} from "./trust-helpers.js";
+
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -30,10 +37,18 @@ interface AhpStatus {
     readonly state: string;
     readonly active_turn_id?: string;
   }>;
+  readonly creation?: {
+    readonly mode: string;
+    readonly state: string;
+  };
   readonly pending_commands: number;
   readonly pending_approvals?: number;
   readonly pending_inputs?: number;
   readonly pending_projections: number;
+}
+
+interface TrustRequestsResponse {
+  readonly requests: readonly PendingTrustRequest[];
 }
 
 interface CombinedStatus {
@@ -48,6 +63,7 @@ interface CombinedStatus {
   readonly pendingCommands: number;
   readonly pendingInteractions: number;
   readonly pendingProjections: number;
+  readonly creationState: string;
   readonly error?: string;
 }
 
@@ -62,6 +78,8 @@ class StatusController implements vscode.Disposable {
   #refreshing: Promise<void> | undefined;
 
   #status: CombinedStatus = unavailableStatus("not yet checked");
+
+  readonly #openedTrustRequests = new Set<string>();
 
   constructor() {
     this.#item.name = "QQ Copilot AHP";
@@ -107,6 +125,7 @@ class StatusController implements vscode.Disposable {
       `AHP Adapter: ${status.adapterState}`,
       `Session bindings: ${status.bindingState}`,
       `Active Turns: ${status.activeTurnCount}`,
+      `Creation: ${status.creationState}`,
       `Pending Adapter commands: ${status.pendingCommands}`,
       `Pending interactions: ${status.pendingInteractions}`,
       `Pending QQ deliveries: ${status.pendingProjections}`,
@@ -119,7 +138,7 @@ class StatusController implements vscode.Disposable {
 
   async #refreshInner(): Promise<void> {
     try {
-      const legacy = await runBridgeCommand<LegacyStatus>("status");
+      const legacy = await runBridgeCommand<LegacyStatus>(["status"]);
       const ahp = legacy.ahp;
       const bindings = ahp?.bindings ?? (ahp?.binding ? [ahp.binding] : []);
       const boundCount = bindings.filter((binding) => binding.state === "bound").length;
@@ -143,10 +162,14 @@ class StatusController implements vscode.Disposable {
         pendingInteractions:
           (ahp?.pending_approvals ?? 0) + (ahp?.pending_inputs ?? 0),
         pendingProjections: ahp?.pending_projections ?? 0,
+        creationState: ahp?.creation
+          ? `${ahp.creation.mode}/${ahp.creation.state}`
+          : "none",
       };
     } catch (error) {
       this.#status = unavailableStatus(errorCode(error));
     }
+    await this.#syncTrustState();
     this.#render();
   }
 
@@ -182,9 +205,47 @@ class StatusController implements vscode.Disposable {
         `**AHP Adapter:** ${status.adapterState}`,
         `**Sessions:** ${status.bindingState}（运行中 ${status.activeTurnCount}）`,
         `**待交互:** ${status.pendingInteractions}`,
+        `**创建:** ${status.creationState}`,
         `**待补发:** ${status.pendingProjections}`,
       ].join("  \n"),
     );
+  }
+
+  async #syncTrustState(): Promise<void> {
+    const workspaceUris =
+      vscode.workspace.workspaceFolders?.map((folder) =>
+        folder.uri.toString(),
+      ) ?? [];
+    if (!workspaceUris.length) {
+      return;
+    }
+    const trustArgs = workspaceTrustCommandArgs(
+      workspaceUris,
+      vscode.workspace.isTrusted,
+    );
+    await runBridgeCommand<{ readonly updated: number }>(trustArgs).catch(
+      () => undefined,
+    );
+    const requests = await runBridgeCommand<TrustRequestsResponse>([
+      "trust-requests",
+    ]).catch(() => undefined);
+    if (!requests) {
+      return;
+    }
+    const matching = matchingTrustRequest(
+      workspaceUris,
+      vscode.workspace.isTrusted,
+      requests.requests,
+      this.#openedTrustRequests,
+    );
+    if (
+      matching &&
+      !vscode.workspace.isTrusted &&
+      !this.#openedTrustRequests.has(matching.request_id)
+    ) {
+      this.#openedTrustRequests.add(matching.request_id);
+      await vscode.commands.executeCommand("workbench.trust.manage");
+    }
   }
 }
 
@@ -198,6 +259,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("qqCopilot.showStatus", () =>
       controller.show(),
     ),
+    vscode.workspace.onDidGrantWorkspaceTrust(() => controller.refresh()),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => controller.refresh()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("qqCopilot")) {
         controller.restartTimer();
@@ -209,7 +272,7 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {}
 
 async function runBridgeCommand<T>(
-  command: "status",
+  args: readonly string[],
 ): Promise<T> {
   const config = vscode.workspace.getConfiguration("qqCopilot");
   const localAppData = process.env.LOCALAPPDATA;
@@ -217,14 +280,14 @@ async function runBridgeCommand<T>(
     throw new Error("LOCALAPPDATA is not set");
   }
   const bridge =
-    config.get<string>("bridgeExecutable") ||
+    userConfigurationValue(config.inspect<string>("bridgeExecutable")) ||
     join(localAppData, "Programs", "CopilotQQBridge", "qq-bridge.exe");
   const configPath =
-    config.get<string>("configPath") ||
+    userConfigurationValue(config.inspect<string>("configPath")) ||
     join(localAppData, "CopilotQQBridge", "config.toml");
   const result = await execFileAsync(
     bridge,
-    ["--config", configPath, command],
+    ["--config", configPath, ...args],
     {
       windowsHide: true,
       timeout: 5_000,
@@ -248,6 +311,7 @@ function unavailableStatus(error: string): CombinedStatus {
     pendingCommands: 0,
     pendingInteractions: 0,
     pendingProjections: 0,
+    creationState: "unknown",
     error,
   };
 }

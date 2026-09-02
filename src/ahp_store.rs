@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, Error as SqliteError, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -11,6 +11,7 @@ use crate::{
     protocol::{
         AhpAdapterCommand, AhpAdapterRegistration, AhpBindingRecord, AhpCommandKind,
         AhpCommandOutcome, AhpHostDescriptor, AhpPublishedEvent, AhpSessionDescriptor,
+        AhpTargetKind,
     },
     security::{canonical_json, random_code, redact_json, sha256_hex},
 };
@@ -39,6 +40,7 @@ pub struct AhpStatus {
     pub pending_approvals: u32,
     pub pending_inputs: u32,
     pub pending_projections: u32,
+    pub creation: Option<AhpCreationWizardStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +168,68 @@ pub struct AhpProjectionRecord {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCommandProgressRecord {
+    pub progress: u64,
+    pub total: Option<u64>,
+    pub message: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCommandStatusRecord {
+    pub command_id: i64,
+    pub kind: AhpCommandKind,
+    pub state: String,
+    pub error_code: Option<String>,
+    pub result: Option<Value>,
+    pub progress: Option<AhpCommandProgressRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCreationWizardRecord {
+    pub wizard_id: String,
+    pub mode: String,
+    pub state: String,
+    pub context: Option<Value>,
+    pub pending_task: Option<String>,
+    pub create_command_id: Option<i64>,
+    pub new_session_uri: Option<String>,
+    pub old_binding_endpoint_id: Option<String>,
+    pub old_binding_session_uri: Option<String>,
+    pub old_binding_host_instance_id: Option<String>,
+    pub cancel_requested: bool,
+    pub expires_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCreationWizardStatus {
+    pub wizard_id: String,
+    pub mode: String,
+    pub state: String,
+    pub expires_at: i64,
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpWizardButtonRecord {
+    pub button_data: String,
+    pub wizard_id: String,
+    pub action_kind: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpTrustRequestRecord {
+    pub request_id: String,
+    pub workspace_uri: String,
+    pub open_trust_ui: bool,
+    pub trusted: bool,
+    pub expires_at: i64,
+}
+
 pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -190,6 +254,13 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 state TEXT NOT NULL CHECK (
                     state IN ('connected', 'read_only', 'incompatible', 'unreachable')
                 ),
+                host_label TEXT,
+                ssh_alias TEXT,
+                target_kind TEXT CHECK (target_kind IN ('local', 'ssh')),
+                target_path TEXT,
+                endpoint_type TEXT,
+                editor_client_tools_available INTEGER
+                    NOT NULL DEFAULT 1 CHECK (editor_client_tools_available IN (0, 1)),
                 last_seen_at INTEGER NOT NULL
             );
 
@@ -204,6 +275,12 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 workspace_uris_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 modified_at TEXT NOT NULL,
+                host_label TEXT,
+                ssh_alias TEXT,
+                target_kind TEXT CHECK (target_kind IN ('local', 'ssh')),
+                target_path TEXT,
+                editor_client_tools_available INTEGER
+                    NOT NULL DEFAULT 1 CHECK (editor_client_tools_available IN (0, 1)),
                 available INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
                 last_seen_at INTEGER NOT NULL
             );
@@ -246,7 +323,8 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 kind TEXT NOT NULL CHECK (
                     kind IN (
                         'bind_session', 'unbind_session', 'send_message', 'cancel_turn',
-                        'approve_tool', 'review_tool_result', 'complete_input'
+                        'approve_tool', 'review_tool_result', 'complete_input',
+                        'prepare_target', 'create_session', 'dispose_session'
                     )
                 ),
                 data_json TEXT NOT NULL,
@@ -256,6 +334,9 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 lease_owner TEXT,
                 lease_expires_at INTEGER,
                 error_code TEXT,
+                result_json TEXT,
+                progress_json TEXT,
+                progress_updated_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -377,6 +458,53 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_ahp_projections_pending
                 ON ahp_projections(state, created_at);
+
+            CREATE TABLE IF NOT EXISTS ahp_creation_wizard (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                wizard_id TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('quick', 'advanced')),
+                state TEXT NOT NULL CHECK (
+                    state IN (
+                        'select_target', 'select_model', 'select_approval',
+                        'await_task', 'creating', 'cancelled'
+                    )
+                ),
+                context_json TEXT,
+                pending_task TEXT,
+                create_command_id INTEGER REFERENCES ahp_commands(command_id),
+                new_session_uri TEXT,
+                old_binding_endpoint_id TEXT,
+                old_binding_session_uri TEXT,
+                old_binding_host_instance_id TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ahp_creation_buttons (
+                button_data TEXT PRIMARY KEY,
+                wizard_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ahp_creation_buttons_expiry
+                ON ahp_creation_buttons(expires_at, used_at);
+
+            CREATE TABLE IF NOT EXISTS ahp_trust_requests (
+                request_id TEXT PRIMARY KEY,
+                workspace_uri TEXT NOT NULL,
+                open_trust_ui INTEGER NOT NULL CHECK (open_trust_ui IN (0, 1)),
+                trusted INTEGER NOT NULL DEFAULT 0 CHECK (trusted IN (0, 1)),
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ahp_trust_requests_pending
+                ON ahp_trust_requests(expires_at, trusted);
             "#,
         )
         .context("failed to initialize AHP database schema")?;
@@ -449,6 +577,72 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
     )?;
     ensure_column(
         connection,
+        "ahp_hosts",
+        "host_label",
+        "ALTER TABLE ahp_hosts ADD COLUMN host_label TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_hosts",
+        "ssh_alias",
+        "ALTER TABLE ahp_hosts ADD COLUMN ssh_alias TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_hosts",
+        "target_kind",
+        "ALTER TABLE ahp_hosts ADD COLUMN target_kind TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_hosts",
+        "target_path",
+        "ALTER TABLE ahp_hosts ADD COLUMN target_path TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_hosts",
+        "endpoint_type",
+        "ALTER TABLE ahp_hosts ADD COLUMN endpoint_type TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_hosts",
+        "editor_client_tools_available",
+        "ALTER TABLE ahp_hosts ADD COLUMN editor_client_tools_available INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "host_label",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN host_label TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "ssh_alias",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN ssh_alias TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "target_kind",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN target_kind TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "target_path",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN target_path TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "editor_client_tools_available",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN editor_client_tools_available INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        connection,
         "ahp_approvals",
         "allow_button_data",
         "ALTER TABLE ahp_approvals ADD COLUMN allow_button_data TEXT NOT NULL DEFAULT ''",
@@ -459,6 +653,25 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
         "deny_button_data",
         "ALTER TABLE ahp_approvals ADD COLUMN deny_button_data TEXT NOT NULL DEFAULT ''",
     )?;
+    ensure_column(
+        connection,
+        "ahp_commands",
+        "result_json",
+        "ALTER TABLE ahp_commands ADD COLUMN result_json TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_commands",
+        "progress_json",
+        "ALTER TABLE ahp_commands ADD COLUMN progress_json TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_commands",
+        "progress_updated_at",
+        "ALTER TABLE ahp_commands ADD COLUMN progress_updated_at INTEGER",
+    )?;
+    migrate_ahp_command_kinds(connection)?;
     let mut missing = {
         let mut statement = connection.prepare(
             "SELECT approval_key FROM ahp_approvals
@@ -616,6 +829,84 @@ fn migrate_legacy_binding(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ahp_command_kinds(connection: &Connection) -> Result<()> {
+    let schema: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ahp_commands'",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema.contains("'prepare_target'")
+        && schema.contains("'create_session'")
+        && schema.contains("'dispose_session'")
+    {
+        return Ok(());
+    }
+
+    let foreign_keys_enabled =
+        connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        connection.execute_batch("PRAGMA foreign_keys = OFF")?;
+    }
+    let migration = connection.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS ahp_commands_new;
+        CREATE TABLE ahp_commands_new (
+            command_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_key TEXT NOT NULL UNIQUE,
+            binding_id TEXT NOT NULL,
+            binding_generation INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK (
+                kind IN (
+                    'bind_session', 'unbind_session', 'send_message', 'cancel_turn',
+                    'approve_tool', 'review_tool_result', 'complete_input',
+                    'prepare_target', 'create_session', 'dispose_session'
+                )
+            ),
+            data_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('pending', 'leased', 'acked', 'rejected', 'failed')
+            ),
+            lease_owner TEXT,
+            lease_expires_at INTEGER,
+            error_code TEXT,
+            result_json TEXT,
+            progress_json TEXT,
+            progress_updated_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO ahp_commands_new(
+            command_id, command_key, binding_id, binding_generation, kind, data_json, state,
+            lease_owner, lease_expires_at, error_code, result_json, progress_json,
+            progress_updated_at, created_at, updated_at
+        )
+        SELECT
+            command_id, command_key, COALESCE(binding_id, ''), binding_generation, kind,
+            data_json, state,
+            lease_owner, lease_expires_at, error_code, result_json, progress_json,
+            progress_updated_at, created_at, updated_at
+        FROM ahp_commands;
+        DROP TABLE ahp_commands;
+        ALTER TABLE ahp_commands_new RENAME TO ahp_commands;
+        CREATE INDEX idx_ahp_commands_ready
+            ON ahp_commands(state, lease_expires_at, command_id);
+        COMMIT;
+        "#,
+    );
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    let restore_foreign_keys = if foreign_keys_enabled {
+        connection.execute_batch("PRAGMA foreign_keys = ON")
+    } else {
+        Ok(())
+    };
+    migration.context("failed to migrate AHP command kinds")?;
+    restore_foreign_keys.context("failed to restore SQLite foreign key enforcement")?;
+    Ok(())
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -701,33 +992,72 @@ impl Database {
         hosts: &[AhpHostDescriptor],
         sessions: &[AhpSessionDescriptor],
     ) -> Result<()> {
+        self.ahp_replace_catalog_scoped(adapter_id, adapter_instance_id, hosts, sessions, true)
+    }
+
+    pub fn ahp_replace_catalog_scoped(
+        &self,
+        adapter_id: &str,
+        adapter_instance_id: &str,
+        hosts: &[AhpHostDescriptor],
+        sessions: &[AhpSessionDescriptor],
+        full_snapshot: bool,
+    ) -> Result<()> {
         let now = now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_adapter(&transaction, adapter_id, adapter_instance_id)?;
-
-        transaction.execute("UPDATE ahp_session_catalog SET available = 0", [])?;
-        transaction.execute("UPDATE ahp_hosts SET state = 'unreachable'", [])?;
+        if full_snapshot {
+            transaction.execute("UPDATE ahp_session_catalog SET available = 0", [])?;
+            transaction.execute("UPDATE ahp_hosts SET state = 'unreachable'", [])?;
+        } else {
+            for endpoint_id in hosts.iter().map(|host| host.endpoint_id.as_str()) {
+                transaction.execute(
+                    "UPDATE ahp_session_catalog SET available = 0 WHERE endpoint_id = ?1",
+                    [endpoint_id],
+                )?;
+            }
+        }
         for host in hosts {
             transaction.execute(
                 "INSERT INTO ahp_hosts(
                     endpoint_id, host_instance_id, pid, advertised_protocol,
-                    selected_protocol, state, last_seen_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    selected_protocol, state, host_label, ssh_alias, target_kind,
+                    target_path, endpoint_type, editor_client_tools_available, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(endpoint_id) DO UPDATE SET
                     host_instance_id = excluded.host_instance_id,
                     pid = excluded.pid,
                     advertised_protocol = excluded.advertised_protocol,
                     selected_protocol = excluded.selected_protocol,
                     state = excluded.state,
+                    host_label = excluded.host_label,
+                    ssh_alias = excluded.ssh_alias,
+                    target_kind = excluded.target_kind,
+                    target_path = excluded.target_path,
+                    endpoint_type = excluded.endpoint_type,
+                    editor_client_tools_available = excluded.editor_client_tools_available,
                     last_seen_at = excluded.last_seen_at",
                 params![
                     host.endpoint_id,
                     host.host_instance_id,
                     i64::from(host.pid),
                     host.advertised_protocol,
-                    host.selected_protocol,
+                    host.selected_protocol.as_deref(),
                     host.state.as_str(),
+                    host.host_label.as_deref(),
+                    host.ssh_alias.as_deref(),
+                    host.target_kind.map(|kind| match kind {
+                        AhpTargetKind::Local => "local",
+                        AhpTargetKind::Ssh => "ssh",
+                    }),
+                    host.target_path.as_deref(),
+                    host.endpoint_type.as_deref(),
+                    if host.editor_client_tools_available.unwrap_or(true) {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
                     now
                 ],
             )?;
@@ -741,7 +1071,7 @@ impl Database {
             }
             upsert_catalog_session(&transaction, session, now)?;
         }
-        fail_bindings_for_host_changes(&transaction, hosts, now)?;
+        fail_bindings_for_host_changes(&transaction, hosts, full_snapshot, now)?;
         transaction.execute(
             "UPDATE ahp_adapter SET last_seen_at = ?1, updated_at = ?1, state = 'connected'
              WHERE singleton = 1",
@@ -755,9 +1085,11 @@ impl Database {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT endpoint_id, host_instance_id, session_uri, provider, title,
-                    status, workspace_uris_json, created_at, modified_at, short_code
+                    status, workspace_uris_json, created_at, modified_at, short_code,
+                    host_label, ssh_alias, target_kind, target_path,
+                    editor_client_tools_available, NULL, NULL
              FROM ahp_session_catalog
-             WHERE available = 1
+             WHERE available = 1 OR target_kind IS NOT NULL
              ORDER BY modified_at DESC",
         )?;
         statement
@@ -770,8 +1102,11 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT endpoint_id, host_instance_id, session_uri, provider, title,
-                        status, workspace_uris_json, created_at, modified_at, short_code
-                 FROM ahp_session_catalog WHERE short_code = ?1 AND available = 1",
+                        status, workspace_uris_json, created_at, modified_at, short_code,
+                        host_label, ssh_alias, target_kind, target_path,
+                        editor_client_tools_available, NULL, NULL
+                 FROM ahp_session_catalog
+                 WHERE short_code = ?1 AND (available = 1 OR target_kind IS NOT NULL)",
                 [short_code.to_ascii_uppercase()],
                 map_session_descriptor,
             )
@@ -782,6 +1117,18 @@ impl Database {
     pub fn ahp_session_by_uri(&self, session_uri: &str) -> Result<Option<AhpSessionDescriptor>> {
         let connection = self.connection()?;
         session_by_uri(&connection, session_uri)
+    }
+
+    pub fn ahp_session_is_available(&self, session_uri: &str) -> Result<bool> {
+        self.connection()?
+            .query_row(
+                "SELECT available FROM ahp_session_catalog WHERE session_uri = ?1",
+                [session_uri],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|available| available.is_some_and(|value| value != 0))
+            .context("failed to query AHP Session availability")
     }
 
     pub fn ahp_create_session_switch_buttons(
@@ -850,7 +1197,8 @@ impl Database {
                         b.expires_at, b.used_at
                  FROM ahp_session_switch_buttons b
                  JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
-                 WHERE b.button_data = ?1 AND s.available = 1",
+                 WHERE b.button_data = ?1
+                   AND (s.available = 1 OR s.target_kind IS NOT NULL)",
                 [button_data],
                 |row| {
                     Ok((
@@ -917,6 +1265,72 @@ impl Database {
             binding,
             accepted: true,
         }))
+    }
+
+    pub fn ahp_consume_session_switch_button(
+        &self,
+        button_data: &str,
+        allowed_session_uris: &[String],
+    ) -> Result<Option<AhpSessionDescriptor>> {
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let token: Option<(String, String, String, String, i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT b.group_id, b.session_uri, b.workspace_uris_json, s.workspace_uris_json,
+                        b.expires_at, b.used_at
+                 FROM ahp_session_switch_buttons b
+                 JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
+                 WHERE b.button_data = ?1
+                   AND (s.available = 1 OR s.target_kind IS NOT NULL)",
+                [button_data],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            group_id,
+            session_uri,
+            menu_workspace_uris,
+            current_workspace_uris,
+            expires_at,
+            used_at,
+        )) = token
+        else {
+            return Ok(None);
+        };
+        let session = session_by_uri(&transaction, &session_uri)?
+            .context("AHP Session for switch button is no longer available")?;
+        if !allowed_session_uris
+            .iter()
+            .any(|allowed| allowed == &session.session_uri)
+        {
+            transaction.execute(
+                "UPDATE ahp_session_switch_buttons
+                 SET used_at = ?1 WHERE button_data = ?2 AND used_at IS NULL",
+                params![now, button_data],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+        if used_at.is_some() || expires_at <= now || menu_workspace_uris != current_workspace_uris {
+            return Ok(None);
+        }
+        transaction.execute(
+            "UPDATE ahp_session_switch_buttons
+             SET used_at = ?1 WHERE group_id = ?2 AND used_at IS NULL",
+            params![now, group_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(session))
     }
 
     pub fn ahp_bind_session(
@@ -1299,6 +1713,33 @@ impl Database {
         Ok(command_id)
     }
 
+    pub fn ahp_enqueue_prepare_target(&self, command_key: &str, data: &Value) -> Result<i64> {
+        self.ahp_enqueue_unbound_command(command_key, AhpCommandKind::PrepareTarget, data)
+    }
+
+    pub fn ahp_enqueue_create_session(&self, command_key: &str, data: &Value) -> Result<i64> {
+        self.ahp_enqueue_unbound_command(command_key, AhpCommandKind::CreateSession, data)
+    }
+
+    pub fn ahp_enqueue_dispose_session(&self, command_key: &str, data: &Value) -> Result<i64> {
+        self.ahp_enqueue_unbound_command(command_key, AhpCommandKind::DisposeSession, data)
+    }
+
+    fn ahp_enqueue_unbound_command(
+        &self,
+        command_key: &str,
+        kind: AhpCommandKind,
+        data: &Value,
+    ) -> Result<i64> {
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let command_id =
+            enqueue_command(&transaction, command_key, "__unbound__", 0, kind, data, now)?;
+        transaction.commit()?;
+        Ok(command_id)
+    }
+
     pub fn ahp_begin_approval(&self, approval: &NewAhpApproval) -> Result<BeginAhpApproval> {
         let now = now();
         let mut connection = self.connection()?;
@@ -1515,6 +1956,22 @@ impl Database {
             .transpose()
     }
 
+    pub fn ahp_has_pending_interactions(&self) -> Result<bool> {
+        let now = now();
+        let connection = self.connection()?;
+        expire_ahp_interactions(&connection, now)?;
+        let pending: i64 = connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM ahp_approvals
+                 WHERE state IN ('pending', 'submitted') AND expires_at > ?1) +
+                (SELECT COUNT(*) FROM ahp_inputs
+                 WHERE state IN ('pending', 'submitted') AND expires_at > ?1)",
+            [now],
+            |row| row.get(0),
+        )?;
+        Ok(pending != 0)
+    }
+
     pub fn ahp_submit_input(
         &self,
         input_key: &str,
@@ -1700,6 +2157,7 @@ impl Database {
         command_id: i64,
         outcome: AhpCommandOutcome,
         error_code: Option<&str>,
+        result: Option<&Value>,
     ) -> Result<()> {
         let now = now();
         let mut connection = self.connection()?;
@@ -1716,13 +2174,17 @@ impl Database {
         let Some((binding_id, command_kind)) = command else {
             bail!("AHP command acknowledgement is stale or mismatched");
         };
+        let result = result.map(canonical_json);
         let changed = transaction.execute(
             "UPDATE ahp_commands
-             SET state = ?1, error_code = ?2, lease_expires_at = NULL, updated_at = ?3
-             WHERE command_id = ?4 AND state = 'leased' AND lease_owner = ?5",
+             SET state = ?1, error_code = ?2, result_json = ?3,
+                 lease_expires_at = NULL, progress_json = NULL,
+                 progress_updated_at = NULL, updated_at = ?4
+             WHERE command_id = ?5 AND state = 'leased' AND lease_owner = ?6",
             params![
                 outcome.as_str(),
                 error_code,
+                result,
                 now,
                 command_id,
                 adapter_instance_id
@@ -1757,6 +2219,14 @@ impl Database {
             AhpCommandOutcome::Rejected => {
                 expire_ahp_interactions(&transaction, now)?;
                 transaction.execute(
+                    "UPDATE ahp_approvals
+                     SET state = 'pending', command_id = NULL,
+                         decided_by_surface = NULL, decided_by_message_id = NULL,
+                         updated_at = ?1
+                     WHERE command_id = ?2 AND state = 'submitted' AND expires_at > ?1",
+                    params![now, command_id],
+                )?;
+                transaction.execute(
                     "UPDATE ahp_inputs
                      SET state = 'pending', command_id = NULL,
                          decided_by_surface = NULL, decided_by_message_id = NULL,
@@ -1767,6 +2237,11 @@ impl Database {
             }
             AhpCommandOutcome::Failed => {
                 transaction.execute(
+                    "UPDATE ahp_approvals SET state = 'failed', updated_at = ?1
+                     WHERE command_id = ?2 AND state = 'submitted'",
+                    params![now, command_id],
+                )?;
+                transaction.execute(
                     "UPDATE ahp_inputs SET state = 'failed', updated_at = ?1
                      WHERE command_id = ?2 AND state = 'submitted'",
                     params![now, command_id],
@@ -1775,6 +2250,115 @@ impl Database {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn ahp_record_command_progress(
+        &self,
+        adapter_id: &str,
+        adapter_instance_id: &str,
+        command_id: i64,
+        progress: u64,
+        total: Option<u64>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_adapter(&transaction, adapter_id, adapter_instance_id)?;
+        let payload = canonical_json(&json!({
+            "progress": progress,
+            "total": total,
+            "message": message,
+        }));
+        let changed = transaction.execute(
+            "UPDATE ahp_commands
+             SET progress_json = ?1, progress_updated_at = ?2, updated_at = ?2
+             WHERE command_id = ?3 AND state = 'leased' AND lease_owner = ?4",
+            params![payload, now, command_id, adapter_instance_id],
+        )?;
+        if changed != 1 {
+            bail!("AHP command progress targets a stale or inactive lease");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ahp_command_status(&self, command_id: i64) -> Result<Option<AhpCommandStatusRecord>> {
+        self.connection()?
+            .query_row(
+                "SELECT command_id, kind, state, error_code, result_json,
+                        progress_json, progress_updated_at
+                 FROM ahp_commands WHERE command_id = ?1",
+                [command_id],
+                |row| {
+                    let kind: String = row.get(1)?;
+                    let result: Option<String> = row.get(4)?;
+                    let progress: Option<String> = row.get(5)?;
+                    let progress_updated_at: Option<i64> = row.get(6)?;
+                    Ok(AhpCommandStatusRecord {
+                        command_id: row.get(0)?,
+                        kind: AhpCommandKind::try_from(kind.as_str()).map_err(|error| {
+                            SqliteError::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    error,
+                                )),
+                            )
+                        })?,
+                        state: row.get(2)?,
+                        error_code: row.get(3)?,
+                        result: result
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    SqliteError::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })
+                            })
+                            .transpose()?,
+                        progress: match (progress, progress_updated_at) {
+                            (Some(progress), Some(updated_at)) => {
+                                let progress: Value =
+                                    serde_json::from_str(&progress).map_err(|error| {
+                                        SqliteError::FromSqlConversionFailure(
+                                            5,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(error),
+                                        )
+                                    })?;
+                                Some(AhpCommandProgressRecord {
+                                    progress: progress
+                                        .get("progress")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0),
+                                    total: progress.get("total").and_then(Value::as_u64),
+                                    message: progress
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    updated_at,
+                                })
+                            }
+                            _ => None,
+                        },
+                    })
+                },
+            )
+            .optional()
+            .context("failed to query AHP command status")
+    }
+
+    pub fn ahp_has_pending_commands(&self) -> Result<bool> {
+        let pending: i64 = self.connection()?.query_row(
+            "SELECT COUNT(*) FROM ahp_commands WHERE state IN ('pending', 'leased')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(pending != 0)
     }
 
     pub fn ahp_status(&self, stale_seconds: u64) -> Result<AhpStatus> {
@@ -1806,11 +2390,21 @@ impl Database {
             .optional()?;
         let mut host_statement = connection.prepare(
             "SELECT endpoint_id, host_instance_id, pid, advertised_protocol,
-                    selected_protocol, state FROM ahp_hosts ORDER BY endpoint_id",
+                    selected_protocol, state, host_label, ssh_alias, target_kind,
+                    target_path, endpoint_type, editor_client_tools_available, last_seen_at
+             FROM ahp_hosts ORDER BY endpoint_id",
         )?;
         let hosts = host_statement
             .query_map([], |row| {
                 let state: String = row.get(5)?;
+                let last_seen_at: i64 = row.get(12)?;
+                let stored_state = parse_host_state(&state).map_err(|error| {
+                    SqliteError::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })?;
                 Ok(AhpHostDescriptor {
                     endpoint_id: row.get(0)?,
                     host_instance_id: row.get(1)?,
@@ -1823,13 +2417,39 @@ impl Database {
                     })?,
                     advertised_protocol: row.get(3)?,
                     selected_protocol: row.get(4)?,
-                    state: parse_host_state(&state).map_err(|error| {
-                        SqliteError::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            error.into(),
-                        )
-                    })?,
+                    state: if last_seen_at < stale_cutoff
+                        && matches!(
+                            stored_state,
+                            crate::protocol::AhpHostState::Connected
+                                | crate::protocol::AhpHostState::ReadOnly
+                        ) {
+                        crate::protocol::AhpHostState::Unreachable
+                    } else {
+                        stored_state
+                    },
+                    host_label: row.get(6)?,
+                    ssh_alias: row.get(7)?,
+                    target_kind: row
+                        .get::<_, Option<String>>(8)?
+                        .map(|value| match value.as_str() {
+                            "local" => Ok(AhpTargetKind::Local),
+                            "ssh" => Ok(AhpTargetKind::Ssh),
+                            _ => Err(SqliteError::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("unknown target kind {value}"),
+                                )),
+                            )),
+                        })
+                        .transpose()?,
+                    target_path: row.get(9)?,
+                    endpoint_type: row.get(10)?,
+                    editor_client_tools_available: row
+                        .get::<_, Option<i64>>(11)?
+                        .map(|value| value != 0),
+                    last_seen_at: Some(last_seen_at),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1869,7 +2489,321 @@ impl Database {
             pending_approvals,
             pending_inputs,
             pending_projections,
+            creation: self.ahp_creation_wizard_status()?,
         })
+    }
+
+    pub fn ahp_creation_wizard(&self) -> Result<Option<AhpCreationWizardRecord>> {
+        let now = now();
+        let connection = self.connection()?;
+        expire_ahp_auxiliary_state(&connection, now)?;
+        connection
+            .query_row(
+                "SELECT wizard_id, mode, state, context_json, pending_task, create_command_id,
+                        new_session_uri, old_binding_endpoint_id, old_binding_session_uri,
+                        old_binding_host_instance_id, cancel_requested, expires_at,
+                        created_at, updated_at
+                 FROM ahp_creation_wizard WHERE singleton = 1",
+                [],
+                map_creation_wizard,
+            )
+            .optional()
+            .context("failed to query AHP creation wizard")
+    }
+
+    pub fn ahp_creation_wizard_status(&self) -> Result<Option<AhpCreationWizardStatus>> {
+        self.ahp_creation_wizard().map(|wizard| {
+            wizard.map(|wizard| AhpCreationWizardStatus {
+                wizard_id: wizard.wizard_id,
+                mode: wizard.mode,
+                state: wizard.state,
+                expires_at: wizard.expires_at,
+                cancel_requested: wizard.cancel_requested,
+            })
+        })
+    }
+
+    pub fn ahp_save_creation_wizard(&self, wizard: &AhpCreationWizardRecord) -> Result<()> {
+        if !matches!(wizard.mode.as_str(), "quick" | "advanced") {
+            bail!("invalid AHP creation wizard mode");
+        }
+        if !matches!(
+            wizard.state.as_str(),
+            "select_target"
+                | "select_model"
+                | "select_approval"
+                | "await_task"
+                | "creating"
+                | "cancelled"
+        ) {
+            bail!("invalid AHP creation wizard state");
+        }
+        let context = wizard.context.as_ref().map(canonical_json);
+        self.connection()?.execute(
+            "INSERT INTO ahp_creation_wizard(
+                singleton, wizard_id, mode, state, context_json, pending_task,
+                create_command_id, new_session_uri, old_binding_endpoint_id,
+                old_binding_session_uri, old_binding_host_instance_id, cancel_requested,
+                expires_at, created_at, updated_at
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(singleton) DO UPDATE SET
+                wizard_id = excluded.wizard_id,
+                mode = excluded.mode,
+                state = excluded.state,
+                context_json = excluded.context_json,
+                pending_task = excluded.pending_task,
+                create_command_id = excluded.create_command_id,
+                new_session_uri = excluded.new_session_uri,
+                old_binding_endpoint_id = excluded.old_binding_endpoint_id,
+                old_binding_session_uri = excluded.old_binding_session_uri,
+                old_binding_host_instance_id = excluded.old_binding_host_instance_id,
+                cancel_requested = excluded.cancel_requested,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at",
+            params![
+                wizard.wizard_id,
+                wizard.mode,
+                wizard.state,
+                context,
+                wizard.pending_task,
+                wizard.create_command_id,
+                wizard.new_session_uri,
+                wizard.old_binding_endpoint_id,
+                wizard.old_binding_session_uri,
+                wizard.old_binding_host_instance_id,
+                if wizard.cancel_requested {
+                    1_i64
+                } else {
+                    0_i64
+                },
+                wizard.expires_at,
+                wizard.created_at,
+                wizard.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn ahp_clear_creation_wizard(&self) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let wizard_id: Option<String> = transaction
+            .query_row(
+                "SELECT wizard_id FROM ahp_creation_wizard WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(wizard_id) = wizard_id {
+            transaction.execute(
+                "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
+                [wizard_id],
+            )?;
+        }
+        transaction.execute("DELETE FROM ahp_creation_wizard WHERE singleton = 1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn ahp_create_wizard_buttons(
+        &self,
+        wizard_id: &str,
+        action_kind: &str,
+        payloads: &[Value],
+        ttl_seconds: u64,
+    ) -> Result<Vec<AhpWizardButtonRecord>> {
+        if payloads.len() > 100 {
+            bail!("too many AHP creation wizard buttons");
+        }
+        let now = now();
+        let expires_at =
+            now + i64::try_from(ttl_seconds).context("wizard button TTL exceeds range")?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_ahp_auxiliary_state(&transaction, now)?;
+        transaction.execute(
+            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
+            [wizard_id],
+        )?;
+        let mut buttons = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let button_data = allocate_creation_button_token(&transaction, action_kind)?;
+            transaction.execute(
+                "INSERT INTO ahp_creation_buttons(
+                    button_data, wizard_id, action_kind, payload_json, expires_at, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    button_data,
+                    wizard_id,
+                    action_kind,
+                    canonical_json(payload),
+                    expires_at,
+                    now
+                ],
+            )?;
+            buttons.push(AhpWizardButtonRecord {
+                button_data,
+                wizard_id: wizard_id.to_owned(),
+                action_kind: action_kind.to_owned(),
+                payload: payload.clone(),
+            });
+        }
+        transaction.commit()?;
+        Ok(buttons)
+    }
+
+    pub fn ahp_consume_wizard_button(
+        &self,
+        button_data: &str,
+    ) -> Result<Option<AhpWizardButtonRecord>> {
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_ahp_auxiliary_state(&transaction, now)?;
+        let record: Option<(String, String, String, String, i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT button_data, wizard_id, action_kind, payload_json, expires_at, used_at
+                 FROM ahp_creation_buttons WHERE button_data = ?1",
+                [button_data],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((button_data, wizard_id, action_kind, payload_json, expires_at, used_at)) = record
+        else {
+            return Ok(None);
+        };
+        if used_at.is_some() || expires_at <= now {
+            return Ok(None);
+        }
+        transaction.execute(
+            "UPDATE ahp_creation_buttons
+             SET used_at = ?1
+             WHERE wizard_id = ?2 AND action_kind = ?3 AND used_at IS NULL",
+            params![now, wizard_id, action_kind],
+        )?;
+        transaction.commit()?;
+        Ok(Some(AhpWizardButtonRecord {
+            button_data,
+            wizard_id,
+            action_kind,
+            payload: serde_json::from_str(&payload_json)
+                .context("stored wizard button payload is invalid")?,
+        }))
+    }
+
+    pub fn ahp_begin_trust_request(
+        &self,
+        request_id: &str,
+        workspace_uri: &str,
+        open_trust_ui: bool,
+        ttl_seconds: u64,
+    ) -> Result<AhpTrustRequestRecord> {
+        let now = now();
+        let expires_at =
+            now + i64::try_from(ttl_seconds).context("trust request TTL exceeds range")?;
+        let connection = self.connection()?;
+        expire_ahp_auxiliary_state(&connection, now)?;
+        connection.execute(
+            "INSERT INTO ahp_trust_requests(
+                request_id, workspace_uri, open_trust_ui, trusted, expires_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)
+             ON CONFLICT(request_id) DO UPDATE SET
+                workspace_uri = excluded.workspace_uri,
+                open_trust_ui = excluded.open_trust_ui,
+                trusted = 0,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at",
+            params![
+                request_id,
+                workspace_uri,
+                if open_trust_ui { 1_i64 } else { 0_i64 },
+                expires_at,
+                now
+            ],
+        )?;
+        Ok(AhpTrustRequestRecord {
+            request_id: request_id.to_owned(),
+            workspace_uri: workspace_uri.to_owned(),
+            open_trust_ui,
+            trusted: false,
+            expires_at,
+        })
+    }
+
+    pub fn ahp_pending_trust_requests(&self) -> Result<Vec<AhpTrustRequestRecord>> {
+        let now = now();
+        let connection = self.connection()?;
+        expire_ahp_auxiliary_state(&connection, now)?;
+        let mut statement = connection.prepare(
+            "SELECT request_id, workspace_uri, open_trust_ui, trusted, expires_at
+             FROM ahp_trust_requests
+             WHERE expires_at > ?1
+             ORDER BY created_at ASC",
+        )?;
+        statement
+            .query_map([now], map_trust_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query AHP trust requests")
+    }
+
+    pub fn ahp_trust_request(&self, request_id: &str) -> Result<Option<AhpTrustRequestRecord>> {
+        let now = now();
+        let connection = self.connection()?;
+        expire_ahp_auxiliary_state(&connection, now)?;
+        connection
+            .query_row(
+                "SELECT request_id, workspace_uri, open_trust_ui, trusted, expires_at
+                 FROM ahp_trust_requests WHERE request_id = ?1",
+                [request_id],
+                map_trust_request,
+            )
+            .optional()
+            .context("failed to query AHP trust request")
+    }
+
+    pub fn ahp_delete_trust_request(&self, request_id: &str) -> Result<()> {
+        self.connection()?.execute(
+            "DELETE FROM ahp_trust_requests WHERE request_id = ?1",
+            [request_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn ahp_report_workspace_trust(
+        &self,
+        workspace_uris: &[String],
+        trusted: bool,
+    ) -> Result<u32> {
+        if workspace_uris.is_empty() {
+            return Ok(0);
+        }
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_ahp_auxiliary_state(&transaction, now)?;
+        let mut changed = 0_u32;
+        for workspace_uri in workspace_uris {
+            let updated = transaction.execute(
+                "UPDATE ahp_trust_requests
+                 SET trusted = ?1, updated_at = ?2
+                 WHERE workspace_uri = ?3 AND expires_at > ?2",
+                params![if trusted { 1_i64 } else { 0_i64 }, now, workspace_uri],
+            )?;
+            changed = changed.saturating_add(u32::try_from(updated).unwrap_or(0));
+        }
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn ahp_queue_projection(&self, event_id: &str, kind: &str, content: &str) -> Result<()> {
@@ -1932,8 +2866,10 @@ impl Database {
     }
 
     pub fn ahp_purge_events(&self, retention_days: u32) -> Result<()> {
-        let cutoff = now() - i64::from(retention_days) * 86_400;
+        let now = now();
+        let cutoff = now - i64::from(retention_days) * 86_400;
         let connection = self.connection()?;
+        expire_ahp_auxiliary_state(&connection, now)?;
         connection.execute("DELETE FROM ahp_events WHERE created_at < ?1", [cutoff])?;
         connection.execute(
             "DELETE FROM ahp_commands
@@ -1952,17 +2888,17 @@ impl Database {
         connection.execute(
             "UPDATE ahp_approvals SET state = 'expired', updated_at = ?1
              WHERE state IN ('pending', 'submitted') AND expires_at <= ?1",
-            [now()],
+            [now],
         )?;
         connection.execute(
             "UPDATE ahp_inputs SET state = 'expired', updated_at = ?1
              WHERE state IN ('pending', 'submitted') AND expires_at <= ?1",
-            [now()],
+            [now],
         )?;
         connection.execute(
             "DELETE FROM ahp_session_switch_buttons
              WHERE expires_at <= ?1 OR used_at IS NOT NULL",
-            [now()],
+            [now],
         )?;
         connection.execute(
             "DELETE FROM ahp_session_catalog
@@ -2035,9 +2971,12 @@ fn binding_from_connection(connection: &Connection) -> Result<Option<AhpBindingR
         .query_row(
             "SELECT b.binding_id, b.generation, b.endpoint_id, b.host_instance_id,
                     b.session_uri, b.chat_uri, b.state, b.last_server_sequence,
-                    b.active_turn_id, b.queued_message_count, b.last_activity_at, 1
+                    b.active_turn_id, b.queued_message_count, b.last_activity_at, 1,
+                    s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                    s.editor_client_tools_available
              FROM ahp_foreground_binding f
              JOIN ahp_bindings b ON b.binding_id = f.binding_id
+             LEFT JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
              WHERE f.singleton = 1 AND b.state != 'detaching'",
             [],
             map_binding,
@@ -2051,10 +2990,13 @@ fn bindings_from_connection(connection: &Connection) -> Result<Vec<AhpBindingRec
         "SELECT b.binding_id, b.generation, b.endpoint_id, b.host_instance_id,
                 b.session_uri, b.chat_uri, b.state, b.last_server_sequence,
                 b.active_turn_id, b.queued_message_count, b.last_activity_at,
-                CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END
+                CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END,
+                s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                s.editor_client_tools_available
          FROM ahp_bindings b
          LEFT JOIN ahp_foreground_binding f
             ON f.singleton = 1 AND f.binding_id = b.binding_id
+         LEFT JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
          WHERE b.state != 'detaching'
          ORDER BY CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END DESC,
                   b.last_activity_at DESC, b.binding_id",
@@ -2071,10 +3013,13 @@ fn binding_by_id(connection: &Connection, binding_id: &str) -> Result<Option<Ahp
             "SELECT b.binding_id, b.generation, b.endpoint_id, b.host_instance_id,
                     b.session_uri, b.chat_uri, b.state, b.last_server_sequence,
                     b.active_turn_id, b.queued_message_count, b.last_activity_at,
-                    CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END
+                    CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END,
+                    s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                    s.editor_client_tools_available
              FROM ahp_bindings b
              LEFT JOIN ahp_foreground_binding f
                 ON f.singleton = 1 AND f.binding_id = b.binding_id
+             LEFT JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
              WHERE b.binding_id = ?1",
             [binding_id],
             map_binding,
@@ -2092,10 +3037,13 @@ fn binding_by_session(
             "SELECT b.binding_id, b.generation, b.endpoint_id, b.host_instance_id,
                     b.session_uri, b.chat_uri, b.state, b.last_server_sequence,
                     b.active_turn_id, b.queued_message_count, b.last_activity_at,
-                    CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END
+                    CASE WHEN f.binding_id IS NULL THEN 0 ELSE 1 END,
+                    s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                    s.editor_client_tools_available
              FROM ahp_bindings b
              LEFT JOIN ahp_foreground_binding f
                 ON f.singleton = 1 AND f.binding_id = b.binding_id
+             LEFT JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
              WHERE b.session_uri = ?1",
             [session_uri],
             map_binding,
@@ -2126,6 +3074,25 @@ fn map_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpBindingRecord> {
         })?,
         last_activity_at: row.get(10)?,
         foreground: row.get::<_, i64>(11)? != 0,
+        host_label: row.get(12)?,
+        ssh_alias: row.get(13)?,
+        target_kind: row
+            .get::<_, Option<String>>(14)?
+            .map(|value| match value.as_str() {
+                "local" => Ok(AhpTargetKind::Local),
+                "ssh" => Ok(AhpTargetKind::Ssh),
+                _ => Err(SqliteError::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown target kind {value}"),
+                    )),
+                )),
+            })
+            .transpose()?,
+        target_path: row.get(15)?,
+        editor_client_tools_available: row.get::<_, Option<i64>>(16)?.map(|value| value != 0),
     })
 }
 
@@ -2475,6 +3442,34 @@ fn expire_ahp_interactions(connection: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
+fn expire_ahp_auxiliary_state(connection: &Connection, now: i64) -> Result<()> {
+    connection.execute(
+        "DELETE FROM ahp_creation_buttons
+         WHERE expires_at <= ?1 OR used_at IS NOT NULL",
+        [now],
+    )?;
+    let expired_wizard_id: Option<String> = connection
+        .query_row(
+            "SELECT wizard_id FROM ahp_creation_wizard
+             WHERE singleton = 1 AND expires_at <= ?1",
+            [now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(wizard_id) = expired_wizard_id {
+        connection.execute(
+            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
+            [wizard_id],
+        )?;
+        connection.execute("DELETE FROM ahp_creation_wizard WHERE singleton = 1", [])?;
+    }
+    connection.execute(
+        "DELETE FROM ahp_trust_requests WHERE expires_at <= ?1",
+        [now],
+    )?;
+    Ok(())
+}
+
 fn is_constraint(error: &SqliteError) -> bool {
     matches!(
         error,
@@ -2500,6 +3495,46 @@ fn map_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpAdapterCommand> {
     })
 }
 
+fn map_creation_wizard(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpCreationWizardRecord> {
+    let context: Option<String> = row.get(3)?;
+    Ok(AhpCreationWizardRecord {
+        wizard_id: row.get(0)?,
+        mode: row.get(1)?,
+        state: row.get(2)?,
+        context: context
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    SqliteError::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        pending_task: row.get(4)?,
+        create_command_id: row.get(5)?,
+        new_session_uri: row.get(6)?,
+        old_binding_endpoint_id: row.get(7)?,
+        old_binding_session_uri: row.get(8)?,
+        old_binding_host_instance_id: row.get(9)?,
+        cancel_requested: row.get::<_, i64>(10)? != 0,
+        expires_at: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn map_trust_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpTrustRequestRecord> {
+    Ok(AhpTrustRequestRecord {
+        request_id: row.get(0)?,
+        workspace_uri: row.get(1)?,
+        open_trust_ui: row.get::<_, i64>(2)? != 0,
+        trusted: row.get::<_, i64>(3)? != 0,
+        expires_at: row.get(4)?,
+    })
+}
+
 fn map_session_descriptor(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpSessionDescriptor> {
     let workspace_uris: String = row.get(6)?;
     Ok(AhpSessionDescriptor {
@@ -2521,6 +3556,38 @@ fn map_session_descriptor(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpSessio
         })?,
         created_at: row.get(7)?,
         modified_at: row.get(8)?,
+        host_label: row.get(10)?,
+        ssh_alias: row.get(11)?,
+        target_kind: row
+            .get::<_, Option<String>>(12)?
+            .map(|value| match value.as_str() {
+                "local" => Ok(AhpTargetKind::Local),
+                "ssh" => Ok(AhpTargetKind::Ssh),
+                _ => Err(SqliteError::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown target kind {value}"),
+                    )),
+                )),
+            })
+            .transpose()?,
+        target_path: row.get(13)?,
+        editor_client_tools_available: row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
+        host_state: row
+            .get::<_, Option<String>>(15)?
+            .map(|value| {
+                parse_host_state(&value).map_err(|error| {
+                    SqliteError::FromSqlConversionFailure(
+                        15,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })
+            })
+            .transpose()?,
+        host_last_seen_at: row.get(16)?,
     })
 }
 
@@ -2531,8 +3598,11 @@ fn session_by_uri(
     connection
         .query_row(
             "SELECT endpoint_id, host_instance_id, session_uri, provider, title,
-                    status, workspace_uris_json, created_at, modified_at, short_code
-             FROM ahp_session_catalog WHERE session_uri = ?1 AND available = 1",
+                    status, workspace_uris_json, created_at, modified_at, short_code,
+                    host_label, ssh_alias, target_kind, target_path,
+                    editor_client_tools_available, NULL, NULL
+             FROM ahp_session_catalog
+             WHERE session_uri = ?1 AND (available = 1 OR target_kind IS NOT NULL)",
             [session_uri],
             map_session_descriptor,
         )
@@ -2713,10 +3783,13 @@ fn make_binding_capacity(connection: &Connection, max_bindings: usize, now: i64)
         let mut statement = connection.prepare(
             "SELECT b.binding_id, b.generation, b.endpoint_id, b.host_instance_id,
                     b.session_uri, b.chat_uri, b.state, b.last_server_sequence,
-                    b.active_turn_id, b.queued_message_count, b.last_activity_at, 0
+                    b.active_turn_id, b.queued_message_count, b.last_activity_at, 0,
+                    s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                    s.editor_client_tools_available
              FROM ahp_bindings b
              LEFT JOIN ahp_foreground_binding f
                 ON f.singleton = 1 AND f.binding_id = b.binding_id
+             LEFT JOIN ahp_session_catalog s ON s.session_uri = b.session_uri
              WHERE f.binding_id IS NULL
                AND b.state IN ('bound', 'lost', 'failed')
                AND b.active_turn_id IS NULL
@@ -2859,8 +3932,9 @@ fn upsert_catalog_session(
     connection.execute(
         "INSERT INTO ahp_session_catalog(
             session_uri, short_code, endpoint_id, host_instance_id, provider, title,
-            status, workspace_uris_json, created_at, modified_at, available, last_seen_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11)
+            status, workspace_uris_json, created_at, modified_at, host_label, ssh_alias,
+            target_kind, target_path, editor_client_tools_available, available, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1, ?16)
          ON CONFLICT(session_uri) DO UPDATE SET
             endpoint_id = excluded.endpoint_id,
             host_instance_id = excluded.host_instance_id,
@@ -2870,6 +3944,11 @@ fn upsert_catalog_session(
             workspace_uris_json = excluded.workspace_uris_json,
             created_at = excluded.created_at,
             modified_at = excluded.modified_at,
+            host_label = excluded.host_label,
+            ssh_alias = excluded.ssh_alias,
+            target_kind = excluded.target_kind,
+            target_path = excluded.target_path,
+            editor_client_tools_available = excluded.editor_client_tools_available,
             available = 1,
             last_seen_at = excluded.last_seen_at",
         params![
@@ -2883,6 +3962,18 @@ fn upsert_catalog_session(
             serde_json::to_string(&session.workspace_uris)?,
             session.created_at,
             session.modified_at,
+            session.host_label.as_deref(),
+            session.ssh_alias.as_deref(),
+            session.target_kind.map(|kind| match kind {
+                AhpTargetKind::Local => "local",
+                AhpTargetKind::Ssh => "ssh",
+            }),
+            session.target_path.as_deref(),
+            if session.editor_client_tools_available.unwrap_or(true) {
+                1_i64
+            } else {
+                0_i64
+            },
             now
         ],
     )?;
@@ -2934,6 +4025,41 @@ fn allocate_session_switch_token(connection: &Connection) -> Result<String> {
     bail!("failed to allocate a unique Session switch token")
 }
 
+fn allocate_creation_button_token(connection: &Connection, action_kind: &str) -> Result<String> {
+    let prefix = match action_kind {
+        "target" => "newt".to_owned(),
+        "model" => "newm".to_owned(),
+        "approval" => "newa".to_owned(),
+        other => {
+            let shortened: String = other
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(4)
+                .collect();
+            if shortened.is_empty() {
+                "newx".to_owned()
+            } else {
+                format!("n{shortened}")
+            }
+        }
+    };
+    for _ in 0..32 {
+        let token = format!("{prefix}_{}", random_code(None, 20));
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM ahp_creation_buttons WHERE button_data = ?1",
+                [&token],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(token);
+        }
+    }
+    bail!("failed to allocate a unique creation wizard token")
+}
+
 fn parse_host_state(value: &str) -> Result<crate::protocol::AhpHostState> {
     use crate::protocol::AhpHostState;
     match value {
@@ -2948,6 +4074,7 @@ fn parse_host_state(value: &str) -> Result<crate::protocol::AhpHostState> {
 fn fail_bindings_for_host_changes(
     connection: &Connection,
     hosts: &[AhpHostDescriptor],
+    full_snapshot: bool,
     now: i64,
 ) -> Result<()> {
     let bindings = bindings_from_connection(connection)?;
@@ -2956,6 +4083,9 @@ fn fail_bindings_for_host_changes(
             .iter()
             .find(|host| host.endpoint_id == binding.endpoint_id)
             .map(|host| host.host_instance_id.as_str());
+        if next_host_instance.is_none() && !full_snapshot {
+            continue;
+        }
         if binding.host_instance_id.as_deref() == next_host_instance {
             continue;
         }
@@ -3020,6 +4150,13 @@ mod tests {
             advertised_protocol: "1.0.0".to_owned(),
             selected_protocol: Some("1.0.0".to_owned()),
             state: AhpHostState::Connected,
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(r"C:\test".to_owned()),
+            endpoint_type: Some("socket".to_owned()),
+            editor_client_tools_available: Some(true),
+            last_seen_at: Some(now()),
         }
     }
 
@@ -3035,7 +4172,73 @@ mod tests {
             workspace_uris: vec!["file:///c%3A/test".to_owned()],
             created_at: "2026-08-27T00:00:00Z".to_owned(),
             modified_at: "2026-08-27T00:00:00Z".to_owned(),
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(r"C:\test".to_owned()),
+            editor_client_tools_available: Some(true),
+            host_state: None,
+            host_last_seen_at: None,
         }
+    }
+
+    #[test]
+    fn migration_expands_existing_command_kind_constraint() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE ahp_commands (
+                    command_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command_key TEXT NOT NULL UNIQUE,
+                    binding_generation INTEGER NOT NULL,
+                    kind TEXT NOT NULL CHECK (
+                        kind IN (
+                            'bind_session', 'unbind_session', 'send_message', 'cancel_turn',
+                            'approve_tool', 'review_tool_result', 'complete_input'
+                        )
+                    ),
+                    data_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('pending', 'leased', 'acked', 'rejected', 'failed')
+                    ),
+                    lease_owner TEXT,
+                    lease_expires_at INTEGER,
+                    error_code TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO ahp_commands(
+                    command_key, binding_generation, kind, data_json, state, created_at, updated_at
+                ) VALUES ('legacy-bind', 1, 'bind_session', '{}', 'acked', 1, 1);
+                "#,
+            )
+            .expect("legacy schema");
+
+        initialize_schema(&connection).expect("migrate schema");
+
+        connection
+            .execute(
+                "INSERT INTO ahp_commands(
+                    command_key, binding_id, binding_generation, kind, data_json, state,
+                    created_at, updated_at
+                 ) VALUES ('prepare', '__unbound__', 0, 'prepare_target', '{}', 'pending', 2, 2)",
+                [],
+            )
+            .expect("new command kind");
+        let legacy_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ahp_commands WHERE command_key = 'legacy-bind'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy command");
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign keys");
+        assert_eq!(legacy_count, 1);
+        assert_eq!(foreign_keys, 1);
     }
 
     #[test]
@@ -3067,6 +4270,7 @@ mod tests {
                 "adapter-run-1",
                 commands[0].command_id,
                 AhpCommandOutcome::Applied,
+                None,
                 None,
             )
             .expect("ack");
@@ -3100,6 +4304,47 @@ mod tests {
         let binding = database.ahp_binding().expect("binding").expect("bound");
         assert_eq!(binding.state, "lost");
         assert_eq!(database.ahp_status(60).expect("status").pending_commands, 0);
+    }
+
+    #[test]
+    fn partial_catalogue_does_not_fail_bindings_on_other_hosts() {
+        let (_directory, database) = database();
+        database
+            .ahp_register_adapter(&registration("adapter-run-1"))
+            .expect("register");
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &[session("host-1")],
+            )
+            .expect("first catalogue");
+        let binding = database
+            .ahp_bind_session("endpoint-1", "copilot:/session-1")
+            .expect("bind");
+
+        let mut other_host = host("host-2");
+        other_host.endpoint_id = "endpoint-2".to_owned();
+        let mut other_session = session("host-2");
+        other_session.endpoint_id = "endpoint-2".to_owned();
+        other_session.session_uri = "copilot:/session-2".to_owned();
+        database
+            .ahp_replace_catalog_scoped(
+                "adapter-stable",
+                "adapter-run-1",
+                &[other_host],
+                &[other_session],
+                false,
+            )
+            .expect("partial catalogue");
+
+        let unchanged = database
+            .ahp_binding_for_session(&binding.session_uri)
+            .expect("binding query")
+            .expect("binding");
+        assert_eq!(unchanged.state, "binding");
+        assert_eq!(database.ahp_status(60).expect("status").pending_commands, 1);
     }
 
     #[test]
@@ -3215,6 +4460,49 @@ mod tests {
     }
 
     #[test]
+    fn rejected_approval_submission_returns_to_pending_for_retry() {
+        let (_directory, database, binding) = bound_database();
+        let approval = database
+            .ahp_begin_approval(&NewAhpApproval {
+                approval_key: "approval-retry".to_owned(),
+                stage: "parameter".to_owned(),
+                session_uri: binding.session_uri,
+                chat_uri: binding.chat_uri.expect("chat URI"),
+                turn_id: "turn-retry".to_owned(),
+                tool_call_id: "tool-retry".to_owned(),
+                tool_name: "terminal".to_owned(),
+                summary: "run tests".to_owned(),
+                expires_at: now() + 600,
+            })
+            .expect("begin approval");
+        let first = database
+            .ahp_submit_approval(&approval.record.short_code, true, "qq-message-1")
+            .expect("submit approval")
+            .expect("approval exists");
+        assert!(first.accepted);
+        let commands = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("approval command");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                commands[0].command_id,
+                AhpCommandOutcome::Rejected,
+                Some("stale-request"),
+                None,
+            )
+            .expect("reject command");
+
+        let retried = database
+            .ahp_submit_approval(&approval.record.short_code, false, "qq-message-2")
+            .expect("retry approval")
+            .expect("approval exists");
+        assert!(retried.accepted);
+        assert_eq!(retried.record.state, "submitted");
+    }
+
+    #[test]
     fn pending_input_validates_choices_and_enqueues_answer() {
         let (_directory, database, binding) = bound_database();
         let input = database
@@ -3292,6 +4580,7 @@ mod tests {
                 commands[0].command_id,
                 AhpCommandOutcome::Rejected,
                 Some("invalid-command"),
+                None,
             )
             .expect("reject command");
 
@@ -3318,16 +4607,11 @@ mod tests {
             .expect("original session");
         let original_code = original.short_code.expect("short code");
         let second = AhpSessionDescriptor {
-            short_code: None,
-            endpoint_id: "endpoint-1".to_owned(),
-            host_instance_id: "host-1".to_owned(),
             session_uri: "copilot:/session-2".to_owned(),
-            provider: "copilot".to_owned(),
             title: "Second session".to_owned(),
-            status: 1,
-            workspace_uris: vec!["file:///c%3A/test".to_owned()],
             created_at: "2026-08-27T00:01:00Z".to_owned(),
             modified_at: "2026-08-27T00:01:00Z".to_owned(),
+            ..session("host-1")
         };
         database
             .ahp_replace_catalog(
@@ -3433,16 +4717,13 @@ mod tests {
     fn switch_allows_busy_target_and_keeps_previous_binding() {
         let (_directory, database, original_binding) = bound_database();
         let busy = AhpSessionDescriptor {
-            short_code: None,
-            endpoint_id: "endpoint-1".to_owned(),
-            host_instance_id: "host-1".to_owned(),
             session_uri: "copilot:/busy-session".to_owned(),
-            provider: "copilot".to_owned(),
             title: "Busy session".to_owned(),
             status: 1 << 3,
             workspace_uris: vec!["file:///c%3A/other".to_owned()],
             created_at: "2026-08-27T00:01:00Z".to_owned(),
             modified_at: "2026-08-27T00:01:00Z".to_owned(),
+            ..session("host-1")
         };
         database
             .ahp_replace_catalog(
@@ -3474,16 +4755,12 @@ mod tests {
     fn switch_button_cannot_bind_outside_allowed_session_set() {
         let (_directory, database, original_binding) = bound_database();
         let outside = AhpSessionDescriptor {
-            short_code: None,
-            endpoint_id: "endpoint-1".to_owned(),
-            host_instance_id: "host-1".to_owned(),
             session_uri: "copilot:/outside-session".to_owned(),
-            provider: "copilot".to_owned(),
             title: "Outside session".to_owned(),
-            status: 1,
             workspace_uris: vec!["file:///c%3A/outside".to_owned()],
             created_at: "2026-08-27T00:01:00Z".to_owned(),
             modified_at: "2026-08-27T00:01:00Z".to_owned(),
+            ..session("host-1")
         };
         database
             .ahp_replace_catalog(
@@ -3566,11 +4843,26 @@ mod tests {
         database
             .ahp_replace_catalog("adapter-stable", "adapter-run-1", &[], &[])
             .expect("empty catalogue");
-        assert!(
+        assert!(matches!(
+            database
+                .ahp_status(60)
+                .expect("status")
+                .hosts
+                .first()
+                .expect("cached host")
+                .state,
+            AhpHostState::Unreachable
+        ));
+        assert_eq!(
             database
                 .ahp_list_sessions()
-                .expect("empty sessions")
-                .is_empty()
+                .expect("cached sessions")
+                .into_iter()
+                .next()
+                .expect("cached session")
+                .short_code
+                .expect("cached code"),
+            original
         );
         database
             .ahp_replace_catalog(
@@ -3786,6 +5078,7 @@ mod tests {
                 first.command_id,
                 AhpCommandOutcome::Failed,
                 Some("temporary_failure"),
+                None,
             )
             .expect("fail unbind");
 
@@ -3807,6 +5100,7 @@ mod tests {
                 "adapter-run-1",
                 retried.command_id,
                 AhpCommandOutcome::Applied,
+                None,
                 None,
             )
             .expect("complete retry");
@@ -3875,6 +5169,13 @@ mod tests {
             workspace_uris: vec![format!("file:///c%3A/session-{number}")],
             created_at: format!("2026-08-27T00:{number:02}:00Z"),
             modified_at: format!("2026-08-27T00:{number:02}:00Z"),
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(format!(r"C:\session-{number}")),
+            editor_client_tools_available: Some(true),
+            host_state: None,
+            host_last_seen_at: None,
         }
     }
 
@@ -3900,6 +5201,7 @@ mod tests {
                 command.command_id,
                 AhpCommandOutcome::Applied,
                 None,
+                None,
             )
             .expect("ack bind");
         database
@@ -3915,6 +5217,78 @@ mod tests {
                 1,
             )
             .expect("binding ready");
+    }
+
+    #[test]
+    fn creation_wizard_buttons_and_trust_requests_round_trip() {
+        let (_directory, database) = database();
+        let now = now();
+        let wizard = AhpCreationWizardRecord {
+            wizard_id: "wizard-1".to_owned(),
+            mode: "advanced".to_owned(),
+            state: "select_target".to_owned(),
+            context: Some(json!({"step": "target"})),
+            pending_task: None,
+            create_command_id: None,
+            new_session_uri: None,
+            old_binding_endpoint_id: None,
+            old_binding_session_uri: None,
+            old_binding_host_instance_id: None,
+            cancel_requested: false,
+            expires_at: now + 600,
+            created_at: now,
+            updated_at: now,
+        };
+        database
+            .ahp_save_creation_wizard(&wizard)
+            .expect("save wizard");
+        let buttons = database
+            .ahp_create_wizard_buttons(
+                "wizard-1",
+                "target",
+                &[
+                    json!({"kind": "local", "path": r"C:\test"}),
+                    json!({"kind": "local", "path": r"C:\other"}),
+                ],
+                600,
+            )
+            .expect("create wizard buttons");
+        assert_eq!(buttons.len(), 2);
+        let consumed = database
+            .ahp_consume_wizard_button(&buttons[0].button_data)
+            .expect("consume button")
+            .expect("button exists");
+        assert_eq!(consumed.wizard_id, "wizard-1");
+        assert_eq!(consumed.action_kind, "target");
+        assert!(
+            database
+                .ahp_consume_wizard_button(&buttons[1].button_data)
+                .expect("sibling replay")
+                .is_none()
+        );
+
+        let request = database
+            .ahp_begin_trust_request("trust-1", "file:///C:/test", true, 600)
+            .expect("begin trust request");
+        assert!(!request.trusted);
+        let listed = database
+            .ahp_pending_trust_requests()
+            .expect("list trust requests");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_id, "trust-1");
+        assert_eq!(
+            database
+                .ahp_report_workspace_trust(&["file:///C:/test".to_owned()], true)
+                .expect("report trust"),
+            1
+        );
+        assert!(
+            database
+                .ahp_trust_request("trust-1")
+                .expect("lookup")
+                .expect("request")
+                .trusted
+        );
     }
 
     fn bound_database() -> (tempfile::TempDir, Database, AhpBindingRecord) {
@@ -3942,6 +5316,7 @@ mod tests {
                 "adapter-run-1",
                 bind_commands[0].command_id,
                 AhpCommandOutcome::Applied,
+                None,
                 None,
             )
             .expect("ack bind");

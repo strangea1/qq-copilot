@@ -21,15 +21,17 @@ use crate::{
         AhpApprovalRecord, AhpInputRecord, AhpStatus, MAX_TRACKED_AHP_SESSIONS, NewAhpApproval,
         NewAhpInput,
     },
-    config::{AhpToolNotificationMode, AppConfig},
+    config::{AhpAuthorizedTarget, AhpToolNotificationMode, AppConfig},
     db::{
         ApprovalRecord, BeginDelivery, BindOutcome, Database, NewApproval, NewDelivery,
         NewQuestion, QuestionRecord,
     },
     protocol::{
-        AhpAdapterRegistration, AhpCommandPollResult, AhpEventKind, AhpHostDescriptor,
-        AhpPublishedEvent, AhpSessionDescriptor, ApprovalState, BridgeRequest, PermissionDecision,
-        PermissionResult, RiskLevel, StopDecision,
+        AhpAdapterRegistration, AhpCommandPollResult, AhpCreateSessionCommand,
+        AhpCreateSessionResult, AhpDisposeSessionCommand, AhpEventKind, AhpHostDescriptor,
+        AhpManagedTarget, AhpPrepareTargetCommand, AhpPrepareTargetResult, AhpPublishedEvent,
+        AhpSessionDescriptor, AhpSupportedSessionField, AhpTargetKind, ApprovalState,
+        BridgeRequest, PermissionDecision, PermissionResult, RiskLevel, StopDecision,
     },
     qq::{ApprovalButtons, ChoiceButton, ChoiceButtons, QqMessenger, SendReceipt},
     security::{
@@ -53,7 +55,7 @@ pub struct BridgeService {
     config_path: PathBuf,
     database: Database,
     qq: Arc<dyn QqMessenger>,
-    tool_notification_mode: RwLock<AhpToolNotificationMode>,
+    tool_notification_mode: Arc<RwLock<AhpToolNotificationMode>>,
     final_delivery_lock: Mutex<()>,
     typing_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
 }
@@ -135,6 +137,12 @@ struct AhpTurnEventData {
     summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CreationWizardContext {
+    target: AhpManagedTarget,
+    prepare: AhpPrepareTargetResult,
+}
+
 impl BridgeService {
     pub fn new(
         config: Arc<AppConfig>,
@@ -148,7 +156,7 @@ impl BridgeService {
             config_path,
             database,
             qq,
-            tool_notification_mode: RwLock::new(tool_notification_mode),
+            tool_notification_mode: Arc::new(RwLock::new(tool_notification_mode)),
             final_delivery_lock: Mutex::new(()),
             typing_tasks: Mutex::new(HashMap::new()),
         }
@@ -156,6 +164,18 @@ impl BridgeService {
 
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    fn task_clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            config_path: self.config_path.clone(),
+            database: self.database.clone(),
+            qq: self.qq.clone(),
+            tool_notification_mode: self.tool_notification_mode.clone(),
+            final_delivery_lock: Mutex::new(()),
+            typing_tasks: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn dispatch(&self, request: BridgeRequest) -> Result<Value> {
@@ -298,16 +318,20 @@ impl BridgeService {
                 adapter_instance_id,
                 hosts,
                 sessions,
+                full_snapshot,
             } => {
                 self.require_ahp_enabled()?;
                 validate_ahp_catalog(&hosts, &sessions)?;
-                self.database.ahp_replace_catalog(
+                self.database.ahp_replace_catalog_scoped(
                     &adapter_id,
                     &adapter_instance_id,
                     &hosts,
                     &sessions,
+                    full_snapshot,
                 )?;
-                self.reconcile_recent_ahp_sessions(&sessions)?;
+                if full_snapshot {
+                    self.reconcile_recent_ahp_sessions(&sessions)?;
+                }
                 Ok(json!({"accepted": true}))
             }
             BridgeRequest::AhpBindingReady {
@@ -425,12 +449,32 @@ impl BridgeService {
                     sleep(POLL_INTERVAL).await;
                 }
             }
+            BridgeRequest::AhpCommandProgress {
+                adapter_id,
+                adapter_instance_id,
+                command_id,
+                progress,
+                total,
+                message,
+            } => {
+                self.require_ahp_enabled()?;
+                self.database.ahp_record_command_progress(
+                    &adapter_id,
+                    &adapter_instance_id,
+                    command_id,
+                    progress,
+                    total,
+                    message.as_deref(),
+                )?;
+                Ok(json!({"accepted": true}))
+            }
             BridgeRequest::AhpAckCommand {
                 adapter_id,
                 adapter_instance_id,
                 command_id,
                 outcome,
                 error_code,
+                result,
             } => {
                 self.require_ahp_enabled()?;
                 if let Some(error_code) = error_code.as_deref() {
@@ -442,6 +486,7 @@ impl BridgeService {
                     command_id,
                     outcome,
                     error_code.as_deref(),
+                    result.as_ref(),
                 )?;
                 Ok(json!({"accepted": true}))
             }
@@ -618,13 +663,21 @@ impl BridgeService {
         };
         let is_choice = button_id.starts_with("choice_");
         let is_session_switch = button_id.starts_with("session_");
+        let is_target = button_id.starts_with("target_");
+        let is_model = button_id.starts_with("model_");
+        let is_approval_mode = button_id.starts_with("approval_");
         let structurally_valid = self.config.qq.approval_buttons_enabled
             && application_id == self.config.qq.app_id
             && scene == "c2c"
             && chat_type == 2
             && interaction_type == 11
             && data_type == 11
-            && (expected_approved.is_some() || is_choice || is_session_switch)
+            && (expected_approved.is_some()
+                || is_choice
+                || is_session_switch
+                || is_target
+                || is_model
+                || is_approval_mode)
             && !button_data.is_empty()
             && button_data.len() <= 200;
         if !structurally_valid {
@@ -683,6 +736,39 @@ impl BridgeService {
                     (1, None)
                 }
             }
+        } else if is_target || is_model || is_approval_mode {
+            match self.database.ahp_consume_wizard_button(button_data) {
+                Ok(Some(button)) => {
+                    let action = button.action_kind.clone();
+                    let service = self.task_clone();
+                    let wizard_id = button.wizard_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = service.process_ahp_creation_button(button).await {
+                            tracing::error!(action, error = %error, "AHP creation button processing failed");
+                            service
+                                .handle_ahp_creation_button_failure(&wizard_id, &error)
+                                .await;
+                        }
+                    });
+                    (
+                        0,
+                        Some(if is_target {
+                            "目标选择已提交，正在准备。".to_owned()
+                        } else {
+                            "配置选择已提交。".to_owned()
+                        }),
+                    )
+                }
+                Ok(None) => (3, None),
+                Err(error) => {
+                    tracing::warn!(
+                        interaction_id,
+                        error = %error,
+                        "QQ creation button was rejected"
+                    );
+                    (1, None)
+                }
+            }
         } else if is_choice {
             match self
                 .database
@@ -719,7 +805,7 @@ impl BridgeService {
             {
                 Ok(Some(submission)) if submission.accepted => {
                     if let Some(workspace) =
-                        ahp_session_target_workspace(&self.config, &submission.session)
+                        ahp_session_target_display(&self.config, &submission.session)
                     {
                         (
                             0,
@@ -731,7 +817,7 @@ impl BridgeService {
                                     .as_deref()
                                     .unwrap_or("[unknown]"),
                                 submission.session.title,
-                                workspace.display(),
+                                workspace,
                                 submission.binding.state
                             )),
                         )
@@ -741,12 +827,45 @@ impl BridgeService {
                 }
                 Ok(Some(_)) | Ok(None) => (3, None),
                 Err(error) => {
-                    tracing::warn!(
-                        interaction_id,
-                        error = %error,
-                        "QQ Session switch button was rejected"
-                    );
-                    (1, None)
+                    match self
+                        .database
+                        .ahp_consume_session_switch_button(button_data, &allowed_session_uris)
+                    {
+                        Ok(Some(session)) => {
+                            let service = self.task_clone();
+                            let interaction_id = interaction_id.to_owned();
+                            tokio::spawn(async move {
+                                let result = service.switch_ahp_session(session).await;
+                                let (key, message) = match result {
+                                    Ok(message) => {
+                                        (format!("switch-button:{interaction_id}"), message)
+                                    }
+                                    Err(error) => (
+                                        format!("switch-button:{interaction_id}:error"),
+                                        format!("Session 切换失败：{error}"),
+                                    ),
+                                };
+                                let _ = service
+                                    .send_if_owner(
+                                        "ahp_button_confirmation",
+                                        None,
+                                        &key,
+                                        &message,
+                                        None,
+                                    )
+                                    .await;
+                            });
+                            (0, Some("离线目标正在连接，切换请求已提交。".to_owned()))
+                        }
+                        Ok(None) | Err(_) => {
+                            tracing::warn!(
+                                interaction_id,
+                                error = %error,
+                                "QQ Session switch button was rejected"
+                            );
+                            (1, None)
+                        }
+                    }
                 }
             }
         };
@@ -1199,6 +1318,29 @@ impl BridgeService {
                 }))
             }
             "/cancel" if argument.is_empty() && remainder.is_empty() => {
+                let binding = self.database.ahp_binding()?;
+                if binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.active_turn_id.is_none())
+                    && let Some(wizard) = self.database.ahp_creation_wizard()?
+                {
+                    if wizard.state == "creating" {
+                        let mut cancelled = wizard.clone();
+                        cancelled.cancel_requested = true;
+                        cancelled.updated_at = Utc::now().timestamp();
+                        self.database.ahp_save_creation_wizard(&cancelled)?;
+                        self.database
+                            .mark_inbound_kind(message_id, "ahp_new_cancel")?;
+                        return Ok(Some(
+                            "已请求取消当前 Session 创建；若已晚于创建完成，将自动回收空会话。"
+                                .to_owned(),
+                        ));
+                    }
+                    self.database.ahp_clear_creation_wizard()?;
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_new_cancel")?;
+                    return Ok(Some("已取消当前 /new 向导。".to_owned()));
+                }
                 match self.database.ahp_enqueue_cancel(message_id) {
                     Ok(_) => {
                         self.database.mark_inbound_kind(message_id, "ahp_cancel")?;
@@ -1325,11 +1467,24 @@ impl BridgeService {
             "/sessions" if argument.is_empty() && remainder.is_empty() => {
                 self.database
                     .mark_inbound_kind(message_id, "ahp_sessions")?;
+                let status = self
+                    .database
+                    .ahp_status(self.config.ahp.adapter_stale_seconds)?;
                 Ok(Some(format_ahp_sessions(
                     &self.config,
-                    &self.database.ahp_bindings()?,
-                    &self.database.ahp_list_sessions()?,
+                    &status.bindings,
+                    &status.hosts,
+                    &status.sessions,
                 )))
+            }
+            "/new" if argument.is_empty() && remainder.is_empty() => {
+                self.database.mark_inbound_kind(message_id, "ahp_new")?;
+                self.start_ahp_creation_wizard(message_id, false).await
+            }
+            "/new" if argument.eq_ignore_ascii_case("advanced") && remainder.is_empty() => {
+                self.database
+                    .mark_inbound_kind(message_id, "ahp_new_advanced")?;
+                self.start_ahp_creation_wizard(message_id, true).await
             }
             "/switch" if argument.is_empty() && remainder.is_empty() => {
                 self.database
@@ -1351,21 +1506,10 @@ impl BridgeService {
                         .mark_inbound_kind(message_id, "ahp_switch_forbidden")?;
                     return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
                 }
-                match self
-                    .database
-                    .ahp_bind_session(&session.endpoint_id, &session.session_uri)
-                {
+                match self.switch_ahp_session(session).await {
                     Ok(binding) => {
                         self.database.mark_inbound_kind(message_id, "ahp_switch")?;
-                        Ok(Some(format!(
-                            "前台已切换到 {}：{}\n目录: {}\nBinding: {}",
-                            session.short_code.as_deref().unwrap_or("[unknown]"),
-                            session.title,
-                            ahp_session_target_workspace(&self.config, &session)
-                                .expect("filtered target workspace")
-                                .display(),
-                            binding.state
-                        )))
+                        Ok(Some(binding))
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, "AHP Session switch rejected");
@@ -1487,6 +1631,16 @@ impl BridgeService {
                 ))
             }
             _ => {
+                if let Some(wizard) = self.database.ahp_creation_wizard()? {
+                    if wizard.state == "await_task" {
+                        return self.start_ahp_session_creation(message_id, command).await;
+                    }
+                    self.database
+                        .mark_inbound_kind(message_id, "ahp_new_waiting_button")?;
+                    return Ok(Some(
+                        "当前 /new 向导仍需按钮选择；发送 /cancel 取消。".to_owned(),
+                    ));
+                }
                 if let Some(input) = self.database.ahp_pending_input()? {
                     let accepted =
                         self.database
@@ -1537,6 +1691,20 @@ impl BridgeService {
                 .mark_inbound_kind(message_id, "ahp_voice_rejected")?;
             return Ok(Some(
                 "语音识别结果过长或包含疑似 Secret，已拒绝。".to_owned(),
+            ));
+        }
+        if let Some(wizard) = self.database.ahp_creation_wizard()? {
+            if wizard.state == "await_task" {
+                self.database
+                    .mark_inbound_kind(message_id, "ahp_new_voice_task")?;
+                return self
+                    .start_ahp_session_creation(message_id, transcript)
+                    .await;
+            }
+            self.database
+                .mark_inbound_kind(message_id, "ahp_new_waiting_button")?;
+            return Ok(Some(
+                "当前 /new 向导仍需按钮选择；发送 /cancel 取消。".to_owned(),
             ));
         }
         if let Some(input) = self.database.ahp_pending_input()? {
@@ -1612,6 +1780,1336 @@ impl BridgeService {
         }
         *current = mode;
         Ok(changed)
+    }
+
+    fn ahp_creation_block_reason(&self) -> Result<Option<String>> {
+        let bindings = self.database.ahp_bindings()?;
+        if bindings
+            .iter()
+            .any(|binding| binding.active_turn_id.is_some())
+        {
+            return Ok(Some("仍有受监控 Session 存在活动 Turn。".to_owned()));
+        }
+        if bindings
+            .iter()
+            .any(|binding| binding.queued_message_count != 0)
+        {
+            return Ok(Some("仍有受监控 Session 存在排队消息。".to_owned()));
+        }
+        if self.database.ahp_has_pending_interactions()? {
+            return Ok(Some("当前仍有待处理的审批或输入请求。".to_owned()));
+        }
+        if self.database.ahp_has_pending_commands()? {
+            return Ok(Some("AHP Adapter 仍有待完成命令。".to_owned()));
+        }
+        Ok(None)
+    }
+
+    fn current_creation_context(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::ahp_store::AhpCreationWizardRecord,
+            CreationWizardContext,
+        )>,
+    > {
+        let Some(wizard) = self.database.ahp_creation_wizard()? else {
+            return Ok(None);
+        };
+        let Some(context) = wizard.context.clone() else {
+            return Ok(None);
+        };
+        let context: CreationWizardContext =
+            serde_json::from_value(context).context("stored creation wizard context is invalid")?;
+        Ok(Some((wizard, context)))
+    }
+
+    async fn start_ahp_creation_wizard(
+        &self,
+        message_id: &str,
+        advanced: bool,
+    ) -> Result<Option<String>> {
+        if !self.config.qq.approval_buttons_enabled {
+            return Ok(Some(
+                "/new 依赖 QQ 回调按钮，请先启用 qq.approval_buttons_enabled。".to_owned(),
+            ));
+        }
+        if self.database.ahp_creation_wizard()?.is_some() {
+            return Ok(Some(
+                "当前已有一个 /new 向导或创建任务在进行中；发送 /cancel 可取消。".to_owned(),
+            ));
+        }
+        if let Some(reason) = self.ahp_creation_block_reason()? {
+            return Ok(Some(format!("当前不能创建新 Session：{reason}")));
+        }
+        let targets = self.config.ahp.effective_authorized_targets();
+        if targets.is_empty() {
+            return Ok(Some(
+                "尚未注册任何可用目标目录，请先在电脑上注册目标。".to_owned(),
+            ));
+        }
+        if targets.len() > 100 {
+            return Ok(Some(
+                "已授权目标超过 100 个，QQ 最多安全展示 4 页按钮；请先在电脑上移除不用的目标。"
+                    .to_owned(),
+            ));
+        }
+        let now = Utc::now().timestamp();
+        let wizard = crate::ahp_store::AhpCreationWizardRecord {
+            wizard_id: Uuid::new_v4().to_string(),
+            mode: if advanced {
+                "advanced".to_owned()
+            } else {
+                "quick".to_owned()
+            },
+            state: "select_target".to_owned(),
+            context: None,
+            pending_task: None,
+            create_command_id: None,
+            new_session_uri: None,
+            old_binding_endpoint_id: None,
+            old_binding_session_uri: None,
+            old_binding_host_instance_id: None,
+            cancel_requested: false,
+            expires_at: now + i64::try_from(self.config.bridge.question_ttl_seconds)?,
+            created_at: now,
+            updated_at: now,
+        };
+        self.database.ahp_save_creation_wizard(&wizard)?;
+        self.send_ahp_creation_target_menu(message_id, &wizard)
+            .await
+    }
+
+    async fn send_ahp_creation_target_menu(
+        &self,
+        message_id: &str,
+        wizard: &crate::ahp_store::AhpCreationWizardRecord,
+    ) -> Result<Option<String>> {
+        let status = self
+            .database
+            .ahp_status(self.config.ahp.adapter_stale_seconds)?;
+        let targets = self.config.ahp.effective_authorized_targets();
+        let payloads = targets
+            .iter()
+            .map(authorized_target_to_managed_target)
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to serialize AHP target choices")?;
+        let buttons = self.database.ahp_create_wizard_buttons(
+            &wizard.wizard_id,
+            "target",
+            &payloads,
+            self.config.bridge.question_ttl_seconds,
+        )?;
+        let owner = self.database.owner()?.context("no QQ owner is bound")?;
+        if !owner.enabled {
+            bail!("QQ remote control is disabled by the local emergency switch");
+        }
+        let page_count = buttons.len().div_ceil(25);
+        for (page_index, page) in buttons.chunks(25).enumerate() {
+            let lines = page
+                .iter()
+                .enumerate()
+                .map(|(offset, _button)| {
+                    let index = page_index * 25 + offset + 1;
+                    let target = targets
+                        .get(index - 1)
+                        .context("target list changed while building QQ menu")?;
+                    let state =
+                        describe_authorized_target_status(target, &status.hosts, &status.sessions);
+                    Ok(format!(
+                        "{}. {} · {} · {}",
+                        index,
+                        escape_qq_markdown(&target.display_label()),
+                        escape_qq_markdown(&target.display_workspace()),
+                        state
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("\n");
+            let choices = page
+                .iter()
+                .enumerate()
+                .map(|(offset, button)| ChoiceButton {
+                    label: format!("T{:02}", page_index * 25 + offset + 1),
+                    button_data: button.button_data.clone(),
+                })
+                .collect();
+            let delivery = self.database.begin_delivery(NewDelivery {
+                delivery_id: Uuid::new_v4(),
+                idempotency_key: format!("ahp-new-targets:{}:{}", wizard.wizard_id, page_index + 1),
+                kind: "ahp_new_target_buttons".to_owned(),
+                session_id: None,
+            })?;
+            if !delivery.created {
+                self.wait_for_existing_delivery(delivery).await?;
+                continue;
+            }
+            match self
+                .qq
+                .send_choice_buttons(
+                    &owner.user_openid,
+                    &ChoiceButtons {
+                        markdown: format!(
+                            "## 新建 Session：选择目标（{}/{page_count}）\n{}\n\n模式：{}；按钮有效期 {} 秒。发送 /cancel 取消。",
+                            page_index + 1,
+                            lines,
+                            if wizard.mode == "advanced" { "advanced" } else { "quick" },
+                            self.config.bridge.question_ttl_seconds
+                        ),
+                        button_id_prefix: "target".to_owned(),
+                        choices,
+                    },
+                    Some(message_id),
+                    u32::try_from(page_index + 1)?,
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    self.database
+                        .record_sent_message(delivery.record.delivery_id, 1)?;
+                    self.database.finish_delivery(
+                        delivery.record.delivery_id,
+                        "sent",
+                        Some(&receipt.message_id),
+                        None,
+                    )?;
+                }
+                Err(error) => {
+                    self.database.finish_delivery(
+                        delivery.record.delivery_id,
+                        "in_doubt",
+                        None,
+                        Some("qq_new_target_delivery_error"),
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn process_ahp_creation_button(
+        &self,
+        button: crate::ahp_store::AhpWizardButtonRecord,
+    ) -> Result<()> {
+        let Some(wizard) = self.database.ahp_creation_wizard()? else {
+            return Ok(());
+        };
+        if wizard.wizard_id != button.wizard_id {
+            return Ok(());
+        }
+        match button.action_kind.as_str() {
+            "target" => {
+                let target: AhpManagedTarget = serde_json::from_value(button.payload)
+                    .context("invalid target selection payload")?;
+                self.prepare_ahp_creation_target(&wizard.wizard_id, target)
+                    .await?;
+            }
+            "model" | "approval" => {
+                self.apply_ahp_creation_field_selection(
+                    &wizard.wizard_id,
+                    &button.action_kind,
+                    &button.payload,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_ahp_creation_button_failure(&self, wizard_id: &str, error: &anyhow::Error) {
+        let should_clear = match self.database.ahp_creation_wizard() {
+            Ok(wizard) => wizard.is_some_and(|wizard| wizard.wizard_id == wizard_id),
+            Err(load_error) => {
+                tracing::error!(
+                    wizard_id,
+                    error = %load_error,
+                    "failed to load creation wizard after button failure"
+                );
+                return;
+            }
+        };
+        if !should_clear {
+            return;
+        }
+        if let Err(clear_error) = self.database.ahp_clear_creation_wizard() {
+            tracing::error!(
+                wizard_id,
+                error = %clear_error,
+                "failed to clear creation wizard after button failure"
+            );
+        }
+        let detail = redact_text(&error.to_string());
+        if let Err(send_error) = self
+            .send_if_owner(
+                "ahp_new_failed",
+                None,
+                &format!("ahp-new-failed:{wizard_id}:button"),
+                &format!("新 Session 创建向导失败，已取消本次操作。\n错误：{detail}"),
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                wizard_id,
+                error = %send_error,
+                "failed to notify owner about creation button failure"
+            );
+        }
+    }
+
+    async fn prepare_ahp_creation_target(
+        &self,
+        wizard_id: &str,
+        target: AhpManagedTarget,
+    ) -> Result<()> {
+        let wizard = self
+            .database
+            .ahp_creation_wizard()?
+            .filter(|wizard| wizard.wizard_id == wizard_id && wizard.state == "select_target")
+            .context("AHP creation wizard is no longer waiting for a target")?;
+        let command = AhpPrepareTargetCommand {
+            target: target.clone(),
+            advanced: wizard.mode == "advanced",
+            retain_connection: false,
+            config: None,
+        };
+        let command_id = self.database.ahp_enqueue_prepare_target(
+            &format!("prepare-target:{wizard_id}"),
+            &serde_json::to_value(&command)?,
+        )?;
+        let status = self
+            .wait_for_ahp_command_terminal(wizard_id, command_id, Duration::from_secs(60), false)
+            .await?;
+        if self.creation_cancel_requested(wizard_id)? {
+            self.database.ahp_clear_creation_wizard()?;
+            return Ok(());
+        }
+        if status.state != "acked" {
+            self.database.ahp_clear_creation_wizard()?;
+            let detail = match status.error_code.as_deref().unwrap_or("unknown") {
+                "requires-new-advanced" => {
+                    "该目标的模型或审批模式没有可直接复用的默认值，请改用 /new advanced。"
+                        .to_owned()
+                }
+                error if error.starts_with("unsupported-required-config-") => {
+                    "该目标仍要求额外的 Host 字段，当前移动端不支持，请回到 PC 创建。".to_owned()
+                }
+                error => format!("目标准备失败：{error}。请稍后重试或在电脑端创建。"),
+            };
+            let _ = self
+                .send_if_owner(
+                    "ahp_new_failed",
+                    None,
+                    &format!("ahp-new-failed:{wizard_id}:prepare"),
+                    &detail,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        let mut prepare: AhpPrepareTargetResult = serde_json::from_value(
+            status
+                .result
+                .clone()
+                .context("AHP target preparation omitted result payload")?,
+        )
+        .context("AHP target preparation result was invalid")?;
+        if prepare.model.is_none() {
+            prepare.model = None;
+        }
+        let mut wizard = self
+            .database
+            .ahp_creation_wizard()?
+            .filter(|wizard| wizard.wizard_id == wizard_id)
+            .context("AHP creation wizard disappeared during target preparation")?;
+        let context = CreationWizardContext { target, prepare };
+        wizard.context = Some(serde_json::to_value(&context)?);
+        wizard.updated_at = Utc::now().timestamp();
+        if wizard.mode == "advanced" {
+            if let Some(model) = context.prepare.model.as_ref() {
+                wizard.state = "select_model".to_owned();
+                self.database.ahp_save_creation_wizard(&wizard)?;
+                self.send_ahp_creation_field_menu(&wizard, "选择模型", "model", model)
+                    .await?;
+                return Ok(());
+            }
+            if let Some(approval) = context.prepare.approval.as_ref() {
+                wizard.state = "select_approval".to_owned();
+                self.database.ahp_save_creation_wizard(&wizard)?;
+                self.send_ahp_creation_field_menu(&wizard, "选择审批模式", "approval", approval)
+                    .await?;
+                return Ok(());
+            }
+        }
+        wizard.state = "await_task".to_owned();
+        self.database.ahp_save_creation_wizard(&wizard)?;
+        self.send_ahp_creation_task_prompt(&wizard, &context)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_ahp_creation_field_menu(
+        &self,
+        wizard: &crate::ahp_store::AhpCreationWizardRecord,
+        title: &str,
+        action_kind: &str,
+        field: &AhpSupportedSessionField,
+    ) -> Result<()> {
+        if field.options.len() > 100 {
+            bail!("too many AHP creation options for QQ keyboard pagination");
+        }
+        let payloads = field
+            .options
+            .iter()
+            .map(|option| json!({"value": option.value.clone(), "label": option.label.clone()}))
+            .collect::<Vec<_>>();
+        let buttons = self.database.ahp_create_wizard_buttons(
+            &wizard.wizard_id,
+            action_kind,
+            &payloads,
+            self.config.bridge.question_ttl_seconds,
+        )?;
+        let owner = self.database.owner()?.context("no QQ owner is bound")?;
+        if !owner.enabled {
+            bail!("QQ remote control is disabled by the local emergency switch");
+        }
+        let page_count = buttons.len().div_ceil(25);
+        for (page_index, page) in buttons.chunks(25).enumerate() {
+            let lines = page
+                .iter()
+                .enumerate()
+                .map(|(offset, button)| {
+                    let index = page_index * 25 + offset + 1;
+                    let payload = button
+                        .payload
+                        .as_object()
+                        .context("invalid wizard button payload")?;
+                    let label = payload
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .context("wizard button payload omitted label")?;
+                    Ok(format!("{}. {}", index, escape_qq_markdown(label)))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("\n");
+            let choices = page
+                .iter()
+                .enumerate()
+                .map(|(offset, button)| ChoiceButton {
+                    label: format!("O{:02}", page_index * 25 + offset + 1),
+                    button_data: button.button_data.clone(),
+                })
+                .collect();
+            let delivery = self.database.begin_delivery(NewDelivery {
+                delivery_id: Uuid::new_v4(),
+                idempotency_key: format!(
+                    "ahp-new-{action_kind}:{}:{}",
+                    wizard.wizard_id,
+                    page_index + 1
+                ),
+                kind: format!("ahp_new_{action_kind}_buttons"),
+                session_id: None,
+            })?;
+            if !delivery.created {
+                self.wait_for_existing_delivery(delivery).await?;
+                continue;
+            }
+            match self
+                .qq
+                .send_choice_buttons(
+                    &owner.user_openid,
+                    &ChoiceButtons {
+                        markdown: format!(
+                            "## {}（{}/{page_count}）\n{}\n\n按钮有效期 {} 秒；发送 /cancel 取消。",
+                            title,
+                            page_index + 1,
+                            lines,
+                            self.config.bridge.question_ttl_seconds
+                        ),
+                        button_id_prefix: action_kind.to_owned(),
+                        choices,
+                    },
+                    None,
+                    u32::try_from(page_index + 1)?,
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    self.database
+                        .record_sent_message(delivery.record.delivery_id, 1)?;
+                    self.database.finish_delivery(
+                        delivery.record.delivery_id,
+                        "sent",
+                        Some(&receipt.message_id),
+                        None,
+                    )?;
+                }
+                Err(error) => {
+                    self.database.finish_delivery(
+                        delivery.record.delivery_id,
+                        "in_doubt",
+                        None,
+                        Some("qq_new_option_delivery_error"),
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_ahp_creation_field_selection(
+        &self,
+        wizard_id: &str,
+        action_kind: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        let Some((wizard, mut context)) = self.current_creation_context()? else {
+            return Ok(());
+        };
+        if wizard.wizard_id != wizard_id {
+            return Ok(());
+        }
+        let selected = payload
+            .get("value")
+            .cloned()
+            .context("wizard selection payload omitted value")?;
+        let selected_property = match action_kind {
+            "model" => {
+                if wizard.state != "select_model" {
+                    return Ok(());
+                }
+                let field = context
+                    .prepare
+                    .model
+                    .as_ref()
+                    .context("model field is no longer available")?;
+                if !field.options.iter().any(|option| option.value == selected) {
+                    return Ok(());
+                }
+                field.property.clone()
+            }
+            "approval" => {
+                if wizard.state != "select_approval" {
+                    return Ok(());
+                }
+                let field = context
+                    .prepare
+                    .approval
+                    .as_ref()
+                    .context("approval field is no longer available")?;
+                if !field.options.iter().any(|option| option.value == selected) {
+                    return Ok(());
+                }
+                field.property.clone()
+            }
+            _ => return Ok(()),
+        };
+        let mut current_config = context
+            .prepare
+            .resolved_values
+            .as_object()
+            .cloned()
+            .context("resolved Session config is not an object")?;
+        if let Some(field) = context.prepare.model.as_ref() {
+            current_config.insert(field.property.clone(), field.selected.clone());
+        }
+        if let Some(field) = context.prepare.approval.as_ref() {
+            current_config.insert(field.property.clone(), field.selected.clone());
+        }
+        current_config.insert(selected_property, selected);
+        let command = AhpPrepareTargetCommand {
+            target: context.target.clone(),
+            advanced: true,
+            retain_connection: false,
+            config: Some(Value::Object(current_config)),
+        };
+        let command_id = self.database.ahp_enqueue_prepare_target(
+            &format!("prepare-target:{wizard_id}:{action_kind}"),
+            &serde_json::to_value(&command)?,
+        )?;
+        let status = self
+            .wait_for_ahp_command_terminal(wizard_id, command_id, Duration::from_secs(60), false)
+            .await?;
+        if status.state != "acked" {
+            bail!(
+                "Host rejected the selected {action_kind} configuration: {}",
+                status.error_code.as_deref().unwrap_or("unknown")
+            );
+        }
+        context.prepare = serde_json::from_value(
+            status
+                .result
+                .context("AHP config refresh omitted result payload")?,
+        )
+        .context("AHP config refresh result was invalid")?;
+        let Some(mut wizard) = self
+            .database
+            .ahp_creation_wizard()?
+            .filter(|wizard| wizard.wizard_id == wizard_id)
+        else {
+            return Ok(());
+        };
+        let next_field = if action_kind == "model" {
+            context.prepare.approval.clone()
+        } else {
+            None
+        };
+        wizard.state = if next_field.is_some() {
+            "select_approval".to_owned()
+        } else {
+            "await_task".to_owned()
+        };
+        wizard.context = Some(serde_json::to_value(&context)?);
+        wizard.updated_at = Utc::now().timestamp();
+        self.database.ahp_save_creation_wizard(&wizard)?;
+        if let Some(field) = next_field {
+            self.send_ahp_creation_field_menu(&wizard, "选择审批模式", "approval", &field)
+                .await?;
+        } else {
+            self.send_ahp_creation_task_prompt(&wizard, &context)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send_ahp_creation_task_prompt(
+        &self,
+        wizard: &crate::ahp_store::AhpCreationWizardRecord,
+        context: &CreationWizardContext,
+    ) -> Result<()> {
+        let model_line = context
+            .prepare
+            .model
+            .as_ref()
+            .map(|field| format!("\n模型：{}", summarize_selected_option(field)))
+            .unwrap_or_default();
+        let approval_line = context
+            .prepare
+            .approval
+            .as_ref()
+            .map(|field| format!("\n审批：{}", summarize_selected_option(field)))
+            .unwrap_or_default();
+        let editor_note = if context.prepare.editor_client_tools_available {
+            String::new()
+        } else {
+            "\n说明：当前目标使用共享 Agent Host，编辑器客户端工具不可用。".to_owned()
+        };
+        self.send_if_owner(
+            "ahp_new_task_prompt",
+            None,
+            &format!("ahp-new-task-prompt:{}", wizard.wizard_id),
+            &format!(
+                "已选择目标。\n主机：{}\n工作区：{}{}{}{}{}\n请直接发送首条任务文本；发送 /cancel 可取消。",
+                context.prepare.host_label,
+                managed_target_workspace_display(&context.target),
+                model_line,
+                approval_line,
+                editor_note,
+                if self.config.qq.voice_input_enabled {
+                    "\n已启用语音输入时，也可直接发送语音作为任务文本。"
+                } else {
+                    ""
+                }
+            ),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn start_ahp_session_creation(
+        &self,
+        message_id: &str,
+        task: &str,
+    ) -> Result<Option<String>> {
+        let Some((mut wizard, context)) = self.current_creation_context()? else {
+            return Ok(Some("当前没有等待任务文本的 /new 向导。".to_owned()));
+        };
+        if wizard.state != "await_task" {
+            return Ok(Some(
+                "当前 /new 向导仍需按钮选择；发送 /cancel 取消。".to_owned(),
+            ));
+        }
+        if task.chars().count() > 4_000 || contains_secret_value(task) {
+            self.database
+                .mark_inbound_kind(message_id, "ahp_new_task_rejected")?;
+            return Ok(Some("任务文本过长或包含疑似 Secret，已拒绝。".to_owned()));
+        }
+        if let Some(reason) = self.ahp_creation_block_reason()? {
+            return Ok(Some(format!("当前不能创建新 Session：{reason}")));
+        }
+        let task = task.trim();
+        if task.is_empty() {
+            return Ok(Some("请发送非空的首条任务文本。".to_owned()));
+        }
+        self.database
+            .mark_inbound_kind(message_id, "ahp_new_task")?;
+        let old_binding = self.database.ahp_binding()?;
+        let command = AhpCreateSessionCommand {
+            target: context.target.clone(),
+            provider: context.prepare.provider.clone(),
+            session_uri: format!("{}:/{}", context.prepare.provider, Uuid::new_v4()),
+            workspace_uri: context.prepare.workspace_uri.clone(),
+            resolved_values: context.prepare.resolved_values.clone(),
+            overrides: creation_overrides(&context),
+        };
+        let command_id = self.database.ahp_enqueue_create_session(
+            &format!("create-session:{}", wizard.wizard_id),
+            &serde_json::to_value(&command)?,
+        )?;
+        wizard.state = "creating".to_owned();
+        wizard.pending_task = Some(task.to_owned());
+        wizard.create_command_id = Some(command_id);
+        wizard.new_session_uri = Some(command.session_uri.clone());
+        wizard.old_binding_endpoint_id = old_binding
+            .as_ref()
+            .map(|binding| binding.endpoint_id.clone());
+        wizard.old_binding_session_uri = old_binding
+            .as_ref()
+            .map(|binding| binding.session_uri.clone());
+        wizard.old_binding_host_instance_id = old_binding
+            .as_ref()
+            .and_then(|binding| binding.host_instance_id.clone());
+        wizard.updated_at = Utc::now().timestamp();
+        self.database.ahp_save_creation_wizard(&wizard)?;
+        let service = self.task_clone();
+        let wizard_id = wizard.wizard_id.clone();
+        let source_message_id = message_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = service
+                .run_ahp_creation_workflow(&wizard_id, &source_message_id)
+                .await
+            {
+                service
+                    .handle_ahp_creation_workflow_failure(&wizard_id, &error)
+                    .await;
+            }
+        });
+        Ok(Some(
+            "正在创建新的 Session，准备好后会返回编号与状态；发送 /cancel 可取消。".to_owned(),
+        ))
+    }
+
+    async fn run_ahp_creation_workflow(
+        &self,
+        wizard_id: &str,
+        source_message_id: &str,
+    ) -> Result<()> {
+        let Some((wizard, context)) = self.current_creation_context()? else {
+            return Ok(());
+        };
+        if wizard.wizard_id != wizard_id || wizard.state != "creating" {
+            return Ok(());
+        }
+        let task = wizard
+            .pending_task
+            .clone()
+            .context("AHP creation wizard omitted its pending task")?;
+        let create_command_id = wizard
+            .create_command_id
+            .context("AHP creation wizard omitted create command id")?;
+        let create_status = self
+            .wait_for_ahp_command_terminal(
+                &wizard.wizard_id,
+                create_command_id,
+                Duration::from_secs(300),
+                true,
+            )
+            .await?;
+        if self.creation_cancel_requested(wizard_id)? {
+            if let Some(session_uri) = wizard.new_session_uri.as_deref() {
+                self.rollback_created_session(&wizard, &context.target, session_uri)
+                    .await?;
+            }
+            self.database.ahp_clear_creation_wizard()?;
+            let _ = self
+                .send_if_owner(
+                    "ahp_new_cancelled",
+                    None,
+                    &format!("ahp-new-cancelled:{wizard_id}"),
+                    "新 Session 创建已取消。",
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        if create_status.state != "acked" {
+            self.database.ahp_clear_creation_wizard()?;
+            let _ = self
+                .send_if_owner(
+                    "ahp_new_failed",
+                    None,
+                    &format!("ahp-new-failed:{wizard_id}:create"),
+                    &format!(
+                        "新 Session 创建失败：{}",
+                        create_status.error_code.as_deref().unwrap_or("unknown")
+                    ),
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        let create_result: AhpCreateSessionResult = serde_json::from_value(
+            create_status
+                .result
+                .clone()
+                .context("AHP create_session command omitted result payload")?,
+        )
+        .context("AHP create_session result was invalid")?;
+        let session = self
+            .wait_for_ahp_session_catalog_entry(
+                &create_result.session.session_uri,
+                Duration::from_secs(15),
+            )
+            .await?
+            .unwrap_or_else(|| create_result.session.clone());
+        if let Some(reason) = self.ahp_creation_block_reason()? {
+            self.rollback_created_session(
+                &wizard,
+                &context.target,
+                &create_result.session.session_uri,
+            )
+            .await?;
+            self.database.ahp_clear_creation_wizard()?;
+            let _ = self
+                .send_if_owner(
+                    "ahp_new_failed",
+                    None,
+                    &format!("ahp-new-failed:{wizard_id}:blocked"),
+                    &format!("新 Session 已创建，但自动切换前检测到冲突：{reason}"),
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        let pending_binding = match self.database.ahp_bind_session(
+            &create_result.endpoint_id,
+            &create_result.session.session_uri,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.rollback_created_session(
+                    &wizard,
+                    &context.target,
+                    &create_result.session.session_uri,
+                )
+                .await?;
+                self.database.ahp_clear_creation_wizard()?;
+                let _ = self
+                    .send_if_owner(
+                        "ahp_new_failed",
+                        None,
+                        &format!("ahp-new-failed:{wizard_id}:bind"),
+                        &format!("新 Session 已创建，但自动绑定失败：{error}"),
+                        None,
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        let binding = match self
+            .wait_for_ahp_binding_ready(
+                &pending_binding.binding_id,
+                pending_binding.generation,
+                Duration::from_secs(60),
+            )
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.rollback_created_session(
+                    &wizard,
+                    &context.target,
+                    &create_result.session.session_uri,
+                )
+                .await?;
+                self.database.ahp_clear_creation_wizard()?;
+                let _ = self
+                    .send_if_owner(
+                        "ahp_new_failed",
+                        None,
+                        &format!("ahp-new-failed:{wizard_id}:binding-ready"),
+                        &format!("新 Session 绑定未在时限内完成：{error}"),
+                        None,
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        if self.creation_cancel_requested(wizard_id)? {
+            if binding.active_turn_id.is_none() {
+                self.rollback_created_session(
+                    &wizard,
+                    &context.target,
+                    &create_result.session.session_uri,
+                )
+                .await?;
+            }
+            self.database.ahp_clear_creation_wizard()?;
+            return Ok(());
+        }
+        let send_command_id = match self.database.ahp_enqueue_message(source_message_id, &task) {
+            Ok(command_id) => command_id,
+            Err(error) => {
+                self.rollback_created_session(
+                    &wizard,
+                    &context.target,
+                    &create_result.session.session_uri,
+                )
+                .await?;
+                self.database.ahp_clear_creation_wizard()?;
+                let _ = self
+                    .send_if_owner(
+                        "ahp_new_failed",
+                        None,
+                        &format!("ahp-new-failed:{wizard_id}:send"),
+                        &format!("新 Session 已绑定，但首条任务提交失败：{error}"),
+                        None,
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        let send_status = self
+            .wait_for_ahp_command_terminal(
+                &wizard.wizard_id,
+                send_command_id,
+                Duration::from_secs(60),
+                false,
+            )
+            .await?;
+        let binding = self
+            .database
+            .ahp_binding_for_session(&create_result.session.session_uri)?;
+        let started = send_status.state == "acked"
+            && send_status
+                .result
+                .as_ref()
+                .and_then(|value| value.get("disposition"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "started")
+            || binding
+                .as_ref()
+                .and_then(|binding| binding.active_turn_id.as_ref())
+                .is_some();
+        if send_status.state != "acked" && !started {
+            self.rollback_created_session(
+                &wizard,
+                &context.target,
+                &create_result.session.session_uri,
+            )
+            .await?;
+            self.database.ahp_clear_creation_wizard()?;
+            let _ = self
+                .send_if_owner(
+                    "ahp_new_failed",
+                    None,
+                    &format!("ahp-new-failed:{wizard_id}:send-ack"),
+                    &format!(
+                        "首条任务未能开始：{}",
+                        send_status.error_code.as_deref().unwrap_or("unknown")
+                    ),
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+        let session = self
+            .wait_for_ahp_session_catalog_entry(
+                &create_result.session.session_uri,
+                Duration::from_secs(15),
+            )
+            .await?
+            .unwrap_or(session);
+        self.database.ahp_clear_creation_wizard()?;
+        let short_code = session.short_code.as_deref().unwrap_or("[unknown]");
+        let started_status = if started { "已开始" } else { "已提交" };
+        let tool_note = if create_result.editor_client_tools_available {
+            ""
+        } else {
+            "\n说明：当前使用共享 Agent Host，编辑器客户端工具不可用。"
+        };
+        let _ = self
+            .send_if_owner(
+                "ahp_new_created",
+                None,
+                &format!("ahp-new-created:{wizard_id}"),
+                &format!(
+                    "新 Session `{}` 已创建并绑定。\n工作区：{}\n主机：{}\n首条任务：{}{}",
+                    short_code,
+                    managed_target_workspace_display(&context.target),
+                    create_result.host_label,
+                    started_status,
+                    tool_note
+                ),
+                None,
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn handle_ahp_creation_workflow_failure(&self, wizard_id: &str, error: &anyhow::Error) {
+        tracing::error!(wizard_id, error = %error, "AHP Session creation workflow failed");
+        let wizard = match self.database.ahp_creation_wizard() {
+            Ok(Some(wizard)) if wizard.wizard_id == wizard_id => wizard,
+            Ok(_) => return,
+            Err(load_error) => {
+                tracing::error!(
+                    wizard_id,
+                    error = %load_error,
+                    "failed to load creation wizard after workflow error"
+                );
+                return;
+            }
+        };
+        let context = wizard
+            .context
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<CreationWizardContext>(value.clone()).ok());
+        let active_new_turn = match wizard.new_session_uri.as_deref() {
+            Some(session_uri) => match self.database.ahp_binding_for_session(session_uri) {
+                Ok(Some(binding)) => binding.active_turn_id.is_some(),
+                Ok(None) => false,
+                Err(binding_error) => {
+                    tracing::error!(
+                        wizard_id,
+                        error = %binding_error,
+                        "failed to inspect created Session before rollback"
+                    );
+                    true
+                }
+            },
+            None => false,
+        };
+        let mut rollback_error = None;
+        if !active_new_turn
+            && let (Some(context), Some(session_uri)) =
+                (context.as_ref(), wizard.new_session_uri.as_deref())
+            && let Err(error) = self
+                .rollback_created_session(&wizard, &context.target, session_uri)
+                .await
+        {
+            rollback_error = Some(redact_text(&error.to_string()));
+        }
+        if let Err(clear_error) = self.database.ahp_clear_creation_wizard() {
+            tracing::error!(
+                wizard_id,
+                error = %clear_error,
+                "failed to clear creation wizard after workflow error"
+            );
+        }
+        let detail = redact_text(&error.to_string());
+        let message = if active_new_turn {
+            format!(
+                "新 Session 的首条任务已经开始，但创建流程后续确认失败；会话已保留，请发送 /sessions 查看。\n错误：{detail}"
+            )
+        } else if let Some(rollback_error) = rollback_error {
+            format!(
+                "新 Session 创建失败，自动回滚也未完全完成；请在电脑端检查 Agent Host。\n错误：{detail}\n回滚：{rollback_error}"
+            )
+        } else {
+            format!("新 Session 创建失败，已结束向导并执行回滚。\n错误：{detail}")
+        };
+        if let Err(send_error) = self
+            .send_if_owner(
+                "ahp_new_failed",
+                None,
+                &format!("ahp-new-failed:{wizard_id}:workflow"),
+                &message,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                wizard_id,
+                error = %send_error,
+                "failed to notify owner about creation workflow error"
+            );
+        }
+    }
+
+    fn managed_target_for_session(
+        &self,
+        session: &AhpSessionDescriptor,
+    ) -> Option<AhpManagedTarget> {
+        self.config
+            .ahp
+            .effective_authorized_targets()
+            .iter()
+            .find(|target| session_matches_authorized_target(target, session))
+            .map(authorized_target_to_managed_target)
+    }
+
+    async fn prepare_ahp_session_target(
+        &self,
+        session: &AhpSessionDescriptor,
+    ) -> Result<AhpSessionDescriptor> {
+        let target = self
+            .managed_target_for_session(session)
+            .context("AHP Session is no longer associated with a registered target")?;
+        let command = AhpPrepareTargetCommand {
+            target,
+            advanced: false,
+            retain_connection: true,
+            config: None,
+        };
+        let command_id = self.database.ahp_enqueue_prepare_target(
+            &format!("prepare-switch:{}:{}", session.session_uri, Uuid::new_v4()),
+            &serde_json::to_value(&command)?,
+        )?;
+        let status = self
+            .wait_for_ahp_command_terminal("switch", command_id, Duration::from_secs(60), false)
+            .await?;
+        if status.state != "acked" {
+            bail!(
+                "目标准备失败：{}",
+                status.error_code.as_deref().unwrap_or("unknown")
+            );
+        }
+        self.wait_for_ahp_session_catalog_entry(&session.session_uri, Duration::from_secs(15))
+            .await?
+            .or_else(|| {
+                self.database
+                    .ahp_session_by_uri(&session.session_uri)
+                    .ok()
+                    .flatten()
+            })
+            .context("AHP Session disappeared after target refresh")
+    }
+
+    async fn switch_ahp_session(&self, session: AhpSessionDescriptor) -> Result<String> {
+        let status = self
+            .database
+            .ahp_status(self.config.ahp.adapter_stale_seconds)?;
+        let mut session = if session_host_is_online(&session, &status.hosts) {
+            session
+        } else {
+            self.prepare_ahp_session_target(&session).await?
+        };
+        if !ahp_session_matches_workspace(&self.config, &session) {
+            bail!("该 Session 不属于配置的目标目录");
+        }
+        if !session_host_is_online(
+            &session,
+            &self
+                .database
+                .ahp_status(self.config.ahp.adapter_stale_seconds)?
+                .hosts,
+        ) {
+            session = self.prepare_ahp_session_target(&session).await?;
+        }
+        let binding = self
+            .database
+            .ahp_bind_session(&session.endpoint_id, &session.session_uri)?;
+        Ok(format!(
+            "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
+            session.short_code.as_deref().unwrap_or("[unknown]"),
+            session.title,
+            ahp_session_target_display(&self.config, &session)
+                .unwrap_or_else(|| session.session_uri.clone()),
+            binding.generation
+        ))
+    }
+
+    async fn rollback_created_session(
+        &self,
+        wizard: &crate::ahp_store::AhpCreationWizardRecord,
+        target: &AhpManagedTarget,
+        session_uri: &str,
+    ) -> Result<()> {
+        if let Some(binding) = self.database.ahp_binding_for_session(session_uri)? {
+            if binding.active_turn_id.is_some() {
+                bail!("created Session started a Turn before rollback");
+            }
+            if let Some(previous_session_uri) = wizard.old_binding_session_uri.as_deref() {
+                let previous_session = self
+                    .database
+                    .ahp_session_by_uri(previous_session_uri)?
+                    .context("previous AHP Session disappeared during rollback")?;
+                let hosts = self
+                    .database
+                    .ahp_status(self.config.ahp.adapter_stale_seconds)?
+                    .hosts;
+                let previous_session = if session_host_is_online(&previous_session, &hosts) {
+                    previous_session
+                } else {
+                    self.prepare_ahp_session_target(&previous_session).await?
+                };
+                let previous = self.database.ahp_bind_session(
+                    &previous_session.endpoint_id,
+                    &previous_session.session_uri,
+                )?;
+                let restored = self
+                    .wait_for_ahp_binding_ready(
+                        &previous.binding_id,
+                        previous.generation,
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+                if restored.session_uri != previous_session_uri || !restored.foreground {
+                    bail!("rollback restored a different AHP Session");
+                }
+            }
+            if !self.database.ahp_detach_session(session_uri)? {
+                bail!("created Session binding disappeared before rollback");
+            }
+            self.wait_for_ahp_binding_disposed(session_uri, Duration::from_secs(60))
+                .await?;
+        }
+        let command = AhpDisposeSessionCommand {
+            target: target.clone(),
+            session_uri: session_uri.to_owned(),
+        };
+        let command_id = self.database.ahp_enqueue_dispose_session(
+            &format!("dispose-session:{session_uri}:{}", Uuid::new_v4()),
+            &serde_json::to_value(&command)?,
+        )?;
+        let dispose_status = self
+            .wait_for_ahp_command_terminal(
+                &wizard.wizard_id,
+                command_id,
+                Duration::from_secs(60),
+                false,
+            )
+            .await?;
+        if dispose_status.state != "acked" {
+            bail!(
+                "created Session disposal failed: {}",
+                dispose_status.error_code.as_deref().unwrap_or("unknown")
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while self.database.ahp_session_is_available(session_uri)? {
+            if Instant::now() >= deadline {
+                bail!("disposed Session remained in the AHP catalogue");
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_ahp_binding_ready(
+        &self,
+        binding_id: &str,
+        generation: i64,
+        timeout: Duration,
+    ) -> Result<crate::protocol::AhpBindingRecord> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(binding) = self.database.ahp_bindings()?.into_iter().find(|binding| {
+                binding.binding_id == binding_id && binding.generation == generation
+            }) {
+                if binding.state == "bound" {
+                    return Ok(binding);
+                }
+                if matches!(binding.state.as_str(), "failed" | "lost") {
+                    bail!(
+                        "AHP binding entered {} state for generation {}",
+                        binding.state,
+                        generation
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("AHP binding timed out");
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_for_ahp_binding_disposed(
+        &self,
+        session_uri: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .database
+                .ahp_binding_for_session(session_uri)?
+                .is_none()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("AHP binding disposal timed out");
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_for_ahp_session_catalog_entry(
+        &self,
+        session_uri: &str,
+        timeout: Duration,
+    ) -> Result<Option<AhpSessionDescriptor>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(session) = self.database.ahp_session_by_uri(session_uri)? {
+                return Ok(Some(session));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_for_ahp_command_terminal(
+        &self,
+        wizard_id: &str,
+        command_id: i64,
+        timeout: Duration,
+        emit_progress: bool,
+    ) -> Result<crate::ahp_store::AhpCommandStatusRecord> {
+        let deadline = Instant::now() + timeout;
+        let mut last_progress_update = None;
+        loop {
+            let status = self
+                .database
+                .ahp_command_status(command_id)?
+                .context("AHP command disappeared")?;
+            if emit_progress
+                && let Some(progress) = status.progress.as_ref()
+                && Some(progress.updated_at) != last_progress_update
+            {
+                last_progress_update = Some(progress.updated_at);
+                let message = progress.message.as_deref().unwrap_or("正在创建 Session");
+                let _ = self
+                    .send_if_owner(
+                        "ahp_new_progress",
+                        None,
+                        &format!("ahp-new-progress:{wizard_id}:{}", progress.updated_at),
+                        &format!(
+                            "{}{}",
+                            message,
+                            progress.total.map_or_else(String::new, |total| {
+                                format!("（{}/{}）", progress.progress, total)
+                            })
+                        ),
+                        None,
+                    )
+                    .await;
+            }
+            if matches!(status.state.as_str(), "acked" | "rejected" | "failed") {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                bail!("AHP command timed out");
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn creation_cancel_requested(&self, wizard_id: &str) -> Result<bool> {
+        Ok(self
+            .database
+            .ahp_creation_wizard()?
+            .is_some_and(|wizard| wizard.wizard_id == wizard_id && wizard.cancel_requested))
     }
 
     async fn handle_ahp_event(&self, adapter_id: &str, event: &AhpPublishedEvent) -> Result<()> {
@@ -2342,10 +3840,13 @@ impl BridgeService {
     }
 
     async fn send_ahp_session_switch_menu(&self, message_id: &str) -> Result<Option<String>> {
-        let bindings = self.database.ahp_bindings()?;
-        let sessions: Vec<_> = self
+        let status = self
             .database
-            .ahp_list_sessions()?
+            .ahp_status(self.config.ahp.adapter_stale_seconds)?;
+        let bindings = status.bindings.clone();
+        let hosts = status.hosts.clone();
+        let sessions: Vec<_> = status
+            .sessions
             .into_iter()
             .filter(|session| ahp_session_matches_workspace(&self.config, session))
             .collect();
@@ -2403,16 +3904,24 @@ impl BridgeService {
                     } else {
                         "忙碌·未监控"
                     };
-                    let workspace = ahp_session_target_workspace(&self.config, &button.session)
+                    let workspace = ahp_session_target_display(&self.config, &button.session)
                         .expect("filtered target workspace");
+                    let host_label = button
+                        .session
+                        .host_label
+                        .clone()
+                        .unwrap_or_else(|| infer_session_host_label(&button.session));
+                    let host_status = describe_session_host_status(&button.session, &hosts);
                     format!(
-                        "{} `{}` {} · {}",
+                        "{} `{}` {} · {} · {} · {}",
                         state,
                         escape_qq_markdown(
                             button.session.short_code.as_deref().unwrap_or("[unknown]")
                         ),
                         escape_qq_markdown(&button.session.title),
-                        escape_qq_markdown(&workspace.display().to_string())
+                        escape_qq_markdown(&workspace),
+                        escape_qq_markdown(&host_label),
+                        host_status
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2771,9 +4280,17 @@ impl BridgeService {
             .database
             .ahp_binding()?
             .map(|binding| binding.session_uri);
+        let creating_session_uri = self
+            .database
+            .ahp_creation_wizard()?
+            .filter(|wizard| wizard.state == "creating")
+            .and_then(|wizard| wizard.new_session_uri);
         let mut candidates: Vec<_> = sessions
             .iter()
-            .filter(|session| ahp_session_matches_workspace(&self.config, session))
+            .filter(|session| {
+                creating_session_uri.as_deref() != Some(session.session_uri.as_str())
+                    && ahp_session_matches_workspace(&self.config, session)
+            })
             .collect();
         candidates.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
         if let Some(foreground_session_uri) = foreground_session_uri
@@ -2826,7 +4343,7 @@ impl BridgeService {
     fn validate_ahp_session_workspace(&self, endpoint_id: &str, session_uri: &str) -> Result<()> {
         validate_identifier("endpoint_id", endpoint_id)?;
         validate_identifier("session_uri", session_uri)?;
-        if self.config.ahp.shared_workspaces.is_empty() {
+        if self.config.ahp.effective_authorized_targets().is_empty() {
             bail!("AHP target workspaces are not configured");
         }
         let session = self
@@ -2837,7 +4354,7 @@ impl BridgeService {
                 session.endpoint_id == endpoint_id && session.session_uri == session_uri
             })
             .context("AHP session is not present in the current catalogue")?;
-        if ahp_session_target_workspace(&self.config, &session).is_none() {
+        if ahp_session_target_display(&self.config, &session).is_none() {
             bail!("AHP session does not target a configured workspace");
         }
         Ok(())
@@ -3177,8 +4694,12 @@ fn format_ahp_status(status: &AhpStatus, mode: AhpToolNotificationMode) -> Strin
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let creation = status.creation.as_ref().map_or_else(
+        || "无".to_owned(),
+        |creation| format!("{} / {}", creation.mode, creation.state),
+    );
     format!(
-        "AHP Adapter: {adapter}\n监控 Session ({}/{}):\n{bindings}\n通知模式: {}\n可见 Host: {}\n可见 Session: {}\n待处理命令: {}\n待审批/待回答: {}/{}\nQQ 待补发事件: {}",
+        "AHP Adapter: {adapter}\n监控 Session ({}/{}):\n{bindings}\n创建向导: {creation}\n通知模式: {}\n可见 Host: {}\n可见 Session: {}\n待处理命令: {}\n待审批/待回答: {}/{}\nQQ 待补发事件: {}",
         status.bindings.len(),
         MAX_TRACKED_AHP_SESSIONS,
         mode.as_str(),
@@ -3253,6 +4774,8 @@ QQ 语音：使用内置 ASR；不会执行控制命令
 /send <编号> <文本>：发送到指定 Session，不改变前台
 
 【Session】
+/new：选择预授权目标后，发送首条任务并自动创建/绑定新 Session
+/new advanced：在目标之后额外选择模型与审批模式
 /sessions：列出前台、后台和未监控 Session
 /switch：显示前台切换按钮
 /switch <编号>：切换前台，其他任务继续后台运行
@@ -3306,6 +4829,7 @@ fn notification_mode_description(mode: AhpToolNotificationMode) -> &'static str 
 fn format_ahp_sessions(
     config: &AppConfig,
     bindings: &[crate::protocol::AhpBindingRecord],
+    hosts: &[AhpHostDescriptor],
     sessions: &[AhpSessionDescriptor],
 ) -> String {
     let visible: Vec<_> = sessions
@@ -3340,13 +4864,20 @@ fn format_ahp_sessions(
                 "未监控 · 忙碌"
             };
             let workspace =
-                ahp_session_target_workspace(config, session).expect("filtered target workspace");
+                ahp_session_target_display(config, session).expect("filtered target workspace");
+            let host_status = describe_session_host_status(session, hosts);
+            let host_label = session
+                .host_label
+                .clone()
+                .unwrap_or_else(|| infer_session_host_label(session));
             format!(
-                "{} {} | {} | {} | {}",
+                "{} {} | {} | {} | {} | {} | {}",
                 if current { "*" } else { " " },
                 session.short_code.as_deref().unwrap_or("[unknown]"),
                 session.title,
-                workspace.display(),
+                workspace,
+                host_label,
+                host_status,
                 state
             )
         })
@@ -3359,7 +4890,11 @@ fn format_ahp_sessions(
 }
 
 fn ahp_session_matches_workspace(config: &AppConfig, session: &AhpSessionDescriptor) -> bool {
-    ahp_session_target_workspace(config, session).is_some()
+    config
+        .ahp
+        .effective_authorized_targets()
+        .iter()
+        .any(|target| session_matches_authorized_target(target, session))
 }
 
 fn ahp_session_target_workspace<'a>(
@@ -3380,6 +4915,208 @@ fn ahp_session_target_workspace<'a>(
             })
             .then_some(configured.as_path())
     })
+}
+
+fn ahp_session_target_display(
+    config: &AppConfig,
+    session: &AhpSessionDescriptor,
+) -> Option<String> {
+    config
+        .ahp
+        .effective_authorized_targets()
+        .iter()
+        .find(|target| session_matches_authorized_target(target, session))
+        .map(|target| target.display_workspace())
+}
+
+fn authorized_target_to_managed_target(target: &AhpAuthorizedTarget) -> AhpManagedTarget {
+    match target {
+        AhpAuthorizedTarget::Local { path } => AhpManagedTarget::Local {
+            path: path.display().to_string(),
+        },
+        AhpAuthorizedTarget::Ssh {
+            alias,
+            path,
+            user,
+            host,
+            port,
+            host_key_fingerprints,
+        } => AhpManagedTarget::Ssh {
+            alias: alias.clone(),
+            path: path.clone(),
+            user: user.clone(),
+            host: host.clone(),
+            port: *port,
+            host_key_fingerprints: host_key_fingerprints.clone(),
+        },
+    }
+}
+
+fn managed_target_workspace_display(target: &AhpManagedTarget) -> String {
+    match target {
+        AhpManagedTarget::Local { path } => path.clone(),
+        AhpManagedTarget::Ssh { path, .. } => path.clone(),
+    }
+}
+
+fn infer_session_host_label(session: &AhpSessionDescriptor) -> String {
+    match session.target_kind {
+        Some(AhpTargetKind::Local) => "local".to_owned(),
+        Some(AhpTargetKind::Ssh) => session
+            .ssh_alias
+            .as_deref()
+            .map(|alias| format!("ssh:{alias}"))
+            .unwrap_or_else(|| "ssh".to_owned()),
+        None => "host".to_owned(),
+    }
+}
+
+fn summarize_selected_option(field: &AhpSupportedSessionField) -> String {
+    field
+        .options
+        .iter()
+        .find(|option| option.value == field.selected)
+        .map(|option| option.label.clone())
+        .unwrap_or_else(|| field.selected.to_string())
+}
+
+fn creation_overrides(context: &CreationWizardContext) -> Value {
+    let mut overrides = serde_json::Map::new();
+    if let Some(field) = context.prepare.model.as_ref() {
+        overrides.insert(field.property.clone(), field.selected.clone());
+    }
+    if let Some(field) = context.prepare.approval.as_ref() {
+        overrides.insert(field.property.clone(), field.selected.clone());
+    }
+    Value::Object(overrides)
+}
+
+fn describe_authorized_target_status(
+    target: &AhpAuthorizedTarget,
+    hosts: &[AhpHostDescriptor],
+    sessions: &[AhpSessionDescriptor],
+) -> String {
+    let matching: Vec<_> = sessions
+        .iter()
+        .filter(|session| session_matches_authorized_target(target, session))
+        .collect();
+    if matching.is_empty() {
+        "离线".to_owned()
+    } else if matching
+        .iter()
+        .any(|session| session_host_is_online(session, hosts))
+    {
+        "在线".to_owned()
+    } else {
+        "离线/缓存".to_owned()
+    }
+}
+
+fn describe_session_host_status(
+    session: &AhpSessionDescriptor,
+    hosts: &[AhpHostDescriptor],
+) -> String {
+    if let Some(host) = hosts
+        .iter()
+        .find(|host| host.endpoint_id == session.endpoint_id)
+    {
+        match host.state {
+            crate::protocol::AhpHostState::Connected => "在线".to_owned(),
+            crate::protocol::AhpHostState::ReadOnly => "只读".to_owned(),
+            crate::protocol::AhpHostState::Incompatible => "协议不兼容".to_owned(),
+            crate::protocol::AhpHostState::Unreachable => "离线/缓存".to_owned(),
+        }
+    } else {
+        "离线/缓存".to_owned()
+    }
+}
+
+fn session_host_is_online(session: &AhpSessionDescriptor, hosts: &[AhpHostDescriptor]) -> bool {
+    hosts.iter().any(|host| {
+        host.endpoint_id == session.endpoint_id
+            && matches!(
+                host.state,
+                crate::protocol::AhpHostState::Connected | crate::protocol::AhpHostState::ReadOnly
+            )
+    })
+}
+
+fn session_matches_authorized_target(
+    target: &AhpAuthorizedTarget,
+    session: &AhpSessionDescriptor,
+) -> bool {
+    match target {
+        AhpAuthorizedTarget::Local { path } => {
+            if session.target_kind == Some(AhpTargetKind::Local)
+                && session.target_path.as_deref().is_some_and(|target_path| {
+                    let target_path = PathBuf::from(target_path);
+                    path_is_within(path, &target_path) && path_is_within(&target_path, path)
+                })
+            {
+                return true;
+            }
+            session.workspace_uris.iter().any(|workspace_uri| {
+                url::Url::parse(workspace_uri)
+                    .ok()
+                    .and_then(|url| url.to_file_path().ok())
+                    .is_some_and(|workspace| {
+                        path_is_within(&workspace, path) && path_is_within(path, &workspace)
+                    })
+            })
+        }
+        AhpAuthorizedTarget::Ssh { alias, path, .. } => {
+            if session.target_kind == Some(AhpTargetKind::Ssh)
+                && session.ssh_alias.as_deref() == Some(alias.as_str())
+                && session.target_path.as_deref() == Some(path.as_str())
+            {
+                return true;
+            }
+            session.workspace_uris.iter().any(|workspace_uri| {
+                parse_remote_workspace_target(workspace_uri).is_some_and(
+                    |(workspace_alias, workspace_path)| {
+                        workspace_alias == *alias && workspace_path == *path
+                    },
+                ) || (session.ssh_alias.as_deref() == Some(alias.as_str())
+                    && parse_remote_file_workspace(workspace_uri)
+                        .is_some_and(|workspace_path| workspace_path == *path))
+            })
+        }
+    }
+}
+
+fn parse_remote_workspace_target(value: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "vscode-remote" {
+        return None;
+    }
+    let host = urlencoding::decode(url.host_str()?).ok()?;
+    let alias = host.strip_prefix("ssh-remote+")?;
+    let path = normalize_posix_path(&urlencoding::decode(url.path()).ok()?)?;
+    Some((alias.to_owned(), path))
+}
+
+fn parse_remote_file_workspace(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    (url.scheme() == "file")
+        .then(|| normalize_posix_path(url.path()))
+        .flatten()
+}
+
+fn normalize_posix_path(value: &str) -> Option<String> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 fn ahp_session_is_idle(session: &AhpSessionDescriptor) -> bool {
@@ -3675,6 +5412,7 @@ mod tests {
                 "adapter-run-1",
                 bind_command[0].command_id,
                 crate::protocol::AhpCommandOutcome::Applied,
+                None,
                 None,
             )
             .expect("ack bind");
@@ -4696,6 +6434,13 @@ mod tests {
             advertised_protocol: "1.0.0".to_owned(),
             selected_protocol: Some("1.0.0".to_owned()),
             state: crate::protocol::AhpHostState::Connected,
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(fixture.workspace.display().to_string()),
+            endpoint_type: Some("socket".to_owned()),
+            editor_client_tools_available: Some(true),
+            last_seen_at: Some(Utc::now().timestamp()),
         };
         let workspace_uri = url::Url::from_file_path(&fixture.workspace)
             .expect("workspace URI")
@@ -4724,6 +6469,13 @@ mod tests {
                 workspace_uris: vec![workspace_uri.clone()],
                 created_at: "2026-08-27T00:00:00Z".to_owned(),
                 modified_at: "2026-08-27T00:00:00Z".to_owned(),
+                host_label: Some("local".to_owned()),
+                ssh_alias: None,
+                target_kind: Some(AhpTargetKind::Local),
+                target_path: Some(fixture.workspace.display().to_string()),
+                editor_client_tools_available: Some(true),
+                host_state: None,
+                host_last_seen_at: None,
             },
             AhpSessionDescriptor {
                 short_code: None,
@@ -4736,6 +6488,13 @@ mod tests {
                 workspace_uris: vec![other_workspace_uri],
                 created_at: "2026-08-27T00:01:00Z".to_owned(),
                 modified_at: "2026-08-27T00:01:00Z".to_owned(),
+                host_label: Some("local".to_owned()),
+                ssh_alias: None,
+                target_kind: Some(AhpTargetKind::Local),
+                target_path: Some(other_workspace.display().to_string()),
+                editor_client_tools_available: Some(true),
+                host_state: None,
+                host_last_seen_at: None,
             },
             AhpSessionDescriptor {
                 short_code: None,
@@ -4748,6 +6507,13 @@ mod tests {
                 workspace_uris: vec![outside_workspace_uri],
                 created_at: "2026-08-27T00:02:00Z".to_owned(),
                 modified_at: "2026-08-27T00:02:00Z".to_owned(),
+                host_label: Some("local".to_owned()),
+                ssh_alias: None,
+                target_kind: Some(AhpTargetKind::Local),
+                target_path: Some(outside_workspace.display().to_string()),
+                editor_client_tools_available: Some(true),
+                host_state: None,
+                host_last_seen_at: None,
             },
             AhpSessionDescriptor {
                 short_code: None,
@@ -4764,6 +6530,13 @@ mod tests {
                 ],
                 created_at: "2026-08-27T00:03:00Z".to_owned(),
                 modified_at: "2026-08-27T00:03:00Z".to_owned(),
+                host_label: Some("local".to_owned()),
+                ssh_alias: None,
+                target_kind: Some(AhpTargetKind::Local),
+                target_path: Some(other_workspace.display().to_string()),
+                editor_client_tools_available: Some(true),
+                host_state: None,
+                host_last_seen_at: None,
             },
         ];
         fixture
@@ -4847,12 +6620,20 @@ mod tests {
             fixture.qq.acknowledgements().await,
             vec![("interaction-switch-1".to_owned(), 0)]
         );
-        let binding = fixture
-            .service
-            .database()
-            .ahp_binding()
-            .expect("binding")
-            .expect("bound");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let binding = loop {
+            let binding = fixture
+                .service
+                .database()
+                .ahp_binding()
+                .expect("binding")
+                .expect("bound");
+            if binding.session_uri == "copilot:/session-2" {
+                break binding;
+            }
+            assert!(Instant::now() < deadline, "switch did not finish");
+            sleep(Duration::from_millis(20)).await;
+        };
         assert_eq!(binding.session_uri, "copilot:/session-2");
         assert_eq!(binding.state, "binding");
         let bindings = fixture
@@ -4892,6 +6673,7 @@ mod tests {
                 adapter_instance_id: "adapter-run-1".to_owned(),
                 hosts: vec![test_ahp_host()],
                 sessions,
+                full_snapshot: true,
             })
             .await
             .expect("replace catalogue");
@@ -5131,6 +6913,7 @@ mod tests {
                 bind_command[0].command_id,
                 crate::protocol::AhpCommandOutcome::Applied,
                 None,
+                None,
             )
             .expect("ack bind");
         fixture
@@ -5199,6 +6982,13 @@ mod tests {
             advertised_protocol: "1.0.0".to_owned(),
             selected_protocol: Some("1.0.0".to_owned()),
             state: crate::protocol::AhpHostState::Connected,
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: None,
+            endpoint_type: Some("socket".to_owned()),
+            editor_client_tools_available: Some(true),
+            last_seen_at: None,
         }
     }
 
@@ -5241,6 +7031,7 @@ mod tests {
                 command.command_id,
                 crate::protocol::AhpCommandOutcome::Applied,
                 None,
+                None,
             )
             .expect("ack bind");
         database
@@ -5275,7 +7066,419 @@ mod tests {
             ],
             created_at: format!("2026-09-02T00:{number:02}:00Z"),
             modified_at: format!("2026-09-02T00:{number:02}:00Z"),
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(workspace.display().to_string()),
+            editor_client_tools_available: Some(true),
+            host_state: None,
+            host_last_seen_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn new_wizard_sends_target_buttons_and_cancel_clears_state() {
+        let fixture = Fixture::new_ahp_multi_workspace();
+        assert!(
+            fixture
+                .service
+                .process_ahp_owner_message("new-message", "/new")
+                .await
+                .expect("start wizard")
+                .is_none()
+        );
+        let wizard = fixture
+            .service
+            .database()
+            .ahp_creation_wizard()
+            .expect("wizard query")
+            .expect("wizard");
+        assert_eq!(wizard.state, "select_target");
+        let menu = fixture.qq.messages().await.last().cloned().expect("menu");
+        assert_eq!(menu.kind, "choice_buttons");
+        assert!(menu.content.contains("新建 Session"));
+        assert!(menu.content.contains("workspace"));
+        assert!(menu.content.contains("other-workspace"));
+        let cancelled = fixture
+            .service
+            .process_ahp_owner_message("cancel-message", "/cancel")
+            .await
+            .expect("cancel wizard")
+            .expect("cancel response");
+        assert!(cancelled.contains("已取消"));
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_creation_wizard()
+                .expect("wizard query")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn advanced_model_selection_reresolves_before_showing_approval() {
+        let fixture = Fixture::new_ahp();
+        let option = |value: &str| crate::protocol::AhpSessionConfigOption {
+            value: json!(value),
+            label: value.to_owned(),
+            description: None,
+        };
+        let context = CreationWizardContext {
+            target: AhpManagedTarget::Local {
+                path: fixture.workspace.display().to_string(),
+            },
+            prepare: AhpPrepareTargetResult {
+                endpoint_id: "endpoint-1".to_owned(),
+                host_instance_id: "host-1".to_owned(),
+                provider: "copilot".to_owned(),
+                workspace_uri: url::Url::from_file_path(&fixture.workspace)
+                    .expect("workspace URI")
+                    .to_string(),
+                host_label: "local".to_owned(),
+                editor_client_tools_available: false,
+                resolved_values: json!({"isolation": "folder"}),
+                model: Some(AhpSupportedSessionField {
+                    property: "model".to_owned(),
+                    options: vec![option("model-a"), option("model-b")],
+                    selected: json!("model-a"),
+                }),
+                approval: Some(AhpSupportedSessionField {
+                    property: "approval".to_owned(),
+                    options: vec![option("stale")],
+                    selected: json!("stale"),
+                }),
+            },
+        };
+        let now = Utc::now().timestamp();
+        fixture
+            .service
+            .database()
+            .ahp_save_creation_wizard(&crate::ahp_store::AhpCreationWizardRecord {
+                wizard_id: "wizard-advanced".to_owned(),
+                mode: "advanced".to_owned(),
+                state: "select_model".to_owned(),
+                context: Some(serde_json::to_value(&context).expect("context JSON")),
+                pending_task: None,
+                create_command_id: None,
+                new_session_uri: None,
+                old_binding_endpoint_id: None,
+                old_binding_session_uri: None,
+                old_binding_host_instance_id: None,
+                cancel_requested: false,
+                expires_at: now + 600,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("save wizard");
+
+        let service = fixture.service.task_clone();
+        let selection = tokio::spawn(async move {
+            service
+                .apply_ahp_creation_field_selection(
+                    "wizard-advanced",
+                    "model",
+                    &json!({"value": "model-b"}),
+                )
+                .await
+        });
+        let command = loop {
+            let commands = fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("poll commands");
+            if let Some(command) = commands
+                .into_iter()
+                .find(|command| command.kind == crate::protocol::AhpCommandKind::PrepareTarget)
+            {
+                break command;
+            }
+            sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(command.data["config"]["model"], json!("model-b"));
+        let refreshed = AhpPrepareTargetResult {
+            resolved_values: json!({
+                "isolation": "folder",
+                "model": "model-b",
+                "approval": "ask"
+            }),
+            model: context.prepare.model,
+            approval: Some(AhpSupportedSessionField {
+                property: "approval".to_owned(),
+                options: vec![option("ask"), option("autopilot")],
+                selected: json!("ask"),
+            }),
+            ..context.prepare
+        };
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                command.command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+                Some(&serde_json::to_value(refreshed).expect("result JSON")),
+            )
+            .expect("ack config refresh");
+        selection
+            .await
+            .expect("selection task")
+            .expect("selection result");
+
+        let wizard = fixture
+            .service
+            .database()
+            .ahp_creation_wizard()
+            .expect("wizard query")
+            .expect("wizard");
+        assert_eq!(wizard.state, "select_approval");
+        let context: CreationWizardContext =
+            serde_json::from_value(wizard.context.expect("context")).expect("context JSON");
+        assert_eq!(context.prepare.approval.expect("approval").options.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn new_creation_workflow_creates_binds_and_reports_started_session() {
+        let fixture = Fixture::new_ahp();
+        let workspace_uri = url::Url::from_file_path(&fixture.workspace)
+            .expect("workspace URI")
+            .to_string();
+        let context = CreationWizardContext {
+            target: crate::protocol::AhpManagedTarget::Local {
+                path: fixture.workspace.display().to_string(),
+            },
+            prepare: crate::protocol::AhpPrepareTargetResult {
+                endpoint_id: "endpoint-1".to_owned(),
+                host_instance_id: "host-1".to_owned(),
+                provider: "copilot".to_owned(),
+                workspace_uri: workspace_uri.clone(),
+                host_label: "local".to_owned(),
+                editor_client_tools_available: false,
+                resolved_values: json!({}),
+                model: None,
+                approval: None,
+            },
+        };
+        let now = Utc::now().timestamp();
+        fixture
+            .service
+            .database()
+            .ahp_save_creation_wizard(&crate::ahp_store::AhpCreationWizardRecord {
+                wizard_id: "wizard-create".to_owned(),
+                mode: "quick".to_owned(),
+                state: "await_task".to_owned(),
+                context: Some(serde_json::to_value(&context).expect("context JSON")),
+                pending_task: None,
+                create_command_id: None,
+                new_session_uri: None,
+                old_binding_endpoint_id: None,
+                old_binding_session_uri: None,
+                old_binding_host_instance_id: None,
+                cancel_requested: false,
+                expires_at: now + 600,
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("save wizard");
+        let reply = fixture
+            .service
+            .start_ahp_session_creation("create-task-message", "实现移动端新建 Session")
+            .await
+            .expect("start creation")
+            .expect("queued response");
+        assert!(reply.contains("正在创建"));
+
+        let create_command = loop {
+            let commands = fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("poll commands");
+            if let Some(command) = commands
+                .into_iter()
+                .find(|command| command.kind == crate::protocol::AhpCommandKind::CreateSession)
+            {
+                break command;
+            }
+            sleep(Duration::from_millis(20)).await;
+        };
+        let session_uri = create_command
+            .data
+            .get("session_uri")
+            .and_then(Value::as_str)
+            .expect("create session URI")
+            .to_owned();
+        let created_session = AhpSessionDescriptor {
+            short_code: None,
+            endpoint_id: "endpoint-1".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            session_uri: session_uri.clone(),
+            provider: "copilot".to_owned(),
+            title: "Mobile-created".to_owned(),
+            status: 1,
+            workspace_uris: vec![workspace_uri.clone()],
+            created_at: "2026-08-27T00:10:00Z".to_owned(),
+            modified_at: "2026-08-27T00:10:00Z".to_owned(),
+            host_label: Some("local".to_owned()),
+            ssh_alias: None,
+            target_kind: Some(AhpTargetKind::Local),
+            target_path: Some(fixture.workspace.display().to_string()),
+            editor_client_tools_available: Some(false),
+            host_state: None,
+            host_last_seen_at: None,
+        };
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpCatalogReplace {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                hosts: vec![AhpHostDescriptor {
+                    endpoint_id: "endpoint-1".to_owned(),
+                    host_instance_id: "host-1".to_owned(),
+                    pid: 42,
+                    advertised_protocol: "1.0.0".to_owned(),
+                    selected_protocol: Some("1.0.0".to_owned()),
+                    state: crate::protocol::AhpHostState::Connected,
+                    host_label: Some("local".to_owned()),
+                    ssh_alias: None,
+                    target_kind: Some(AhpTargetKind::Local),
+                    target_path: Some(fixture.workspace.display().to_string()),
+                    endpoint_type: Some("socket".to_owned()),
+                    editor_client_tools_available: Some(false),
+                    last_seen_at: Some(Utc::now().timestamp()),
+                }],
+                sessions: vec![created_session.clone()],
+                full_snapshot: false,
+            })
+            .await
+            .expect("publish created session");
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                create_command.command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+                Some(&json!({
+                    "endpoint_id": "endpoint-1",
+                    "host_instance_id": "host-1",
+                    "workspace_uri": workspace_uri,
+                    "host_label": "local",
+                    "editor_client_tools_available": false,
+                    "session": created_session
+                })),
+            )
+            .expect("ack create session");
+
+        let bind_command = loop {
+            let commands = fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("poll bind command");
+            if let Some(command) = commands
+                .into_iter()
+                .find(|command| command.kind == crate::protocol::AhpCommandKind::BindSession)
+            {
+                break command;
+            }
+            sleep(Duration::from_millis(20)).await;
+        };
+        let binding = fixture
+            .service
+            .database()
+            .ahp_binding()
+            .expect("binding query")
+            .expect("binding");
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                bind_command.command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+                None,
+            )
+            .expect("ack bind");
+        fixture
+            .service
+            .database()
+            .ahp_binding_ready(
+                "adapter-stable",
+                "adapter-run-1",
+                &binding.binding_id,
+                "endpoint-1",
+                "host-1",
+                binding.generation,
+                &session_uri,
+                "ahp-chat://default/mobile-created",
+                1,
+            )
+            .expect("binding ready");
+
+        let send_command = loop {
+            let commands = fixture
+                .service
+                .database()
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("poll send command");
+            if let Some(command) = commands
+                .into_iter()
+                .find(|command| command.kind == crate::protocol::AhpCommandKind::SendMessage)
+            {
+                break command;
+            }
+            sleep(Duration::from_millis(20)).await;
+        };
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                send_command.command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+                Some(&json!({
+                    "disposition": "started",
+                    "id": "turn-mobile",
+                    "clientSeq": 7
+                })),
+            )
+            .expect("ack send");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if fixture
+                .service
+                .database()
+                .ahp_creation_wizard()
+                .expect("wizard query")
+                .is_none()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "wizard did not finish");
+            sleep(Duration::from_millis(20)).await;
+        }
+        let messages = fixture.qq.messages().await;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("新 Session `"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("首条任务：已开始"))
+        );
     }
 
     struct Fixture {
@@ -5409,6 +7612,13 @@ mod tests {
                         advertised_protocol: "1.0.0".to_owned(),
                         selected_protocol: Some("1.0.0".to_owned()),
                         state: crate::protocol::AhpHostState::Connected,
+                        host_label: Some("local".to_owned()),
+                        ssh_alias: None,
+                        target_kind: Some(AhpTargetKind::Local),
+                        target_path: Some(workspace.display().to_string()),
+                        endpoint_type: Some("socket".to_owned()),
+                        editor_client_tools_available: Some(true),
+                        last_seen_at: Some(Utc::now().timestamp()),
                     }],
                     &[AhpSessionDescriptor {
                         short_code: None,
@@ -5425,6 +7635,13 @@ mod tests {
                         ],
                         created_at: "2026-08-27T00:00:00Z".to_owned(),
                         modified_at: "2026-08-27T00:00:00Z".to_owned(),
+                        host_label: Some("local".to_owned()),
+                        ssh_alias: None,
+                        target_kind: Some(AhpTargetKind::Local),
+                        target_path: Some(workspace.display().to_string()),
+                        editor_client_tools_available: Some(true),
+                        host_state: None,
+                        host_last_seen_at: None,
                     }],
                 )
                 .expect("catalogue");
@@ -5440,6 +7657,7 @@ mod tests {
                     "adapter-run-1",
                     command[0].command_id,
                     crate::protocol::AhpCommandOutcome::Applied,
+                    None,
                     None,
                 )
                 .expect("ack bind");

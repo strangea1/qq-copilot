@@ -4,6 +4,12 @@ import { TransportError, type AhpTransport } from "@microsoft/agent-host-protoco
 import { WebSocketTransport } from "@microsoft/agent-host-protocol/ws";
 import Ws from "ws";
 
+import type {
+  SocketEndpoint,
+  TcpEndpoint,
+  WebSocketEndpoint,
+} from "./endpoint-registry.js";
+
 const OPEN_TIMEOUT_MS = 10_000;
 const MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
@@ -11,13 +17,47 @@ export async function openNamedPipeTransport(
   pipePath: string,
   connectionToken: string,
 ): Promise<AhpTransport> {
-  const url = new URL("ws://localhost/");
-  url.searchParams.set("tkn", connectionToken);
+  return openSocketTransport(
+    new URL(buildWebSocketUrl(`ws://localhost/`, connectionToken)),
+    () => net.createConnection(pipePath),
+  );
+}
 
+export async function openEndpointTransport(
+  endpoint: SocketEndpoint | TcpEndpoint | WebSocketEndpoint,
+  connectionToken: string,
+): Promise<AhpTransport> {
+  switch (endpoint.type) {
+    case "socket":
+      return openNamedPipeTransport(endpoint.path, connectionToken);
+    case "tcp":
+      return WebSocketTransport.connect(
+        buildWebSocketUrl(
+          `ws://${endpoint.host}:${endpoint.port}/`,
+          connectionToken,
+        ),
+      );
+    case "websocket":
+      return WebSocketTransport.connect(
+        buildWebSocketUrl(endpoint.url, connectionToken),
+      );
+  }
+}
+
+function buildWebSocketUrl(base: string, connectionToken: string): string {
+  const url = new URL(base);
+  url.searchParams.set("tkn", connectionToken);
+  return url.toString();
+}
+
+async function openSocketTransport(
+  url: URL,
+  createConnection: () => net.Socket,
+): Promise<AhpTransport> {
   let socket: Ws;
   try {
     socket = new Ws(url, {
-      createConnection: () => net.createConnection(pipePath),
+      createConnection,
       followRedirects: false,
       perMessageDeflate: false,
       maxPayload: MAX_PAYLOAD_BYTES,

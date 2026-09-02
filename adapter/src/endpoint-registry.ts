@@ -19,6 +19,11 @@ export interface TcpEndpoint {
   readonly port: number;
 }
 
+export interface WebSocketEndpoint {
+  readonly type: "websocket";
+  readonly url: string;
+}
+
 export interface EndpointRegistryEntry {
   readonly schemaVersion: 2;
   readonly type: "editor" | "standalone";
@@ -26,7 +31,7 @@ export interface EndpointRegistryEntry {
   readonly instanceId: string;
   readonly protocolVersion: string;
   readonly connectionToken: string;
-  readonly endpoint: SocketEndpoint | TcpEndpoint;
+  readonly endpoint: SocketEndpoint | TcpEndpoint | WebSocketEndpoint;
   readonly sourceFile: string;
 }
 
@@ -133,8 +138,10 @@ function registryFingerprint(entries: readonly EndpointRegistryEntry[]): string 
     hash.update("\0", "utf8");
     if (entry.endpoint.type === "socket") {
       hash.update(entry.endpoint.path, "utf8");
-    } else {
+    } else if (entry.endpoint.type === "tcp") {
       hash.update(`${entry.endpoint.host}\0${entry.endpoint.port}`, "utf8");
+    } else {
+      hash.update(entry.endpoint.url, "utf8");
     }
     hash.update("\0", "utf8");
   }
@@ -213,7 +220,7 @@ function parseEntry(
     return undefined;
   }
 
-  let endpoint: SocketEndpoint | TcpEndpoint;
+  let endpoint: SocketEndpoint | TcpEndpoint | WebSocketEndpoint;
   if (
     raw.endpoint.type === "socket" &&
     typeof raw.endpoint.path === "string" &&
@@ -234,6 +241,15 @@ function parseEntry(
       type: "tcp",
       host: raw.endpoint.host,
       port: raw.endpoint.port,
+    };
+  } else if (
+    raw.endpoint.type === "websocket" &&
+    typeof raw.endpoint.url === "string" &&
+    /^wss?:\/\//u.test(raw.endpoint.url)
+  ) {
+    endpoint = {
+      type: "websocket",
+      url: raw.endpoint.url,
     };
   } else {
     return undefined;

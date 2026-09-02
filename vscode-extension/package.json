@@ -14,6 +14,11 @@
   "extensionKind": [
     "ui"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
   "activationEvents": [
     "onStartupFinished",
     "onCommand:qqCopilot.refreshStatus",
@@ -36,11 +41,13 @@
       "properties": {
         "qqCopilot.bridgeExecutable": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Optional absolute path to qq-bridge.exe."
         },
         "qqCopilot.configPath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Optional absolute path to the QQ Bridge config.toml."
         },
@@ -56,7 +63,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/trust-helpers.test.cjs"
   },
   "devDependencies": {
     "@types/node": "24.12.4",

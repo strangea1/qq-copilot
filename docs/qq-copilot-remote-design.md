@@ -1,8 +1,8 @@
 # VS Code Copilot 与 QQ Bot 远程交互设计
 
-状态：AHP 双客户端、多目标目录和最多 5 个并发 Binding 已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
-日期：2026-08-29<br>
-目标环境：Windows、单个 QQ 单聊用户、VS Code 本地 Agent、当前 Windows 标准用户权限
+状态：AHP 双客户端、最多 5 个并发 Binding、QQ 新建 Session 与本地/Remote SSH 预授权目标已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
+日期：2026-09-02<br>
+目标环境：Windows、单个 QQ 单聊用户、本地/Remote SSH Agent Host、当前 Windows 标准用户权限
 
 实现对应关系：
 
@@ -31,25 +31,34 @@ flowchart LR
 
 - Agent Host 是 Session、Chat、Turn 和工具审批的唯一权威状态源。
 - VS Code 与 QQ Adapter 同时订阅用户已创建的 Session。Adapter 以 `binding_id` 为键
-  维护独立的 SessionBinding、事件 normalizer 和发布队列，最多同时监控 5 个 Session。
+  维护独立的 SessionBinding、事件 normalizer 和发布队列，最多同时监控 5 个跨
+  Editor、Local Standalone 和 Remote SSH Host 的 Session。
 - SQLite `ahp_bindings` 保存所有 Binding，`ahp_foreground_binding` 只保存 QQ 前台
   指针。普通 QQ 文本/语音进入前台 Chat；`/send <code>` 可定向进入后台 Chat；
   Agent 忙碌时继续使用 AHP queued message。
+- QQ 可通过 `/new` / `/new advanced` 选择电脑端预授权目标、创建新的 Session、自动加入
+  监控并提交首条任务；也可 `/switch` 到已有 Session。
 - `bridge.workspace_roots` 定义本地操作安全边界；`ahp.shared_workspaces` 定义 QQ
-  可见的精确目标目录集合。目标目录必须被某个安全根目录覆盖，共同父目录不会隐式包含
-  子目录 Session。
+  兼容的本地精确目标目录，`ahp.authorized_targets` 定义完整的 Local/Remote 目标身份。
+  Local 使用规范化 Windows 路径；Remote 使用 `(ssh alias, canonical POSIX path)`；
+  共同父目录不会隐式包含子目录 Session。
 - Bridge 为所有目标目录中的 Session 分配稳定短码；QQ `/sessions` 同时显示短码、
-  标题、完整目录，以及前台、后台、运行中和未监控状态。`/switch` 返回一次性回调按钮，
-  `/switch <code>` 作为文本兜底，两者都只改变前台指针，不停止旧 Session。
+  标题、完整目录、`local` / `ssh:<alias>`、在线/离线缓存，以及前台、后台、运行中和
+  未监控状态。`/switch` 返回一次性回调按钮，`/switch <code>` 作为文本兜底，两者都只
+  改变前台指针，不停止旧 Session。
+- `/new advanced` 只暴露 Host `resolveSessionConfig` 中可安全映射的模型与审批模式；
+  若还需要其他无默认字段，则显式拒绝并要求回到 PC 创建。
 - 最近活跃 Session 自动加入监控。达到 5 个时，LRU 只能选择非前台、无 active Turn、
   queued message、Pending Adapter command、审批或澄清的 Binding；所有槽位受保护时
-  新 Session 明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。
+  新建、切换或定向发送明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。
 - 目录配置变化、Session 目录变化、过期或已使用的按钮都会 fail-closed。每个 Keyboard
   最多 25 项，最多 4 页。不同通知的“切换到该 Session”按钮使用独立 group，互不失效。
 - `qq-bridge add-workspace` 规范化并去重目录，同时追加安全根和 AHP 目标列表；
   `scripts/add-workspace.ps1` 在确认当前绑定空闲后完成配置和 Bridge/Adapter 重启。
+- `scripts/register-local-target.ps1` / `register-remote-target.ps1` 会在电脑端验证目标、
+  打开对应 VS Code 工作区并等待状态扩展报告 `workspace.isTrusted` 后才持久化授权。
 - 旧的标量 `ahp.shared_workspace` 可读取，配置保存后迁移为
-  `ahp.shared_workspaces = [...]`。
+  `ahp.shared_workspaces = [...]`，并与 Local `ahp.authorized_targets` 同步。
 - PC 或 QQ 首个有效审批/澄清回答生效。QQ 提交后的 Host 终态只确认数据库状态，不重复
   发送“另一端处理”；PC 端终态仍通知 QQ。审批码、问题码和按钮保存来源 Session/Chat，
   前台变化后仍路由回原 Binding。
@@ -66,7 +75,9 @@ flowchart LR
   澄清等待时只停止对应 Session。
 - QQ Keyboard 用于审批和 Boolean/单选问题，文本命令始终作为兜底。
 - Bridge 保存 30 天脱敏事件和 projection outbox；下次 QQ 入站被动回复补发遗漏。
-- VS Code 完全退出时编辑器托管 Host 终止，QQ 不能继续执行。
+- VS Code 完全退出时编辑器托管 Host 终止；Local Standalone Host 可继续执行。
+- Remote SSH 目标通过 Windows `ssh.exe` 按需启动/复用远端默认 Standalone Host，因此
+  仍要求 Windows PC 在线、已登录且 Bridge 正在运行。
 - Host 实例变化时只让受影响 Binding 的进行中 Turn、未决审批、输入和未 ACK 命令
   fail-closed；其他 Host/Session 继续运行。
 - Bridge/Adapter IPC v2 在 ready、failed、event 和 command 上显式携带
@@ -79,6 +90,9 @@ VS Code 1.136 宣告 AHP `0.9.0`，其类型和 reducer 基于 revision
 `a0bc67f840788f816c9b44bb1325181cb4c4661d`，并带有 VS Code stable 的
 registry overlay。公开 npm 0.8 tarball 与该 Host 不完全匹配，因此安装包由
 `scripts/vendor-ahp-client.ps1` 固定 revision 并应用仓库 overlay 后生成。
+
+Local Standalone/Remote SSH 通过 `code agent host` / `code agent endpoints` 接入，
+并且只有在 Host 宣告 vendored 客户端支持的协议版本时才可连接；未知版本继续 fail-closed。
 
 下文第 1–20 节保留最初 Hooks/MCP 设计和安全分析，作为 Legacy 模式与演进记录；
 其“不能从 QQ 创建空闲回合”等结论不适用于当前已绑定的 AHP Session。

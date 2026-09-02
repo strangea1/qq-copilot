@@ -6,7 +6,9 @@ param(
 
     [string]$InstallDirectory = "$env:LOCALAPPDATA\Programs\CopilotQQBridge",
 
-    [string]$ConfigPath = "$env:LOCALAPPDATA\CopilotQQBridge\config.toml"
+    [string]$ConfigPath = "$env:LOCALAPPDATA\CopilotQQBridge\config.toml",
+
+    [switch]$RequireIdle
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,38 @@ if (-not (Test-Path -LiteralPath $Bridge -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Bridge config not found: $ConfigPath"
+}
+if ($RequireIdle) {
+    $StatusOutput = & $Bridge --config $ConfigPath status
+    if ($LASTEXITCODE -ne 0) {
+        throw "The Bridge must be running so its idle state can be verified before restart."
+    }
+    $Status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    $Bindings = @()
+    if ($Status.ahp.bindings) {
+        $Bindings = @($Status.ahp.bindings)
+    }
+    elseif ($Status.ahp.binding) {
+        $Bindings = @($Status.ahp.binding)
+    }
+    $BusyBindings = @($Bindings | Where-Object {
+        $_.active_turn_id -or [int]($_.queued_message_count) -ne 0
+    })
+    if ($BusyBindings.Count -ne 0) {
+        throw "Wait for all active Turns and queued messages to finish before restarting."
+    }
+    if ([int]$Status.ahp.pending_commands -ne 0) {
+        throw "Wait for pending Adapter commands to finish before restarting."
+    }
+    if (
+        [int]($Status.ahp.pending_approvals) -ne 0 -or
+        [int]($Status.ahp.pending_inputs) -ne 0
+    ) {
+        throw "Resolve pending approvals or input requests before restarting."
+    }
+    if ($Status.ahp.creation) {
+        throw "Finish or cancel the current /new workflow before restarting."
+    }
 }
 
 $StatusOutput = & $Bridge --config $ConfigPath status 2>$null
@@ -56,6 +90,9 @@ if ($LASTEXITCODE -eq 0) {
             [int]($Status.ahp.pending_inputs) -ne 0
         ) {
             throw "Wait for pending approvals and clarification inputs to finish before switching integration."
+        }
+        if ($Status.ahp.creation) {
+            throw "Finish or cancel the current /new workflow before switching integration."
         }
     }
 }

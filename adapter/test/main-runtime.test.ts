@@ -47,6 +47,8 @@ const config: AdapterConfig = {
   adapterId: "qq-adapter-test",
   userDataDirectory: "C:\\Users\\tester\\AppData\\Roaming\\Code\\User\\globalStorage",
   pollSeconds: 1,
+  codeExecutable: "C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd",
+  authorizedTargets: [],
 };
 
 class FakeBridgeClient implements BridgeClientLike {
@@ -192,6 +194,10 @@ class FakeCore implements AhpCoreLike {
 
   async stop(): Promise<void> {
     this.stopCount += 1;
+  }
+
+  async refreshEndpoints(): Promise<CatalogueSnapshot> {
+    return this.catalogue;
   }
 
   async bindSession(

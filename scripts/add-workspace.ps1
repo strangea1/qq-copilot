@@ -49,6 +49,9 @@ if (
 ) {
     throw "Wait for pending approvals and clarification inputs to finish before adding a workspace."
 }
+if ($Status.ahp.creation) {
+    throw "Finish or cancel the current /new workflow before adding a workspace."
+}
 
 $Arguments = @("--config", $ConfigPath, "add-workspace")
 foreach ($Path in $Workspace) {
@@ -67,7 +70,8 @@ if ($LASTEXITCODE -ne 0) {
 & $SwitchScript `
     -Mode Ahp `
     -InstallDirectory $InstallDirectory `
-    -ConfigPath $ConfigPath
+    -ConfigPath $ConfigPath `
+    -RequireIdle
 if ($LASTEXITCODE -ne 0) {
     throw "Bridge restart failed with exit code $LASTEXITCODE"
 }

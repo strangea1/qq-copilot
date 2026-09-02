@@ -4,17 +4,18 @@
 
 ## 1. 部署模型
 
-生产模式使用 VS Code 托管的 Agent Host：
+生产模式支持两类 Host：
 
 ```text
-VS Code Agents Window ───────────────┐
-                                     ├── VS Code Agent Host
-QQ Bot ↔ qq-bridge ↔ AHP Adapter ────┘
+VS Code Editor Host / Local Standalone Host / Remote SSH Standalone Host
+QQ Bot ↔ qq-bridge ↔ AHP Adapter
 ```
 
-- VS Code 必须保持运行。
-- QQ 与 VS Code 最多同时共享 5 个已监控的 Agent Host Session；一个作为 QQ 前台，
-  其余可继续后台运行。
+- Local Standalone Host 可在 VS Code 关闭时继续运行。
+- Remote SSH 目标通过 Windows `ssh.exe` 连接并复用远端默认 Standalone Host。
+- Editor Host 随相应 VS Code 窗口退出。
+- QQ 与 PC 最多同时共享 5 个已监控的 Agent Host Session；一个作为 QQ 前台，其余可继续
+  后台运行。QQ 也可新建 Session、自动加入监控并提交首条任务。
 - Bridge、Adapter 和状态栏扩展安装在 Agent 可编辑工作区之外。
 - 旧 Hooks/MCP 链只作为回滚模式。
 
@@ -22,6 +23,8 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter ────┘
 
 - Windows 10/11，推荐使用非管理员标准用户。
 - VS Code 1.136，或已完成兼容测试的后续版本。
+- Local Standalone/Remote SSH 还要求 `code agent host` 宣告当前 vendored 客户端支持的
+  协议版本；未知版本会 fail-closed。
 - GitHub Copilot 已登录。
 - Rust 1.89 或更高版本。
 - Node.js 24.18 或更高版本。
@@ -83,11 +86,12 @@ npm run build --prefix adapter
 npm ci --prefix vscode-extension
 npm run typecheck --prefix vscode-extension
 npm run build --prefix vscode-extension
+npm test --prefix vscode-extension
 ```
 
 ## 6. 安装
 
-示例同时配置两个 QQ 可见的目标目录：
+示例同时配置两个安全根目录，并写入 `code` / `ssh` 可执行路径：
 
 ```powershell
 .\scripts\install.ps1 `
@@ -95,9 +99,10 @@ npm run build --prefix vscode-extension
   -AhpWorkspace "C:\test","C:\src\another-project"
 ```
 
-`-Workspace` 设置安全允许根目录，`-AhpWorkspace` 设置 QQ 可见的精确目标目录。每个
-AHP 目标目录也会自动加入安全允许根目录。升级已有安装时，应向 `-AhpWorkspace`
-传入希望保留的完整目标目录列表；该参数会重设 AHP 目标列表，而不是只追加本次参数。
+`-Workspace` 设置安全允许根目录；`-AhpWorkspace` 仍可兼容写入本地目标列表，但新的目标授权
+推荐在安装完成后通过注册脚本执行 Trust 流程。安装器会把
+`ahp.code_executable`（原生 `code-tunnel.exe`）、`ahp.code_launcher`
+（用于打开 Trust UI）和 `ahp.ssh_executable` 一并写入配置。
 
 读取旧配置后，单值 `ahp.shared_workspace` 会在下一次保存时自动迁移为：
 
@@ -190,51 +195,52 @@ Developer: Reload Window
 QQ AHP 已连接
 ```
 
-## 10. 增加目标目录并绑定 Session
+## 10. 注册本地与 Remote SSH 目标
 
-安装后增加目录时，使用托管脚本完成路径规范化、存在性校验、配置去重、安全空闲检查和
-Bridge/Adapter 重启。`-Workspace` 接受一个或多个目录：
+本地目标必须在电脑端完成注册，并等待状态扩展回报当前精确文件夹已 Trusted：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\add-workspace.ps1" `
-  -Workspace "C:\src\project-a","C:\src\project-b"
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\register-local-target.ps1" `
+  -Workspace "C:\src\project-a"
 ```
 
 目标目录按精确路径匹配；只添加共同父目录不会展示其子目录中的 Session。脚本要求
 Bridge 正在运行且已配置 AHP，并会拒绝在任一 Binding 存在活动 Turn、排队消息、
 Pending 审批/澄清或 Adapter 命令时重启。
 
-只需要写入配置并稍后手动重启时，可运行：
+Remote SSH 目标要求现有 `~/.ssh/config` Host alias、`BatchMode=yes` 可用、只接受 Linux
+远端，并会校验 `code agent host` / `code agent endpoints`、远端规范路径和 Linux SSH
+Host 公钥指纹。指纹变化后必须在电脑端重新注册：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" `
-  add-workspace `
-  --workspace "C:\src\project-a" `
-  --workspace "C:\src\project-b"
-
-& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\switch-vscode-integration.ps1" `
-  -Mode Ahp
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\register-remote-target.ps1" `
+  -SshAlias "devbox" `
+  -Workspace "/home/user/project"
 ```
 
-1. 运行 `code --agents`。
-2. 在 Agents Window 新建 Copilot Session。
-3. 工作目录选择任一 `ahp.shared_workspaces` 精确目标目录。
-4. 提交并完成至少一轮消息。
-5. 列出 Session：
+若同一 alias 的指纹与已授权记录不同，注册会在运行任何远端 `code agent` 命令前拒绝。
+确认主机更换无误后，先用 `remove-target.ps1` 删除旧授权，再重新注册并完成 Trust。
+
+移除目标：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" ahp-sessions
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\scripts\remove-target.ps1" `
+  -LocalWorkspace "C:\src\project-a"
 ```
 
-6. 使用输出中的精确 endpoint ID 和 Session URI 绑定：
+注册脚本默认会在成功后重启 Bridge/Adapter 以载入新配置。
 
-```powershell
-& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" ahp-bind `
-  --endpoint <endpoint-id> `
-  --session <session-uri>
+## 11. 从 QQ 创建新 Session
+
+```text
+/new
+  -> 目标按钮
+  -> 发送首条任务
+  -> 自动创建 / 绑定 / 首发任务
 ```
 
-绑定完成后，QQ 发送普通文本即可进入同一个 Session。
+`/new advanced` 会在目标之后增加模型和审批模式选择，但只暴露 Host
+`resolveSessionConfig` 中可安全映射、且不需要额外 PC 输入的字段。
 
 QQ `/sessions` 的示例输出：
 
@@ -245,7 +251,7 @@ AHP Sessions（最多后台监控 5 个）:
   A7K2P | 新任务 | D:\work\vscode\project-c | 未监控 · 空闲
 ```
 
-## 11. 多 Session 路由
+## 12. 多 Session 路由与切换
 
 QQ 中发送：
 
@@ -253,9 +259,10 @@ QQ 中发送：
 /switch
 ```
 
-Bot 会同时展示所有目标目录内的 Session、完整所在目录，以及前台、后台、运行中和
-未监控状态。`/switch` 只改变 QQ 普通文本和语音的默认路由，不会停止旧 Session，
-当前或目标 Session 正在运行时也可以切换前台。
+Bot 会同时展示所有目标目录内的 Session、完整所在目录、`local` / `ssh:<alias>` 和在线/
+离线缓存状态，以及前台、后台、运行中和未监控状态。`/switch` 只改变 QQ 普通文本和语音
+的默认路由，不会停止旧 Session，当前或目标 Session 正在运行时也可以切换前台。对于尚未
+监控或仅缓存的远端 Session，Adapter 会先连接精确目标、刷新目录并安全分配 Binding。
 
 常用命令：
 
@@ -279,7 +286,7 @@ Session 不会显示，也不能通过旧按钮切换。Assistant 过程段会�
 同一个精确工作区出现第二个活动 Turn 时，Bridge 会警告潜在文件/Git 索引冲突，但不会
 阻断执行。有写操作的并发任务应使用独立 Git worktree。
 
-## 12. QQ 命令
+## 13. QQ 命令
 
 ```text
 普通文本
@@ -401,7 +408,7 @@ pending projection 数量。
 
 - 确保使用独立 Agents Window，而不是普通 Chat 面板。
 - 确保 Session 完成过至少一轮消息。
-- 确保 Session 工作目录与 `ahp.shared_workspaces` 中某个目标目录精确一致。
+- 确保 Session 工作目录与 `ahp.authorized_targets`（本地目标会同步写回 `ahp.shared_workspaces`）中的某个目标精确一致。
 - 不要只配置共同父目录；每个实际 Session 目录都需要单独加入目标列表。
 - 运行 `qq-bridge ahp-sessions`，确认 Adapter 已发现该 Session 及其 `workspace_uris`。
 - 新增目录后若使用的是 `qq-bridge add-workspace`，需要重启 Bridge/Adapter。

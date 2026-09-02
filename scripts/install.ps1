@@ -107,6 +107,9 @@ $ManagedScriptsDirectory = Join-Path $InstallDirectory "scripts"
 New-Item -ItemType Directory -Path $ManagedScriptsDirectory -Force | Out-Null
 foreach ($ManagedScript in @(
     "add-workspace.ps1",
+    "register-local-target.ps1",
+    "register-remote-target.ps1",
+    "remove-target.ps1",
     "switch-vscode-integration.ps1",
     "register-startup.ps1"
 )) {
@@ -117,6 +120,36 @@ foreach ($ManagedScript in @(
 }
 
 $NodeCommand = Get-Command node.exe -ErrorAction Stop
+$CodeLauncher = Get-Command code.cmd -ErrorAction SilentlyContinue
+if ($null -eq $CodeLauncher) {
+    $CodeLauncher = Get-Command code.exe -ErrorAction SilentlyContinue
+}
+if ($null -eq $CodeLauncher) {
+    throw "VS Code launcher was not found on PATH (code.cmd/code.exe)."
+}
+$CodeCommand = Get-Command code-tunnel.exe -ErrorAction SilentlyContinue
+if ($null -eq $CodeCommand) {
+    $CodeCommand = Get-ChildItem `
+        -LiteralPath (Split-Path -Parent $CodeLauncher.Source) `
+        -Filter "code-tunnel.exe" `
+        -File `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+}
+if ($null -eq $CodeCommand) {
+    throw "Native VS Code Agent Host CLI code-tunnel.exe was not found."
+}
+$CodeCommandPath = [string]$CodeCommand.Source
+if ([string]::IsNullOrWhiteSpace($CodeCommandPath)) {
+    $CodeCommandPath = [string]$CodeCommand.FullName
+}
+if ([string]::IsNullOrWhiteSpace($CodeCommandPath)) {
+    throw "Native VS Code Agent Host CLI path could not be resolved."
+}
+$SshCommand = Get-Command ssh.exe -ErrorAction SilentlyContinue
+if ($null -eq $SshCommand) {
+    throw "OpenSSH ssh.exe was not found on PATH."
+}
 $NodeVersion = (& $NodeCommand.Source --version).TrimStart("v")
 $NodeMajor = [int]($NodeVersion.Split(".")[0])
 if ($NodeMajor -lt 24) {
@@ -196,7 +229,10 @@ if ($ResolvedAhpWorkspaces.Count -gt 0) {
     }
     $ConfigureAhpArgs += @(
         "--node", $NodeCommand.Source,
-        "--adapter-script", (Join-Path $AdapterDirectory "dist\main.js")
+        "--adapter-script", (Join-Path $AdapterDirectory "dist\main.js"),
+        "--code", $CodeCommandPath,
+        "--code-launcher", $CodeLauncher.Source,
+        "--ssh", $SshCommand.Source
     )
     & $Bridge @ConfigureAhpArgs
     if ($LASTEXITCODE -ne 0) {
@@ -275,7 +311,8 @@ Write-Host "VS Code status extension: $StatusExtensionSource"
 Write-Host "Next: set qq.app_id, run qq-bridge store-secret, then start qq-bridge run."
 if ($ResolvedAhpWorkspaces.Count -gt 0) {
     Write-Host "Next: run scripts\switch-vscode-integration.ps1 -Mode Ahp, reload VS Code,"
-    Write-Host "then create/list/bind an Agents Window Session in a target workspace."
+    Write-Host "then register each trusted local target with scripts\register-local-target.ps1."
+    Write-Host "Remote SSH targets use scripts\register-remote-target.ps1 after VS Code Remote SSH trust is confirmed."
 }
 else {
     Write-Host "Legacy mode: register mcp.json, copy qq-remote.agent.md to ~/.copilot/agents,"

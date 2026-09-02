@@ -86,6 +86,8 @@ pub enum BridgeRequest {
         adapter_instance_id: String,
         hosts: Vec<AhpHostDescriptor>,
         sessions: Vec<AhpSessionDescriptor>,
+        #[serde(default = "default_true")]
+        full_snapshot: bool,
     },
     AhpBindingReady {
         adapter_id: String,
@@ -117,12 +119,21 @@ pub enum BridgeRequest {
         adapter_instance_id: String,
         timeout_seconds: u64,
     },
+    AhpCommandProgress {
+        adapter_id: String,
+        adapter_instance_id: String,
+        command_id: i64,
+        progress: u64,
+        total: Option<u64>,
+        message: Option<String>,
+    },
     AhpAckCommand {
         adapter_id: String,
         adapter_instance_id: String,
         command_id: i64,
         outcome: AhpCommandOutcome,
         error_code: Option<String>,
+        result: Option<Value>,
     },
     AhpSessions,
     AhpBindSession {
@@ -130,6 +141,10 @@ pub enum BridgeRequest {
         session_uri: String,
     },
     AhpUnbindSession,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +163,20 @@ pub struct AhpHostDescriptor {
     pub advertised_protocol: String,
     pub selected_protocol: Option<String>,
     pub state: AhpHostState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<AhpTargetKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_client_tools_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +199,95 @@ impl AhpHostState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AhpTargetKind {
+    Local,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AhpManagedTarget {
+    Local {
+        path: String,
+    },
+    Ssh {
+        alias: String,
+        path: String,
+        user: String,
+        host: String,
+        port: u16,
+        host_key_fingerprints: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpSessionConfigOption {
+    pub value: Value,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpSupportedSessionField {
+    pub property: String,
+    pub options: Vec<AhpSessionConfigOption>,
+    pub selected: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpPrepareTargetCommand {
+    pub target: AhpManagedTarget,
+    pub advanced: bool,
+    #[serde(default)]
+    pub retain_connection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpPrepareTargetResult {
+    pub endpoint_id: String,
+    pub host_instance_id: String,
+    pub provider: String,
+    pub workspace_uri: String,
+    pub host_label: String,
+    pub editor_client_tools_available: bool,
+    pub resolved_values: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<AhpSupportedSessionField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<AhpSupportedSessionField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCreateSessionCommand {
+    pub target: AhpManagedTarget,
+    pub provider: String,
+    pub session_uri: String,
+    pub workspace_uri: String,
+    pub resolved_values: Value,
+    pub overrides: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpCreateSessionResult {
+    pub endpoint_id: String,
+    pub host_instance_id: String,
+    pub workspace_uri: String,
+    pub host_label: String,
+    pub editor_client_tools_available: bool,
+    pub session: AhpSessionDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpDisposeSessionCommand {
+    pub target: AhpManagedTarget,
+    pub session_uri: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpSessionDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +301,20 @@ pub struct AhpSessionDescriptor {
     pub workspace_uris: Vec<String>,
     pub created_at: String,
     pub modified_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<AhpTargetKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_client_tools_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_state: Option<AhpHostState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +391,9 @@ pub enum AhpCommandKind {
     ApproveTool,
     ReviewToolResult,
     CompleteInput,
+    PrepareTarget,
+    CreateSession,
+    DisposeSession,
 }
 
 impl AhpCommandKind {
@@ -271,6 +406,9 @@ impl AhpCommandKind {
             Self::ApproveTool => "approve_tool",
             Self::ReviewToolResult => "review_tool_result",
             Self::CompleteInput => "complete_input",
+            Self::PrepareTarget => "prepare_target",
+            Self::CreateSession => "create_session",
+            Self::DisposeSession => "dispose_session",
         }
     }
 }
@@ -287,6 +425,9 @@ impl TryFrom<&str> for AhpCommandKind {
             "approve_tool" => Ok(Self::ApproveTool),
             "review_tool_result" => Ok(Self::ReviewToolResult),
             "complete_input" => Ok(Self::CompleteInput),
+            "prepare_target" => Ok(Self::PrepareTarget),
+            "create_session" => Ok(Self::CreateSession),
+            "dispose_session" => Ok(Self::DisposeSession),
             other => Err(format!("unknown AHP command kind {other}")),
         }
     }
@@ -324,6 +465,16 @@ pub struct AhpBindingRecord {
     pub queued_message_count: u32,
     pub last_activity_at: i64,
     pub foreground: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<AhpTargetKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_client_tools_available: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

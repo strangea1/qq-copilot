@@ -26,14 +26,32 @@ import {
   type AdapterConfig,
 } from "./config.js";
 import {
+  connectManagedTarget,
+  createManagedSession,
+  disposeManagedSession,
+  prepareTargetResult,
+  refreshManagedSessions,
+  type ConnectedManagedTarget,
+  type ManagedTarget,
+  type PrepareTargetResult,
+} from "./managed-target.js";
+import {
   AhpEventNormalizer,
   type PublishedEvent,
 } from "./event-normalizer.js";
+import {
+  discoverEditorEndpoints,
+  endpointPublicId,
+  watchEditorEndpoints,
+  type WatchEditorEndpointsOptions,
+} from "./endpoint-registry.js";
 import { buildInputCompletion } from "./input-completion.js";
+import type { EndpointRegistryEntry } from "./endpoint-registry.js";
 
 const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
 const RETRY_DELAY_MS = 1_000;
+const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 
 export interface BridgeBinding {
   readonly binding_id: string;
@@ -44,6 +62,11 @@ export interface BridgeBinding {
   readonly chat_uri?: string;
   readonly state: string;
   readonly last_server_sequence: number;
+  readonly host_label?: string;
+  readonly ssh_alias?: string;
+  readonly target_kind?: "local" | "ssh";
+  readonly target_path?: string;
+  readonly editor_client_tools_available?: boolean;
 }
 
 export interface RegisterResult {
@@ -63,7 +86,10 @@ export interface AdapterCommand {
     | "cancel_turn"
     | "approve_tool"
     | "review_tool_result"
-    | "complete_input";
+    | "complete_input"
+    | "prepare_target"
+    | "create_session"
+    | "dispose_session";
   readonly data: unknown;
 }
 
@@ -101,12 +127,20 @@ export interface AhpCoreLike {
   readonly catalogue: CatalogueSnapshot;
   start(): Promise<CatalogueSnapshot | void>;
   stop(): Promise<void>;
+  refreshEndpoints(): Promise<CatalogueSnapshot>;
   bindSession(endpointId: string, sessionUri: string): Promise<AhpSessionBinding>;
 }
 
 export interface RuntimeDependencies {
   readonly createBridgeClient?: (config: AdapterConfig) => BridgeClientLike;
   readonly createCore?: (options: AhpCoreOptions) => AhpCoreLike;
+}
+
+interface ManagedEntryState {
+  readonly key: string;
+  readonly target: ManagedTarget;
+  readonly entry: EndpointRegistryEntry;
+  readonly prepared: ConnectedManagedTarget["prepared"];
 }
 
 class SerialQueue {
@@ -135,6 +169,8 @@ export class AdapterRuntime {
 
   readonly #events = new Map<string, Map<string, PublishedEvent>>();
 
+  readonly #managedEntries = new Map<string, ManagedEntryState>();
+
   readonly #bindings = new Map<string, ActiveBinding>();
 
   readonly #pendingBindings = new Map<string, PendingBinding>();
@@ -143,12 +179,21 @@ export class AdapterRuntime {
 
   readonly #readOnlyEndpoints = new Set<string>();
 
+  readonly #restoreBindings = new Map<string, BridgeBinding>();
+
+  readonly #restoreManagedTargets = new Map<string, ManagedTarget>();
+
+  readonly #restoringBindings = new Set<string>();
+
+  #restoreRetryTimer: NodeJS.Timeout | undefined;
+
   #stopping = false;
 
   constructor(
     config: AdapterConfig,
     dependencies: RuntimeDependencies = {},
   ) {
+    const runtime = this;
     this.#config = config;
     this.#bridge =
       dependencies.createBridgeClient?.(config) ??
@@ -158,6 +203,26 @@ export class AdapterRuntime {
       clientId: config.adapterId,
       locale: "zh-CN",
       watch: true,
+      dependencies: {
+        discoverEndpoints: async (userDataDirectory) => [
+          ...(await discoverEditorEndpoints(userDataDirectory)),
+          ...[...this.#managedEntries.values()].map((entry) => entry.entry),
+        ],
+        watchEndpoints: async function* (
+          userDataDirectory: string,
+          options?: WatchEditorEndpointsOptions,
+        ) {
+          for await (const entries of watchEditorEndpoints(
+            userDataDirectory,
+            options,
+          )) {
+            yield [
+              ...entries,
+              ...[...runtime.#managedEntries.values()].map((entry) => entry.entry),
+            ];
+          }
+        },
+      },
       callbacks: {
         onCatalogue: (snapshot) => {
           this.#callbackQueue.run(() => this.#publishCatalogue(snapshot));
@@ -199,19 +264,38 @@ export class AdapterRuntime {
         },
       }),
     );
-    await this.#core.start();
-    await this.#publishCatalogue(this.#core.catalogue);
     for (const binding of registration.bindings) {
       if (binding.state !== "binding" && binding.state !== "bound") {
         continue;
       }
-      await this.#activateBinding(binding).catch((error) => {
-        safeLog("warn", "Failed to restore AHP binding", {
-          bindingId: binding.binding_id,
+      this.#restoreBindings.set(binding.binding_id, binding);
+      const target = managedTargetFromBinding(
+        binding,
+        this.#config.authorizedTargets,
+      );
+      if (target) {
+        this.#restoreManagedTargets.set(binding.binding_id, target);
+      }
+    }
+    const preparedTargets = new Set<string>();
+    for (const [bindingId, target] of this.#restoreManagedTargets) {
+      const targetKey = managedTargetKey(target);
+      if (preparedTargets.has(targetKey)) {
+        continue;
+      }
+      try {
+        await this.#prepareManagedBindingTarget(target);
+        preparedTargets.add(targetKey);
+      } catch (error) {
+        safeLog("warn", "Failed to prepare managed AHP target during restore", {
+          bindingId,
           code: errorCode(error),
         });
-      });
+      }
     }
+    await this.#core.start();
+    await this.#publishCatalogue(this.#core.catalogue);
+    await this.#tryRestoreBindings();
 
     while (!signal.aborted) {
       try {
@@ -247,6 +331,10 @@ export class AdapterRuntime {
       return;
     }
     this.#stopping = true;
+    if (this.#restoreRetryTimer) {
+      clearTimeout(this.#restoreRetryTimer);
+      this.#restoreRetryTimer = undefined;
+    }
     await this.#callbackQueue.drain();
 
     let failure: unknown;
@@ -259,6 +347,9 @@ export class AdapterRuntime {
     const bindings = [...this.#bindings.values()];
     this.#bindings.clear();
     this.#pendingBindings.clear();
+    this.#restoreBindings.clear();
+    this.#restoreManagedTargets.clear();
+    this.#restoringBindings.clear();
     this.#events.clear();
     this.#eventFlushes.clear();
 
@@ -273,6 +364,13 @@ export class AdapterRuntime {
     } catch (error) {
       failure ??= error;
     }
+
+    for (const entry of this.#managedEntries.values()) {
+      if (entry.prepared.tunnel && !entry.prepared.tunnel.killed) {
+        entry.prepared.tunnel.kill();
+      }
+    }
+    this.#managedEntries.clear();
 
     if (failure !== undefined) {
       throw failure;
@@ -291,7 +389,13 @@ export class AdapterRuntime {
       return;
     }
     try {
-      if (command.kind !== "bind_session" && command.kind !== "unbind_session") {
+      if (
+        command.kind === "send_message" ||
+        command.kind === "cancel_turn" ||
+        command.kind === "approve_tool" ||
+        command.kind === "review_tool_result" ||
+        command.kind === "complete_input"
+      ) {
         const active = this.#requireBinding(command);
         if (this.#readOnlyEndpoints.has(active.endpointId)) {
           throw new AhpOperationError(
@@ -302,19 +406,23 @@ export class AdapterRuntime {
       }
       switch (command.kind) {
         case "bind_session":
+          this.#clearPendingRestore(command.binding_id);
           await this.#activateBinding(parseBindingCommand(command));
           break;
         case "unbind_session":
+          this.#clearPendingRestore(command.binding_id);
           await this.#unbindBinding(command);
+          await this.#pruneManagedEntries();
           break;
         case "send_message": {
           const data = requireRecord(command.data);
           const content = requireString(data.content, "content");
-          await this.#requireBinding(command).binding.queueUserText(
+          const result = await this.#requireBinding(command).binding.queueUserText(
             content,
             command.command_id,
           );
-          break;
+          await this.#ack(command.command_id, "applied", undefined, result);
+          return;
         }
         case "cancel_turn":
           await this.#requireBinding(command).binding.cancelActiveTurn(
@@ -356,6 +464,19 @@ export class AdapterRuntime {
           );
           break;
         }
+        case "prepare_target": {
+          const result = await this.#prepareTarget(command);
+          await this.#ack(command.command_id, "applied", undefined, result);
+          return;
+        }
+        case "create_session": {
+          const result = await this.#createSession(command);
+          await this.#ack(command.command_id, "applied", undefined, result);
+          return;
+        }
+        case "dispose_session":
+          await this.#disposeSession(command);
+          break;
         default:
           throw new AhpOperationError(
             "invalid-command",
@@ -568,6 +689,301 @@ export class AdapterRuntime {
     });
   }
 
+  async #tryRestoreBindings(): Promise<void> {
+    if (this.#stopping) {
+      return;
+    }
+    for (const [bindingId, binding] of [...this.#restoreBindings]) {
+      if (
+        this.#bindings.has(bindingId) ||
+        this.#pendingBindings.has(bindingId) ||
+        this.#restoringBindings.has(bindingId)
+      ) {
+        continue;
+      }
+      this.#restoringBindings.add(bindingId);
+      try {
+        const target = this.#restoreManagedTargets.get(bindingId);
+        if (target) {
+          if (!this.#managedEntries.has(managedTargetKey(target))) {
+            await this.#prepareManagedBindingTarget(target);
+          } else {
+            await this.#core.refreshEndpoints();
+          }
+          this.#restoreManagedTargets.delete(bindingId);
+        }
+        const endpoint = this.#core.catalogue.endpoints.find(
+          (entry) =>
+            entry.endpoint.id === binding.endpoint_id &&
+            entry.endpoint.instanceId === binding.host_instance_id &&
+            entry.connection === "connected",
+        );
+        if (!endpoint) {
+          continue;
+        }
+        await this.#activateBinding(binding);
+        this.#restoreBindings.delete(bindingId);
+        this.#restoreManagedTargets.delete(bindingId);
+      } catch (error) {
+        safeLog("warn", "Failed to prepare or restore AHP binding", {
+          bindingId,
+          code: errorCode(error),
+        });
+      } finally {
+        this.#restoringBindings.delete(bindingId);
+      }
+    }
+    this.#scheduleRestoreRetry();
+  }
+
+  #scheduleRestoreRetry(): void {
+    if (
+      this.#restoreRetryTimer ||
+      this.#restoreBindings.size === 0 ||
+      this.#stopping
+    ) {
+      return;
+    }
+    this.#restoreRetryTimer = setTimeout(() => {
+      this.#restoreRetryTimer = undefined;
+      this.#callbackQueue.run(() => this.#tryRestoreBindings());
+    }, RETRY_DELAY_MS);
+    this.#restoreRetryTimer.unref();
+  }
+
+  #clearPendingRestore(bindingId: string): void {
+    this.#restoreBindings.delete(bindingId);
+    this.#restoreManagedTargets.delete(bindingId);
+    this.#restoringBindings.delete(bindingId);
+    if (this.#restoreBindings.size === 0 && this.#restoreRetryTimer) {
+      clearTimeout(this.#restoreRetryTimer);
+      this.#restoreRetryTimer = undefined;
+    }
+  }
+
+  async #prepareTarget(command: AdapterCommand): Promise<PrepareTargetResult> {
+    const data = requireRecord(command.data);
+    const target = parseManagedTarget(data.target);
+    const advanced =
+      "advanced" in data ? requireBoolean(data.advanced, "advanced") : false;
+    const retainConnection =
+      "retain_connection" in data
+        ? requireBoolean(data.retain_connection, "retain_connection")
+        : false;
+    const currentConfig =
+      "config" in data ? requireRecord(data.config, "config") : {};
+    const connection = await connectManagedTarget(this.#config, target);
+    const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
+    let retained = false;
+    try {
+      const result = await prepareTargetResult(
+        connection,
+        advanced,
+        currentConfig,
+      );
+      if (retainConnection) {
+        await this.#publishManagedCatalogue(connection);
+        await this.#retainManagedPrepared(target, connection.prepared);
+        retained = true;
+      }
+      return result;
+    } finally {
+      if (retained) {
+        await connection.client.shutdown().catch(() => undefined);
+      } else {
+        await connection.close().catch(() => undefined);
+        if (!alreadyRetained) {
+          await this.#publishManagedCatalogue(
+            connection,
+            connection.sessions,
+            "unreachable",
+          );
+        }
+      }
+    }
+  }
+
+  async #prepareManagedBindingTarget(target: ManagedTarget): Promise<void> {
+    const connection = await connectManagedTarget(this.#config, target);
+    try {
+      await this.#publishManagedCatalogue(connection);
+      await this.#retainManagedPrepared(target, connection.prepared);
+      await connection.client.shutdown().catch(() => undefined);
+    } catch (error) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #createSession(command: AdapterCommand): Promise<Record<string, unknown>> {
+    const data = requireRecord(command.data);
+    const target = parseManagedTarget(data.target);
+    const provider = requireString(data.provider, "provider");
+    const sessionUri = requireString(data.session_uri, "session_uri");
+    const workspaceUri = requireString(data.workspace_uri, "workspace_uri");
+    const resolvedValues = requireRecord(data.resolved_values, "resolved_values");
+    const overrides = requireRecord(data.overrides, "overrides");
+    const connection = await connectManagedTarget(
+      this.#config,
+      target,
+      async (progress) => {
+        await this.#bridge.call({
+          operation: "ahp_command_progress",
+          adapter_id: this.#config.adapterId,
+          adapter_instance_id: this.#adapterInstanceId,
+          command_id: command.command_id,
+          progress: progress.progress,
+          ...(progress.total !== undefined ? { total: progress.total } : {}),
+          ...(progress.message ? { message: progress.message } : {}),
+        });
+      },
+    );
+    try {
+      const result = await createManagedSession(connection, {
+        provider,
+        sessionUri,
+        workspaceUri,
+        resolvedValues,
+        overrides,
+      });
+      const sessions = await refreshManagedSessions(connection.client);
+      await this.#publishManagedCatalogue(connection, sessions);
+      await this.#retainManagedPrepared(target, connection.prepared);
+      await connection.client.shutdown().catch(() => undefined);
+      return {
+        endpoint_id: result.endpoint_id,
+        host_instance_id: result.host_instance_id,
+        workspace_uri: result.workspace_uri,
+        host_label: result.host_label,
+        editor_client_tools_available: result.editor_client_tools_available,
+        session: toBridgeSession(connection.prepared, target, result.session),
+      };
+    } catch (error) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async #disposeSession(command: AdapterCommand): Promise<void> {
+    const data = requireRecord(command.data);
+    const target = parseManagedTarget(data.target);
+    const sessionUri = requireString(data.session_uri, "session_uri");
+    const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
+    const connection = await connectManagedTarget(this.#config, target);
+    try {
+      await disposeManagedSession(connection, sessionUri);
+      const sessions = await refreshManagedSessions(connection.client);
+      await this.#publishManagedCatalogue(
+        connection,
+        sessions,
+        alreadyRetained ? "connected" : "unreachable",
+      );
+    } finally {
+      await connection.close().catch(() => undefined);
+    }
+  }
+
+  async #retainManagedPrepared(
+    target: ManagedTarget,
+    prepared: ConnectedManagedTarget["prepared"],
+  ): Promise<void> {
+    const key = managedTargetKey(target);
+    const previous = this.#managedEntries.get(key);
+    this.#managedEntries.set(key, {
+      key,
+      target,
+      entry: prepared.entry,
+      prepared,
+    });
+    try {
+      await this.#core.refreshEndpoints();
+    } catch (error) {
+      if (previous) {
+        this.#managedEntries.set(key, previous);
+      } else {
+        this.#managedEntries.delete(key);
+      }
+      if (prepared.tunnel && !prepared.tunnel.killed) {
+        prepared.tunnel.kill();
+      }
+      await this.#core.refreshEndpoints().catch(() => undefined);
+      throw error;
+    }
+    if (
+      previous?.prepared !== prepared &&
+      previous?.prepared.tunnel &&
+      !previous.prepared.tunnel.killed
+    ) {
+      previous.prepared.tunnel.kill();
+    }
+  }
+
+  async #pruneManagedEntries(): Promise<void> {
+    let changed = false;
+    for (const [key, entry] of [...this.#managedEntries.entries()]) {
+      const endpointId = endpointPublicId(entry.entry);
+      if (
+        [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
+          (binding) => binding.endpointId === endpointId,
+        ) ||
+        [...this.#restoreBindings.values()].some(
+          (binding) => binding.endpoint_id === endpointId,
+        )
+      ) {
+        continue;
+      }
+      if (entry.prepared.tunnel && !entry.prepared.tunnel.killed) {
+        entry.prepared.tunnel.kill();
+      }
+      this.#managedEntries.delete(key);
+      changed = true;
+    }
+    if (changed) {
+      await this.#core.refreshEndpoints();
+    }
+  }
+
+  async #publishManagedCatalogue(
+    connection: ConnectedManagedTarget,
+    sessions = connection.sessions,
+    hostState: "connected" | "unreachable" = "connected",
+  ): Promise<void> {
+    const { prepared } = connection;
+    const target = prepared.target;
+    await this.#bridge.call({
+      operation: "ahp_catalog_replace",
+      adapter_id: this.#config.adapterId,
+      adapter_instance_id: this.#adapterInstanceId,
+      hosts: [
+        {
+          endpoint_id: prepared.endpointId,
+          host_instance_id: prepared.entry.instanceId,
+          pid: prepared.entry.pid,
+          advertised_protocol: prepared.entry.protocolVersion,
+          selected_protocol: prepared.entry.protocolVersion,
+          state: hostState,
+          host_label: prepared.hostLabel,
+          ...(target.kind === "ssh"
+            ? {
+                ssh_alias: target.alias,
+                target_kind: "ssh",
+                target_path: target.path,
+              }
+            : {
+                target_kind: "local",
+                target_path: target.path,
+              }),
+          endpoint_type: prepared.entry.endpoint.type,
+          editor_client_tools_available: prepared.editorClientToolsAvailable,
+        },
+      ],
+      sessions: sessions.map((session) =>
+        toBridgeSession(prepared, target, session),
+      ),
+      full_snapshot: false,
+    });
+  }
+
   #onSessionSnapshot(event: SessionSnapshotEvent): void {
     const binding = this.#matchSessionBinding(event.endpointId, event.sessionUri);
     if (!binding) {
@@ -653,9 +1069,12 @@ export class AdapterRuntime {
     if (
       event.status === "connected" &&
       event.selectedProtocol &&
-      SUPPORTED_PROTOCOL_VERSIONS.includes(event.selectedProtocol)
+      NEGOTIATED_PROTOCOL_VERSIONS.includes(event.selectedProtocol)
     ) {
       this.#readOnlyEndpoints.delete(event.endpoint.id);
+      if (this.#restoreBindings.size > 0) {
+        this.#callbackQueue.run(() => this.#tryRestoreBindings());
+      }
     }
     if (event.status !== "disconnected") {
       return;
@@ -804,47 +1223,81 @@ export class AdapterRuntime {
   }
 
   async #publishCatalogue(snapshot: CatalogueSnapshot): Promise<void> {
-    const hosts = snapshot.endpoints.map((entry) => ({
-      endpoint_id: entry.endpoint.id,
-      host_instance_id: entry.endpoint.instanceId,
-      pid: entry.endpoint.pid,
-      advertised_protocol: entry.endpoint.advertisedProtocol,
-      selected_protocol: entry.selectedProtocol,
-      state:
-        entry.connection === "connected"
-          ? !this.#readOnlyEndpoints.has(entry.endpoint.id)
-            ? "connected"
-            : "read_only"
-          : entry.connection === "incompatible"
-            ? "incompatible"
-            : "unreachable",
-    }));
-    const sessions = snapshot.endpoints.flatMap((entry) =>
-      entry.sessions.map((session) => ({
+    const hosts = snapshot.endpoints.map((entry) => {
+      const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
+      return {
         endpoint_id: entry.endpoint.id,
         host_instance_id: entry.endpoint.instanceId,
-        session_uri: session.resource,
-        provider: session.provider,
-        title: session.title,
-        status: session.status,
-        workspace_uris: session.workingDirectories ?? [],
-        created_at: session.createdAt,
-        modified_at: session.modifiedAt,
-      })),
-    );
+        pid: entry.endpoint.pid,
+        advertised_protocol: entry.endpoint.advertisedProtocol,
+        selected_protocol: entry.selectedProtocol,
+        state:
+          entry.connection === "connected"
+            ? !this.#readOnlyEndpoints.has(entry.endpoint.id)
+              ? "connected"
+              : "read_only"
+            : entry.connection === "incompatible"
+              ? "incompatible"
+              : "unreachable",
+        host_label: managed?.prepared.hostLabel ?? "local",
+        ...(managed?.target.kind === "ssh"
+          ? {
+              ssh_alias: managed.target.alias,
+              target_kind: "ssh",
+              target_path: managed.target.path,
+            }
+          : managed
+            ? {
+                target_kind: "local",
+                target_path: managed.target.path,
+              }
+            : {}),
+        endpoint_type: managed?.entry.endpoint.type ?? "socket",
+        editor_client_tools_available:
+          managed?.prepared.editorClientToolsAvailable ?? true,
+      };
+    });
+    const sessions = snapshot.endpoints.flatMap((entry) => {
+      const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
+      return entry.sessions.map((session) =>
+        managed
+          ? toBridgeSession(managed.prepared, managed.target, session)
+          : {
+              endpoint_id: entry.endpoint.id,
+              host_instance_id: entry.endpoint.instanceId,
+              session_uri: session.resource,
+              provider: session.provider,
+              title: session.title,
+              status: session.status,
+              workspace_uris: session.workingDirectories ?? [],
+              created_at: session.createdAt,
+              modified_at: session.modifiedAt,
+              host_label: "local",
+              editor_client_tools_available: true,
+            },
+      );
+    });
     await this.#bridge.call({
       operation: "ahp_catalog_replace",
       adapter_id: this.#config.adapterId,
       adapter_instance_id: this.#adapterInstanceId,
       hosts,
       sessions,
+      full_snapshot: true,
     });
+  }
+
+  #managedEntryByEndpointId(endpointId: string): ManagedEntryState | undefined {
+    return [...this.#managedEntries.values()].find(
+      (entry) => endpointPublicId(entry.entry) === endpointId,
+    );
   }
 
   async #ack(
     commandId: number,
     outcome: "applied" | "rejected" | "failed",
     error?: string,
+    result?: unknown,
   ): Promise<void> {
     await this.#bridge.call({
       operation: "ahp_ack_command",
@@ -853,6 +1306,7 @@ export class AdapterRuntime {
       command_id: commandId,
       outcome,
       error_code: error,
+      ...(result !== undefined ? { result } : {}),
     });
   }
 }
@@ -882,6 +1336,24 @@ function parseBridgeBinding(value: unknown): BridgeBinding {
     "host_instance_id",
   );
   const chatUri = requireOptionalPlainString(data.chat_uri, "chat_uri");
+  const hostLabel = requireOptionalPlainString(data.host_label, "host_label");
+  const sshAlias = requireOptionalPlainString(data.ssh_alias, "ssh_alias");
+  const rawTargetKind = requireOptionalPlainString(data.target_kind, "target_kind");
+  let targetKind: "local" | "ssh" | undefined;
+  if (rawTargetKind === "local" || rawTargetKind === "ssh") {
+    targetKind = rawTargetKind;
+  } else if (rawTargetKind !== undefined) {
+    throw new Error("target_kind is invalid");
+  }
+  const targetPath = requireOptionalPlainString(data.target_path, "target_path");
+  const editorClientToolsAvailable =
+    data.editor_client_tools_available === undefined ||
+    data.editor_client_tools_available === null
+      ? undefined
+      : requirePlainBoolean(
+          data.editor_client_tools_available,
+          "editor_client_tools_available",
+        );
   return {
     binding_id: requirePlainString(data.binding_id, "binding_id"),
     generation: requirePlainInteger(data.generation, "generation"),
@@ -894,6 +1366,126 @@ function parseBridgeBinding(value: unknown): BridgeBinding {
       data.last_server_sequence,
       "last_server_sequence",
     ),
+    ...(hostLabel ? { host_label: hostLabel } : {}),
+    ...(sshAlias ? { ssh_alias: sshAlias } : {}),
+    ...(targetKind ? { target_kind: targetKind } : {}),
+    ...(targetPath ? { target_path: targetPath } : {}),
+    ...(editorClientToolsAvailable !== undefined
+      ? { editor_client_tools_available: editorClientToolsAvailable }
+      : {}),
+  };
+}
+
+function parseManagedTarget(value: unknown): ManagedTarget {
+  const record = requireRecord(value);
+  if (record.kind === "local") {
+    return {
+      kind: "local",
+      path: requireString(record.path, "path"),
+    };
+  }
+  if (record.kind === "ssh") {
+    return {
+      kind: "ssh",
+      alias: requireString(record.alias, "alias"),
+      path: requireString(record.path, "path"),
+      user: requireString(record.user, "user"),
+      host: requireString(record.host, "host"),
+      port: requireInteger(record.port, "port"),
+      hostKeyFingerprints: requireStringArray(
+        record.host_key_fingerprints,
+        "host_key_fingerprints",
+      ),
+    };
+  }
+  throw new AhpOperationError(
+    "invalid-command",
+    "Managed target kind is invalid",
+  );
+}
+
+function managedTargetFromBinding(
+  binding: BridgeBinding,
+  targets: readonly ManagedTarget[],
+): ManagedTarget | undefined {
+  if (binding.target_kind === "local" && binding.target_path) {
+    return targets.find(
+      (target) =>
+        target.kind === "local" &&
+        target.path.toLocaleLowerCase("en-US") ===
+          binding.target_path?.toLocaleLowerCase("en-US"),
+    );
+  }
+  if (
+    binding.target_kind === "ssh" &&
+    binding.target_path &&
+    binding.ssh_alias
+  ) {
+    return targets.find(
+      (target) =>
+        target.kind === "ssh" &&
+        target.alias === binding.ssh_alias &&
+        target.path === binding.target_path,
+    );
+  }
+  return undefined;
+}
+
+function managedTargetKey(target: ManagedTarget): string {
+  return target.kind === "local"
+    ? `local:${target.path.toLowerCase()}`
+    : `ssh:${target.alias}\0${target.path}`;
+}
+
+function toBridgeSession(
+  prepared: ConnectedManagedTarget["prepared"],
+  target: ManagedTarget,
+  session: {
+    readonly resource: string;
+    readonly provider: string;
+    readonly title: string;
+    readonly status: number;
+    readonly workingDirectories?: readonly string[];
+    readonly createdAt: string;
+    readonly modifiedAt: string;
+  },
+): Record<string, unknown> {
+  const workingDirectories = session.workingDirectories ?? [];
+  const matchesTarget =
+    target.kind === "local"
+      ? workingDirectories.includes(`file:///${encodeURI(target.path.replace(/\\/gu, "/"))}`)
+      : workingDirectories.includes(`file://${encodeURI(target.path)}`) ||
+        workingDirectories.includes(
+          `vscode-remote://ssh-remote+${target.alias}/${target.path.replace(/^\/+/u, "")}`,
+        );
+  return {
+    endpoint_id: prepared.endpointId,
+    host_instance_id: prepared.entry.instanceId,
+    session_uri: session.resource,
+    provider: session.provider,
+    title: session.title,
+    status: session.status,
+    workspace_uris: [...workingDirectories],
+    created_at: session.createdAt,
+    modified_at: session.modifiedAt,
+    host_label: prepared.hostLabel,
+    ...(target.kind === "ssh"
+      ? {
+          ssh_alias: target.alias,
+          ...(matchesTarget
+            ? {
+                target_kind: "ssh",
+                target_path: target.path,
+              }
+            : {}),
+        }
+      : matchesTarget
+        ? {
+            target_kind: "local",
+            target_path: target.path,
+          }
+        : {}),
+    editor_client_tools_available: prepared.editorClientToolsAvailable,
   };
 }
 
@@ -944,9 +1536,19 @@ function requirePlainInteger(value: unknown, name: string): number {
   return value;
 }
 
-function requireRecord(value: unknown): Record<string, unknown> {
+function requirePlainBoolean(value: unknown, name: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`${name} must be a boolean`);
+  }
+  return value;
+}
+
+function requireRecord(
+  value: unknown,
+  name = "command data",
+): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new AhpOperationError("invalid-command", "Command data is invalid");
+    throw new AhpOperationError("invalid-command", `${name} is invalid`);
   }
   return value as Record<string, unknown>;
 }
@@ -971,11 +1573,38 @@ function requireBoolean(value: unknown, name: string): boolean {
   return value;
 }
 
+function requireStringArray(value: unknown, name: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some((item) => typeof item !== "string" || item.length === 0)
+  ) {
+    throw new AhpOperationError(
+      "invalid-command",
+      `${name} must be a non-empty string array`,
+    );
+  }
+  return value;
+}
+
+function requireInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new AhpOperationError(
+      "invalid-command",
+      `${name} must be an integer`,
+    );
+  }
+  return value;
+}
+
 function errorCode(error: unknown): string {
   if (error instanceof AhpOperationError || error instanceof BridgeRpcError) {
     return sanitizeCode(error.code);
   }
   if (error instanceof Error) {
+    if ("code" in error && typeof error.code === "string") {
+      return sanitizeCode(error.code);
+    }
     return `internal-${sanitizeCode(error.name)}`;
   }
   return "internal-unknown";

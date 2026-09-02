@@ -13,7 +13,25 @@ export interface AdapterConfig {
   readonly adapterId: string;
   readonly userDataDirectory: string;
   readonly pollSeconds: number;
+  readonly codeExecutable: string;
+  readonly sshExecutable?: string;
+  readonly authorizedTargets: readonly AuthorizedTargetConfig[];
 }
+
+export type AuthorizedTargetConfig =
+  | {
+      readonly kind: "local";
+      readonly path: string;
+    }
+  | {
+      readonly kind: "ssh";
+      readonly alias: string;
+      readonly path: string;
+      readonly user: string;
+      readonly host: string;
+      readonly port: number;
+      readonly hostKeyFingerprints: readonly string[];
+    };
 
 export async function loadAdapterConfig(
   configPath: string,
@@ -45,6 +63,15 @@ export async function loadAdapterConfig(
   if (pollSeconds < 1 || pollSeconds > 60) {
     throw new Error("ahp.poll_seconds must be between 1 and 60");
   }
+  const codeExecutable = requireString(
+    ahp.code_executable,
+    "ahp.code_executable",
+  );
+  const sshExecutable =
+    typeof ahp.ssh_executable === "string" && ahp.ssh_executable.length > 0
+      ? ahp.ssh_executable
+      : undefined;
+  const authorizedTargets = parseAuthorizedTargets(ahp);
   const adapterId = `qq-copilot-ahp-${createHash("sha256")
     .update(`adapter\0${pipeName}\0${bridgeToken}`, "utf8")
     .digest("hex")
@@ -58,6 +85,9 @@ export async function loadAdapterConfig(
       userDataDirectory ?? defaultUserDataDirectory(),
     ),
     pollSeconds,
+    codeExecutable: resolve(codeExecutable),
+    ...(sshExecutable ? { sshExecutable: resolve(sshExecutable) } : {}),
+    authorizedTargets,
   };
 }
 
@@ -109,6 +139,81 @@ function requireString(value: unknown, name: string): string {
 function requireInteger(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value)) {
     throw new Error(`${name} must be an integer`);
+  }
+  return value;
+}
+
+function parseAuthorizedTargets(
+  ahp: Record<string, unknown>,
+): readonly AuthorizedTargetConfig[] {
+  const targets: AuthorizedTargetConfig[] = [];
+  const shared = Array.isArray(ahp.shared_workspaces)
+    ? ahp.shared_workspaces
+    : typeof ahp.shared_workspace === "string"
+      ? [ahp.shared_workspace]
+      : [];
+  for (const value of shared) {
+    if (typeof value === "string" && value.length > 0) {
+      targets.push({
+        kind: "local",
+        path: resolve(value),
+      });
+    }
+  }
+  if (Array.isArray(ahp.authorized_targets)) {
+    for (const item of ahp.authorized_targets) {
+      const target = requireTable(item, "ahp.authorized_targets[]");
+      if (target.kind === "local") {
+        targets.push({
+          kind: "local",
+          path: resolve(requireString(target.path, "authorized target path")),
+        });
+        continue;
+      }
+      if (target.kind === "ssh") {
+        const alias = requireString(target.alias, "authorized target alias");
+        if (
+          alias.startsWith("-") ||
+          !/^[A-Za-z0-9._-]+$/u.test(alias)
+        ) {
+          throw new Error("authorized target alias is invalid");
+        }
+        const hostKeyFingerprints = requireStringArray(
+          target.host_key_fingerprints,
+          "authorized target host key fingerprints",
+        );
+        if (
+          hostKeyFingerprints.length === 0 ||
+          hostKeyFingerprints.some(
+            (fingerprint) =>
+              !fingerprint.startsWith("SHA256:") || /\s/u.test(fingerprint),
+          )
+        ) {
+          throw new Error("authorized target host key fingerprints are invalid");
+        }
+        targets.push({
+          kind: "ssh",
+          alias,
+          path: requireString(target.path, "authorized target path"),
+          user: requireString(target.user, "authorized target user"),
+          host: requireString(target.host, "authorized target host"),
+          port: requireInteger(target.port, "authorized target port"),
+          hostKeyFingerprints,
+        });
+        continue;
+      }
+      throw new Error("authorized target kind is invalid");
+    }
+  }
+  return targets;
+}
+
+function requireStringArray(value: unknown, name: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.some((item) => typeof item !== "string" || item.length === 0)
+  ) {
+    throw new Error(`${name} must be an array of non-empty strings`);
   }
   return value;
 }
