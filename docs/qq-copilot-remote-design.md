@@ -56,7 +56,8 @@ flowchart LR
 - QQ 只提供 Allow once / Deny；PC 可使用原生 Session Allow。
 - Assistant Markdown response part 在边界闭合后立即推送 QQ；流式 token 不逐条外发，
   已发送的过程段不再并入最终回复，reasoning 和原始工具输出不外发。所有响应段均带
-  `[短码 · 标题]`；审批、澄清和最终回复另提供独立前台切换按钮，通知本身不抢占前台。
+  `[短码 · 标题]`；仅后台来源 Session 的审批、澄清和最终回复提供独立前台切换按钮，
+  当前前台 Session 不显示冗余切换提示，通知本身不抢占前台。
 - 工具通知支持 `approval_only`（不发送工具状态，仅保留审批与 Assistant 响应）、
   `compact`（默认，仅终态）与 `full`。Owner 可用 `/notify` 查询或即时切换，
   结果持久化到配置，无需重启。

@@ -2264,6 +2264,13 @@ impl BridgeService {
         key: &str,
         session_label: &str,
     ) -> Result<()> {
+        if self
+            .database
+            .ahp_binding()?
+            .is_some_and(|binding| binding.session_uri == session_uri)
+        {
+            return Ok(());
+        }
         let owner = self.database.owner()?.context("no QQ owner is bound")?;
         if !owner.enabled {
             bail!("QQ remote control is disabled by the local emergency switch");
@@ -3515,15 +3522,13 @@ mod tests {
             .expect("publish AHP events");
 
         let messages = fixture.qq.messages().await;
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].kind, "approval_buttons");
         assert!(messages[0].content.contains("Run deployment"));
         assert!(messages[0].content.contains("Shared"));
-        assert_eq!(messages[1].kind, "choice_buttons");
-        assert_eq!(messages[2].kind, "text");
-        assert!(messages[2].content.contains("Deployment complete"));
-        assert!(messages[2].content.contains("Shared"));
-        assert_eq!(messages[3].kind, "choice_buttons");
+        assert_eq!(messages[1].kind, "text");
+        assert!(messages[1].content.contains("Deployment complete"));
+        assert!(messages[1].content.contains("Shared"));
         assert!(
             messages
                 .iter()
@@ -3631,6 +3636,110 @@ mod tests {
             messages
                 .iter()
                 .filter(|message| message.kind == "choice_buttons")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn background_session_final_reply_adds_focus_button() {
+        let fixture = Fixture::new_ahp();
+        fixture
+            .service
+            .database()
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &[
+                    test_ahp_session(1, &fixture.workspace, 1),
+                    test_ahp_session(2, &fixture.workspace, 1),
+                ],
+            )
+            .expect("catalogue");
+        let background = fixture
+            .service
+            .database()
+            .ahp_track_session("endpoint-1", "copilot:/session-2")
+            .expect("track background session");
+        let bind_command = fixture
+            .service
+            .database()
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("bind command");
+        fixture
+            .service
+            .database()
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                bind_command[0].command_id,
+                crate::protocol::AhpCommandOutcome::Applied,
+                None,
+            )
+            .expect("ack bind");
+        fixture
+            .service
+            .database()
+            .ahp_binding_ready(
+                "adapter-stable",
+                "adapter-run-1",
+                &background.binding_id,
+                "endpoint-1",
+                "host-1",
+                background.generation,
+                "copilot:/session-2",
+                "ahp-chat://default/session-2",
+                1,
+            )
+            .expect("background ready");
+
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: background.binding_id,
+                binding_generation: background.generation,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(b"background-final"),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(2),
+                    session_uri: "copilot:/session-2".to_owned(),
+                    chat_uri: Some("ahp-chat://default/session-2".to_owned()),
+                    turn_id: Some("turn-background".to_owned()),
+                    kind: AhpEventKind::AssistantMessage,
+                    origin_client_id: None,
+                    occurred_at: "2026-09-02T08:00:00Z".to_owned(),
+                    data: json!({
+                        "message_id": "turn:turn-background:assistant:final",
+                        "content": "Background task complete.",
+                        "complete": true,
+                        "historical": false,
+                        "final_response": true
+                    }),
+                }],
+            })
+            .await
+            .expect("publish background final reply");
+
+        let messages = fixture.qq.messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.kind == "text" && message.content.contains("Background task complete.")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.kind == "choice_buttons"
+                        && message.content.contains("任务仍在其原 Session")
+                })
                 .count(),
             1
         );
@@ -4308,9 +4417,11 @@ mod tests {
                 .iter()
                 .any(|message| message.kind == "approval_buttons")
         );
-        assert!(messages.iter().any(|message| {
-            message.kind == "choice_buttons" && message.content.contains("任务仍在其原 Session")
-        }));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.kind != "choice_buttons")
+        );
 
         fixture
             .service
