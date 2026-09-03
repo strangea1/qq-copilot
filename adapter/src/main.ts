@@ -29,6 +29,7 @@ import {
   connectManagedTarget,
   createManagedSession,
   disposeManagedSession,
+  managedTargetMatchesWorkspaceUri,
   prepareTargetResult,
   refreshManagedSessions,
   type ConnectedManagedTarget,
@@ -51,6 +52,8 @@ import type { EndpointRegistryEntry } from "./endpoint-registry.js";
 const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
 const RETRY_DELAY_MS = 1_000;
+const ACK_RETRY_DELAY_MS = 1_000;
+const MANAGED_BIND_GRACE_MS = 60_000;
 const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 
 export interface BridgeBinding {
@@ -141,14 +144,16 @@ interface ManagedEntryState {
   readonly target: ManagedTarget;
   readonly entry: EndpointRegistryEntry;
   readonly prepared: ConnectedManagedTarget["prepared"];
+  readonly protectedUntil: number;
 }
 
 class SerialQueue {
   #tail: Promise<void> = Promise.resolve();
 
-  run(task: () => Promise<void>): void {
+  run(task: () => Promise<void>): Promise<void> {
     const next = this.#tail.then(task, task);
     this.#tail = next.catch(() => undefined);
+    return next;
   }
 
   async drain(): Promise<void> {
@@ -166,6 +171,14 @@ export class AdapterRuntime {
   readonly #core: AhpCoreLike;
 
   readonly #callbackQueue = new SerialQueue();
+
+  readonly #catalogueQueue = new SerialQueue();
+
+  readonly #commandQueues = new Map<string, SerialQueue>();
+
+  readonly #inFlightCommandIds = new Set<number>();
+
+  readonly #removedSessionUris = new Map<string, string>();
 
   readonly #events = new Map<string, Map<string, PublishedEvent>>();
 
@@ -186,6 +199,8 @@ export class AdapterRuntime {
   readonly #restoringBindings = new Set<string>();
 
   #restoreRetryTimer: NodeJS.Timeout | undefined;
+
+  #managedPruneTimer: NodeJS.Timeout | undefined;
 
   #stopping = false;
 
@@ -225,7 +240,14 @@ export class AdapterRuntime {
       },
       callbacks: {
         onCatalogue: (snapshot) => {
-          this.#callbackQueue.run(() => this.#publishCatalogue(snapshot));
+          if (this.#stopping) {
+            return;
+          }
+          void this.#publishCatalogue(snapshot).catch((error) => {
+            safeLog("warn", "Failed to publish AHP catalogue", {
+              code: errorCode(error),
+            });
+          });
         },
         onConnection: (event) => this.#onConnection(event),
         onSessionSnapshot: (event) => this.#onSessionSnapshot(event),
@@ -312,7 +334,7 @@ export class AdapterRuntime {
           if (signal.aborted) {
             break;
           }
-          await this.#executeCommand(command);
+          this.#enqueueCommand(command);
         }
       } catch (error) {
         if (!signal.aborted) {
@@ -335,7 +357,17 @@ export class AdapterRuntime {
       clearTimeout(this.#restoreRetryTimer);
       this.#restoreRetryTimer = undefined;
     }
+    if (this.#managedPruneTimer) {
+      clearTimeout(this.#managedPruneTimer);
+      this.#managedPruneTimer = undefined;
+    }
+    await Promise.all(
+      [...this.#commandQueues.values()].map((queue) => queue.drain()),
+    );
+    this.#commandQueues.clear();
+    this.#inFlightCommandIds.clear();
     await this.#callbackQueue.drain();
+    await this.#catalogueQueue.drain();
 
     let failure: unknown;
     try {
@@ -377,6 +409,32 @@ export class AdapterRuntime {
     }
   }
 
+  #enqueueCommand(command: AdapterCommand): void {
+    if (this.#inFlightCommandIds.has(command.command_id)) {
+      return;
+    }
+    this.#inFlightCommandIds.add(command.command_id);
+    let queue = this.#commandQueues.get(command.binding_id);
+    if (!queue) {
+      queue = new SerialQueue();
+      this.#commandQueues.set(command.binding_id, queue);
+    }
+    queue.run(async () => {
+      try {
+        await this.#executeCommand(command);
+      } catch (error) {
+        safeLog("warn", "AHP command execution could not be reported", {
+          commandId: command.command_id,
+          bindingId: command.binding_id,
+          kind: command.kind,
+          code: errorCode(error),
+        });
+      } finally {
+        this.#inFlightCommandIds.delete(command.command_id);
+      }
+    });
+  }
+
   async #executeCommand(command: AdapterCommand): Promise<void> {
     if (
       !Number.isSafeInteger(command.command_id) ||
@@ -385,9 +443,16 @@ export class AdapterRuntime {
       command.binding_id.length === 0 ||
       !Number.isSafeInteger(command.binding_generation)
     ) {
-      await this.#ack(command.command_id, "rejected", "invalid-command");
+      await this.#ackWithRetry(
+        command.command_id,
+        "rejected",
+        "invalid-command",
+      );
       return;
     }
+    let result: unknown;
+    let operationError: unknown;
+    let operationFailed = false;
     try {
       if (
         command.kind === "send_message" ||
@@ -417,12 +482,11 @@ export class AdapterRuntime {
         case "send_message": {
           const data = requireRecord(command.data);
           const content = requireString(data.content, "content");
-          const result = await this.#requireBinding(command).binding.queueUserText(
+          result = await this.#requireBinding(command).binding.queueUserText(
             content,
             command.command_id,
           );
-          await this.#ack(command.command_id, "applied", undefined, result);
-          return;
+          break;
         }
         case "cancel_turn":
           await this.#requireBinding(command).binding.cancelActiveTurn(
@@ -465,14 +529,12 @@ export class AdapterRuntime {
           break;
         }
         case "prepare_target": {
-          const result = await this.#prepareTarget(command);
-          await this.#ack(command.command_id, "applied", undefined, result);
-          return;
+          result = await this.#prepareTarget(command);
+          break;
         }
         case "create_session": {
-          const result = await this.#createSession(command);
-          await this.#ack(command.command_id, "applied", undefined, result);
-          return;
+          result = await this.#createSession(command);
+          break;
         }
         case "dispose_session":
           await this.#disposeSession(command);
@@ -483,21 +545,31 @@ export class AdapterRuntime {
             `Unsupported command kind ${String(command.kind)}`,
           );
       }
-      await this.#ack(command.command_id, "applied");
     } catch (error) {
-      const rejected = error instanceof AhpOperationError;
-      await this.#ack(
-        command.command_id,
-        rejected ? "rejected" : "failed",
-        errorCode(error),
-      );
+      operationFailed = true;
+      operationError = error;
+    }
+    if (operationFailed) {
+      const rejected = operationError instanceof AhpOperationError;
       safeLog("warn", "AHP command failed", {
         commandId: command.command_id,
         bindingId: command.binding_id,
         kind: command.kind,
-        code: errorCode(error),
+        code: errorCode(operationError),
       });
+      await this.#ackWithRetry(
+        command.command_id,
+        rejected ? "rejected" : "failed",
+        errorCode(operationError),
+      );
+      return;
     }
+    await this.#ackWithRetry(
+      command.command_id,
+      "applied",
+      undefined,
+      result,
+    );
   }
 
   #requireBinding(command: AdapterCommand): ActiveBinding {
@@ -838,6 +910,7 @@ export class AdapterRuntime {
         });
       },
     );
+    let createdSessionUri: string | undefined;
     try {
       const result = await createManagedSession(connection, {
         provider,
@@ -846,6 +919,13 @@ export class AdapterRuntime {
         resolvedValues,
         overrides,
       });
+      createdSessionUri = result.session.resource;
+      this.#removedSessionUris.delete(createdSessionUri);
+      const session = toBridgeSession(
+        connection.prepared,
+        target,
+        result.session,
+      );
       const sessions = await refreshManagedSessions(connection.client);
       await this.#publishManagedCatalogue(connection, sessions);
       await this.#retainManagedPrepared(target, connection.prepared);
@@ -856,10 +936,37 @@ export class AdapterRuntime {
         workspace_uri: result.workspace_uri,
         host_label: result.host_label,
         editor_client_tools_available: result.editor_client_tools_available,
-        session: toBridgeSession(connection.prepared, target, result.session),
+        session,
       };
     } catch (error) {
+      let cleanupError: unknown;
+      if (createdSessionUri) {
+        try {
+          await disposeManagedSession(connection, createdSessionUri);
+          this.#removedSessionUris.set(
+            createdSessionUri,
+            managedTargetKey(target),
+          );
+          const sessions = await refreshManagedSessions(connection.client);
+          await this.#publishManagedCatalogue(
+            connection,
+            sessions,
+            this.#managedEntries.has(managedTargetKey(target))
+              ? "connected"
+              : "unreachable",
+            [createdSessionUri],
+          );
+        } catch (disposeError) {
+          cleanupError = disposeError;
+        }
+      }
       await connection.close().catch(() => undefined);
+      if (cleanupError !== undefined) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "created-session-cleanup-failed",
+        );
+      }
       throw error;
     }
   }
@@ -872,14 +979,48 @@ export class AdapterRuntime {
     const connection = await connectManagedTarget(this.#config, target);
     try {
       await disposeManagedSession(connection, sessionUri);
+      this.#removedSessionUris.set(sessionUri, managedTargetKey(target));
+      await this.#forgetRemovedSessionBindings(sessionUri);
       const sessions = await refreshManagedSessions(connection.client);
       await this.#publishManagedCatalogue(
         connection,
         sessions,
         alreadyRetained ? "connected" : "unreachable",
+        [sessionUri],
       );
     } finally {
       await connection.close().catch(() => undefined);
+    }
+  }
+
+  async #forgetRemovedSessionBindings(sessionUri: string): Promise<void> {
+    for (const [bindingId, binding] of [...this.#bindings]) {
+      if (binding.sessionUri !== sessionUri) {
+        continue;
+      }
+      this.#bindings.delete(bindingId);
+      this.#events.delete(bindingId);
+      this.#eventFlushes.delete(bindingId);
+      try {
+        await binding.binding.close();
+      } catch (error) {
+        safeLog("warn", "Failed to close a binding for a removed Session", {
+          bindingId,
+          code: errorCode(error),
+        });
+      }
+    }
+    for (const [bindingId, binding] of [...this.#pendingBindings]) {
+      if (binding.sessionUri === sessionUri) {
+        this.#pendingBindings.delete(bindingId);
+        this.#events.delete(bindingId);
+        this.#eventFlushes.delete(bindingId);
+      }
+    }
+    for (const [bindingId, binding] of [...this.#restoreBindings]) {
+      if (binding.session_uri === sessionUri) {
+        this.#clearPendingRestore(bindingId);
+      }
     }
   }
 
@@ -894,6 +1035,7 @@ export class AdapterRuntime {
       target,
       entry: prepared.entry,
       prepared,
+      protectedUntil: Date.now() + MANAGED_BIND_GRACE_MS,
     });
     try {
       await this.#core.refreshEndpoints();
@@ -916,10 +1058,17 @@ export class AdapterRuntime {
     ) {
       previous.prepared.tunnel.kill();
     }
+    await this.#pruneManagedEntries();
   }
 
   async #pruneManagedEntries(): Promise<void> {
+    if (this.#managedPruneTimer) {
+      clearTimeout(this.#managedPruneTimer);
+      this.#managedPruneTimer = undefined;
+    }
     let changed = false;
+    let nextPruneDelay: number | undefined;
+    const now = Date.now();
     for (const [key, entry] of [...this.#managedEntries.entries()]) {
       const endpointId = endpointPublicId(entry.entry);
       if (
@@ -932,6 +1081,12 @@ export class AdapterRuntime {
       ) {
         continue;
       }
+      if (entry.protectedUntil > now) {
+        const delay = entry.protectedUntil - now;
+        nextPruneDelay =
+          nextPruneDelay === undefined ? delay : Math.min(nextPruneDelay, delay);
+        continue;
+      }
       if (entry.prepared.tunnel && !entry.prepared.tunnel.killed) {
         entry.prepared.tunnel.kill();
       }
@@ -941,46 +1096,71 @@ export class AdapterRuntime {
     if (changed) {
       await this.#core.refreshEndpoints();
     }
+    if (nextPruneDelay !== undefined && !this.#stopping) {
+      this.#managedPruneTimer = setTimeout(() => {
+        this.#managedPruneTimer = undefined;
+        void this.#pruneManagedEntries().catch((error) => {
+          safeLog("warn", "Failed to prune idle managed endpoint", {
+            code: errorCode(error),
+          });
+        });
+      }, Math.max(1, nextPruneDelay));
+      this.#managedPruneTimer.unref();
+    }
   }
 
   async #publishManagedCatalogue(
     connection: ConnectedManagedTarget,
     sessions = connection.sessions,
     hostState: "connected" | "unreachable" = "connected",
+    removedSessionUris: readonly string[] = [],
   ): Promise<void> {
     const { prepared } = connection;
     const target = prepared.target;
-    await this.#bridge.call({
-      operation: "ahp_catalog_replace",
-      adapter_id: this.#config.adapterId,
-      adapter_instance_id: this.#adapterInstanceId,
-      hosts: [
-        {
-          endpoint_id: prepared.endpointId,
-          host_instance_id: prepared.entry.instanceId,
-          pid: prepared.entry.pid,
-          advertised_protocol: prepared.entry.protocolVersion,
-          selected_protocol: prepared.entry.protocolVersion,
-          state: hostState,
-          host_label: prepared.hostLabel,
-          ...(target.kind === "ssh"
-            ? {
-                ssh_alias: target.alias,
-                target_kind: "ssh",
-                target_path: target.path,
-              }
-            : {
-                target_kind: "local",
-                target_path: target.path,
-              }),
-          endpoint_type: prepared.entry.endpoint.type,
-          editor_client_tools_available: prepared.editorClientToolsAvailable,
-        },
-      ],
-      sessions: sessions.map((session) =>
-        toBridgeSession(prepared, target, session),
-      ),
-      full_snapshot: false,
+    const targetKey = managedTargetKey(target);
+    const pendingRemovals = [...this.#removedSessionUris]
+      .filter(([, removedTargetKey]) => removedTargetKey === targetKey)
+      .map(([sessionUri]) => sessionUri);
+    const removals = [...new Set([...pendingRemovals, ...removedSessionUris])];
+    await this.#catalogueQueue.run(async () => {
+      await this.#bridge.call({
+        operation: "ahp_catalog_replace",
+        adapter_id: this.#config.adapterId,
+        adapter_instance_id: this.#adapterInstanceId,
+        hosts: [
+          {
+            endpoint_id: prepared.endpointId,
+            host_instance_id: prepared.entry.instanceId,
+            pid: prepared.entry.pid,
+            advertised_protocol: prepared.entry.protocolVersion,
+            selected_protocol: prepared.entry.protocolVersion,
+            state: hostState,
+            host_label: prepared.hostLabel,
+            ...(target.kind === "ssh"
+              ? {
+                  ssh_alias: target.alias,
+                  target_kind: "ssh",
+                  target_path: target.path,
+                }
+              : {
+                  target_kind: "local",
+                  target_path: target.path,
+                }),
+            endpoint_type: prepared.entry.endpoint.type,
+            editor_client_tools_available: prepared.editorClientToolsAvailable,
+          },
+        ],
+        sessions: sessions
+          .filter((session) => !removals.includes(session.resource))
+          .map((session) => toBridgeSession(prepared, target, session)),
+        removed_session_uris: removals,
+        full_snapshot: false,
+      });
+      for (const sessionUri of removals) {
+        if (this.#removedSessionUris.get(sessionUri) === targetKey) {
+          this.#removedSessionUris.delete(sessionUri);
+        }
+      }
     });
   }
 
@@ -1259,31 +1439,42 @@ export class AdapterRuntime {
     });
     const sessions = snapshot.endpoints.flatMap((entry) => {
       const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
-      return entry.sessions.map((session) =>
-        managed
-          ? toBridgeSession(managed.prepared, managed.target, session)
-          : {
-              endpoint_id: entry.endpoint.id,
-              host_instance_id: entry.endpoint.instanceId,
-              session_uri: session.resource,
-              provider: session.provider,
-              title: session.title,
-              status: session.status,
-              workspace_uris: session.workingDirectories ?? [],
-              created_at: session.createdAt,
-              modified_at: session.modifiedAt,
-              host_label: "local",
-              editor_client_tools_available: true,
-            },
-      );
+      return entry.sessions
+        .filter(
+          (session) => !this.#removedSessionUris.has(session.resource),
+        )
+        .map((session) =>
+          managed
+            ? toBridgeSession(managed.prepared, managed.target, session)
+            : {
+                endpoint_id: entry.endpoint.id,
+                host_instance_id: entry.endpoint.instanceId,
+                session_uri: session.resource,
+                provider: session.provider,
+                title: session.title,
+                status: session.status,
+                workspace_uris: session.workingDirectories ?? [],
+                created_at: session.createdAt,
+                modified_at: session.modifiedAt,
+                host_label: "local",
+                editor_client_tools_available: true,
+              },
+        );
     });
-    await this.#bridge.call({
-      operation: "ahp_catalog_replace",
-      adapter_id: this.#config.adapterId,
-      adapter_instance_id: this.#adapterInstanceId,
-      hosts,
-      sessions,
-      full_snapshot: true,
+    const pendingRemovals = [...this.#removedSessionUris.keys()];
+    await this.#catalogueQueue.run(async () => {
+      await this.#bridge.call({
+        operation: "ahp_catalog_replace",
+        adapter_id: this.#config.adapterId,
+        adapter_instance_id: this.#adapterInstanceId,
+        hosts,
+        sessions,
+        removed_session_uris: pendingRemovals,
+        full_snapshot: true,
+      });
+      for (const sessionUri of pendingRemovals) {
+        this.#removedSessionUris.delete(sessionUri);
+      }
     });
   }
 
@@ -1293,21 +1484,37 @@ export class AdapterRuntime {
     );
   }
 
-  async #ack(
+  async #ackWithRetry(
     commandId: number,
     outcome: "applied" | "rejected" | "failed",
     error?: string,
     result?: unknown,
   ): Promise<void> {
-    await this.#bridge.call({
-      operation: "ahp_ack_command",
-      adapter_id: this.#config.adapterId,
-      adapter_instance_id: this.#adapterInstanceId,
-      command_id: commandId,
-      outcome,
-      error_code: error,
-      ...(result !== undefined ? { result } : {}),
-    });
+    let lastError: unknown;
+    for (;;) {
+      try {
+        await this.#bridge.call({
+          operation: "ahp_ack_command",
+          adapter_id: this.#config.adapterId,
+          adapter_instance_id: this.#adapterInstanceId,
+          command_id: commandId,
+          outcome,
+          error_code: error,
+          ...(result !== undefined ? { result } : {}),
+        });
+        return;
+      } catch (ackError) {
+        lastError = ackError;
+        if (this.#stopping) {
+          break;
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, ACK_RETRY_DELAY_MS);
+          timer.unref();
+        });
+      }
+    }
+    throw lastError ?? new Error("Adapter stopped before command acknowledgement");
   }
 }
 
@@ -1451,13 +1658,9 @@ function toBridgeSession(
   },
 ): Record<string, unknown> {
   const workingDirectories = session.workingDirectories ?? [];
-  const matchesTarget =
-    target.kind === "local"
-      ? workingDirectories.includes(`file:///${encodeURI(target.path.replace(/\\/gu, "/"))}`)
-      : workingDirectories.includes(`file://${encodeURI(target.path)}`) ||
-        workingDirectories.includes(
-          `vscode-remote://ssh-remote+${target.alias}/${target.path.replace(/^\/+/u, "")}`,
-        );
+  const matchesTarget = workingDirectories.some((workspaceUri) =>
+    managedTargetMatchesWorkspaceUri(target, workspaceUri),
+  );
   return {
     endpoint_id: prepared.endpointId,
     host_instance_id: prepared.entry.instanceId,

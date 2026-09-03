@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -43,6 +43,8 @@ use crate::{
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_WAIT_FOR_MESSAGE_SECONDS: u64 = 300;
 const INBOUND_MESSAGE_TTL_SECONDS: u64 = 1800;
+const AHP_CREATION_COMMAND_TIMEOUT_SECONDS: u64 = 300;
+const AHP_ACTIVE_CREATION_TTL_SECONDS: u64 = 600;
 
 #[derive(Clone, Copy)]
 enum InboundMessage<'a> {
@@ -58,6 +60,7 @@ pub struct BridgeService {
     tool_notification_mode: Arc<RwLock<AhpToolNotificationMode>>,
     final_delivery_lock: Mutex<()>,
     typing_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    foreground_switch_intent: Arc<StdMutex<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +162,7 @@ impl BridgeService {
             tool_notification_mode: Arc::new(RwLock::new(tool_notification_mode)),
             final_delivery_lock: Mutex::new(()),
             typing_tasks: Mutex::new(HashMap::new()),
+            foreground_switch_intent: Arc::new(StdMutex::new(0)),
         }
     }
 
@@ -175,7 +179,99 @@ impl BridgeService {
             tool_notification_mode: self.tool_notification_mode.clone(),
             final_delivery_lock: Mutex::new(()),
             typing_tasks: Mutex::new(HashMap::new()),
+            foreground_switch_intent: self.foreground_switch_intent.clone(),
         }
+    }
+
+    fn begin_foreground_switch(&self) -> u64 {
+        let mut intent = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *intent = intent.wrapping_add(1);
+        *intent
+    }
+
+    fn foreground_switch_is_current(&self, intent: u64) -> bool {
+        *self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == intent
+    }
+
+    fn switch_session_by_button(
+        &self,
+        button_data: &str,
+        allowed_session_uris: &[String],
+    ) -> (
+        u64,
+        Result<Option<crate::ahp_store::AhpSessionSwitchSubmission>>,
+    ) {
+        let mut intent = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *intent = intent.wrapping_add(1);
+        (
+            *intent,
+            self.database
+                .ahp_switch_session_by_button(button_data, allowed_session_uris),
+        )
+    }
+
+    fn unbind_foreground_session(&self) -> Result<bool> {
+        let mut intent = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *intent = intent.wrapping_add(1);
+        self.database.ahp_unbind_session()
+    }
+
+    fn detach_session(&self, session_uri: &str) -> Result<bool> {
+        let mut intent = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *intent = intent.wrapping_add(1);
+        self.database.ahp_detach_session(session_uri)
+    }
+
+    fn detach_created_session_for_rollback(
+        &self,
+        creation_intent: u64,
+        session_uri: &str,
+    ) -> Result<bool> {
+        let current_intent = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current_intent != creation_intent
+            && self
+                .database
+                .ahp_binding_for_session(session_uri)?
+                .is_some_and(|binding| binding.foreground)
+        {
+            bail!("created Session was selected by a newer foreground switch");
+        }
+        self.database.ahp_detach_session(session_uri)
+    }
+
+    fn commit_foreground_switch(
+        &self,
+        intent: u64,
+        endpoint_id: &str,
+        session_uri: &str,
+    ) -> Result<crate::protocol::AhpBindingRecord> {
+        let current = self
+            .foreground_switch_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != intent {
+            bail!("Session switch request was superseded by a newer choice");
+        }
+        self.database.ahp_bind_session(endpoint_id, session_uri)
     }
 
     pub async fn dispatch(&self, request: BridgeRequest) -> Result<Value> {
@@ -318,15 +414,17 @@ impl BridgeService {
                 adapter_instance_id,
                 hosts,
                 sessions,
+                removed_session_uris,
                 full_snapshot,
             } => {
                 self.require_ahp_enabled()?;
-                validate_ahp_catalog(&hosts, &sessions)?;
+                validate_ahp_catalog(&hosts, &sessions, &removed_session_uris)?;
                 self.database.ahp_replace_catalog_scoped(
                     &adapter_id,
                     &adapter_instance_id,
                     &hosts,
                     &sessions,
+                    &removed_session_uris,
                     full_snapshot,
                 )?;
                 if full_snapshot {
@@ -465,6 +563,7 @@ impl BridgeService {
                     progress,
                     total,
                     message.as_deref(),
+                    self.config.ahp.command_lease_seconds,
                 )?;
                 Ok(json!({"accepted": true}))
             }
@@ -504,12 +603,17 @@ impl BridgeService {
             } => {
                 self.require_ahp_enabled()?;
                 self.validate_ahp_session_workspace(&endpoint_id, &session_uri)?;
-                serde_json::to_value(self.database.ahp_bind_session(&endpoint_id, &session_uri)?)
-                    .context("failed to serialize AHP binding")
+                let switch_intent = self.begin_foreground_switch();
+                serde_json::to_value(self.commit_foreground_switch(
+                    switch_intent,
+                    &endpoint_id,
+                    &session_uri,
+                )?)
+                .context("failed to serialize AHP binding")
             }
             BridgeRequest::AhpUnbindSession => {
                 self.require_ahp_enabled()?;
-                Ok(json!({"unbound": self.database.ahp_unbind_session()?}))
+                Ok(json!({"unbound": self.unbind_foreground_session()?}))
             }
         }
     }
@@ -799,10 +903,9 @@ impl BridgeService {
                 .filter(|session| ahp_session_matches_workspace(&self.config, session))
                 .map(|session| session.session_uri)
                 .collect::<Vec<_>>();
-            match self
-                .database
-                .ahp_switch_session_by_button(button_data, &allowed_session_uris)
-            {
+            let (switch_intent, submission) =
+                self.switch_session_by_button(button_data, &allowed_session_uris);
+            match submission {
                 Ok(Some(submission)) if submission.accepted => {
                     if let Some(workspace) =
                         ahp_session_target_display(&self.config, &submission.session)
@@ -835,7 +938,8 @@ impl BridgeService {
                             let service = self.task_clone();
                             let interaction_id = interaction_id.to_owned();
                             tokio::spawn(async move {
-                                let result = service.switch_ahp_session(session).await;
+                                let result =
+                                    service.switch_ahp_session(session, switch_intent).await;
                                 let (key, message) = match result {
                                     Ok(message) => {
                                         (format!("switch-button:{interaction_id}"), message)
@@ -1506,7 +1610,8 @@ impl BridgeService {
                         .mark_inbound_kind(message_id, "ahp_switch_forbidden")?;
                     return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
                 }
-                match self.switch_ahp_session(session).await {
+                let switch_intent = self.begin_foreground_switch();
+                match self.switch_ahp_session(session, switch_intent).await {
                     Ok(binding) => {
                         self.database.mark_inbound_kind(message_id, "ahp_switch")?;
                         Ok(Some(binding))
@@ -1535,7 +1640,7 @@ impl BridgeService {
                         .mark_inbound_kind(message_id, "ahp_detach_forbidden")?;
                     return Ok(Some("该 Session 不属于配置的目标目录。".to_owned()));
                 }
-                match self.database.ahp_detach_session(&session.session_uri) {
+                match self.detach_session(&session.session_uri) {
                     Ok(true) => {
                         self.database.mark_inbound_kind(message_id, "ahp_detach")?;
                         Ok(Some(format!(
@@ -2448,6 +2553,7 @@ impl BridgeService {
         }
         self.database
             .mark_inbound_kind(message_id, "ahp_new_task")?;
+        let creation_intent = self.begin_foreground_switch();
         let old_binding = self.database.ahp_binding()?;
         let command = AhpCreateSessionCommand {
             target: context.target.clone(),
@@ -2475,17 +2581,18 @@ impl BridgeService {
             .as_ref()
             .and_then(|binding| binding.host_instance_id.clone());
         wizard.updated_at = Utc::now().timestamp();
+        wizard.expires_at = wizard.updated_at + i64::try_from(AHP_ACTIVE_CREATION_TTL_SECONDS)?;
         self.database.ahp_save_creation_wizard(&wizard)?;
         let service = self.task_clone();
         let wizard_id = wizard.wizard_id.clone();
         let source_message_id = message_id.to_owned();
         tokio::spawn(async move {
             if let Err(error) = service
-                .run_ahp_creation_workflow(&wizard_id, &source_message_id)
+                .run_ahp_creation_workflow(&wizard_id, &source_message_id, creation_intent)
                 .await
             {
                 service
-                    .handle_ahp_creation_workflow_failure(&wizard_id, &error)
+                    .handle_ahp_creation_workflow_failure(&wizard_id, creation_intent, &error)
                     .await;
             }
         });
@@ -2498,6 +2605,7 @@ impl BridgeService {
         &self,
         wizard_id: &str,
         source_message_id: &str,
+        creation_intent: u64,
     ) -> Result<()> {
         let Some((wizard, context)) = self.current_creation_context()? else {
             return Ok(());
@@ -2516,14 +2624,19 @@ impl BridgeService {
             .wait_for_ahp_command_terminal(
                 &wizard.wizard_id,
                 create_command_id,
-                Duration::from_secs(300),
+                Duration::from_secs(AHP_CREATION_COMMAND_TIMEOUT_SECONDS),
                 true,
             )
             .await?;
         if self.creation_cancel_requested(wizard_id)? {
             if let Some(session_uri) = wizard.new_session_uri.as_deref() {
-                self.rollback_created_session(&wizard, &context.target, session_uri)
-                    .await?;
+                self.rollback_created_session(
+                    &wizard,
+                    &context.target,
+                    session_uri,
+                    creation_intent,
+                )
+                .await?;
             }
             self.database.ahp_clear_creation_wizard()?;
             let _ = self
@@ -2572,6 +2685,7 @@ impl BridgeService {
                 &wizard,
                 &context.target,
                 &create_result.session.session_uri,
+                creation_intent,
             )
             .await?;
             self.database.ahp_clear_creation_wizard()?;
@@ -2586,7 +2700,8 @@ impl BridgeService {
                 .await;
             return Ok(());
         }
-        let pending_binding = match self.database.ahp_bind_session(
+        let pending_binding = match self.commit_foreground_switch(
+            creation_intent,
             &create_result.endpoint_id,
             &create_result.session.session_uri,
         ) {
@@ -2596,6 +2711,7 @@ impl BridgeService {
                     &wizard,
                     &context.target,
                     &create_result.session.session_uri,
+                    creation_intent,
                 )
                 .await?;
                 self.database.ahp_clear_creation_wizard()?;
@@ -2625,6 +2741,7 @@ impl BridgeService {
                     &wizard,
                     &context.target,
                     &create_result.session.session_uri,
+                    creation_intent,
                 )
                 .await?;
                 self.database.ahp_clear_creation_wizard()?;
@@ -2646,6 +2763,7 @@ impl BridgeService {
                     &wizard,
                     &context.target,
                     &create_result.session.session_uri,
+                    creation_intent,
                 )
                 .await?;
             }
@@ -2659,6 +2777,7 @@ impl BridgeService {
                     &wizard,
                     &context.target,
                     &create_result.session.session_uri,
+                    creation_intent,
                 )
                 .await?;
                 self.database.ahp_clear_creation_wizard()?;
@@ -2701,6 +2820,7 @@ impl BridgeService {
                 &wizard,
                 &context.target,
                 &create_result.session.session_uri,
+                creation_intent,
             )
             .await?;
             self.database.ahp_clear_creation_wizard()?;
@@ -2752,7 +2872,12 @@ impl BridgeService {
         Ok(())
     }
 
-    async fn handle_ahp_creation_workflow_failure(&self, wizard_id: &str, error: &anyhow::Error) {
+    async fn handle_ahp_creation_workflow_failure(
+        &self,
+        wizard_id: &str,
+        creation_intent: u64,
+        error: &anyhow::Error,
+    ) {
         tracing::error!(wizard_id, error = %error, "AHP Session creation workflow failed");
         let wizard = match self.database.ahp_creation_wizard() {
             Ok(Some(wizard)) if wizard.wizard_id == wizard_id => wizard,
@@ -2790,7 +2915,7 @@ impl BridgeService {
             && let (Some(context), Some(session_uri)) =
                 (context.as_ref(), wizard.new_session_uri.as_deref())
             && let Err(error) = self
-                .rollback_created_session(&wizard, &context.target, session_uri)
+                .rollback_created_session(&wizard, &context.target, session_uri, creation_intent)
                 .await
         {
             rollback_error = Some(redact_text(&error.to_string()));
@@ -2881,7 +3006,11 @@ impl BridgeService {
             .context("AHP Session disappeared after target refresh")
     }
 
-    async fn switch_ahp_session(&self, session: AhpSessionDescriptor) -> Result<String> {
+    async fn switch_ahp_session(
+        &self,
+        session: AhpSessionDescriptor,
+        switch_intent: u64,
+    ) -> Result<String> {
         let status = self
             .database
             .ahp_status(self.config.ahp.adapter_stale_seconds)?;
@@ -2902,9 +3031,11 @@ impl BridgeService {
         ) {
             session = self.prepare_ahp_session_target(&session).await?;
         }
-        let binding = self
-            .database
-            .ahp_bind_session(&session.endpoint_id, &session.session_uri)?;
+        let binding = self.commit_foreground_switch(
+            switch_intent,
+            &session.endpoint_id,
+            &session.session_uri,
+        )?;
         Ok(format!(
             "正在切换到 {}：{}\n目录: {}\nGeneration: {}",
             session.short_code.as_deref().unwrap_or("[unknown]"),
@@ -2920,12 +3051,16 @@ impl BridgeService {
         wizard: &crate::ahp_store::AhpCreationWizardRecord,
         target: &AhpManagedTarget,
         session_uri: &str,
+        creation_intent: u64,
     ) -> Result<()> {
         if let Some(binding) = self.database.ahp_binding_for_session(session_uri)? {
             if binding.active_turn_id.is_some() {
                 bail!("created Session started a Turn before rollback");
             }
-            if let Some(previous_session_uri) = wizard.old_binding_session_uri.as_deref() {
+            if binding.foreground
+                && let Some(previous_session_uri) = wizard.old_binding_session_uri.as_deref()
+                && self.foreground_switch_is_current(creation_intent)
+            {
                 let previous_session = self
                     .database
                     .ahp_session_by_uri(previous_session_uri)?
@@ -2939,22 +3074,31 @@ impl BridgeService {
                 } else {
                     self.prepare_ahp_session_target(&previous_session).await?
                 };
-                let previous = self.database.ahp_bind_session(
-                    &previous_session.endpoint_id,
-                    &previous_session.session_uri,
-                )?;
-                let restored = self
-                    .wait_for_ahp_binding_ready(
-                        &previous.binding_id,
-                        previous.generation,
-                        Duration::from_secs(60),
-                    )
-                    .await?;
-                if restored.session_uri != previous_session_uri || !restored.foreground {
-                    bail!("rollback restored a different AHP Session");
+                if self.foreground_switch_is_current(creation_intent) {
+                    match self.commit_foreground_switch(
+                        creation_intent,
+                        &previous_session.endpoint_id,
+                        &previous_session.session_uri,
+                    ) {
+                        Ok(previous) => {
+                            let restored = self
+                                .wait_for_ahp_binding_ready(
+                                    &previous.binding_id,
+                                    previous.generation,
+                                    Duration::from_secs(60),
+                                )
+                                .await?;
+                            if restored.session_uri != previous_session_uri || !restored.foreground
+                            {
+                                bail!("rollback restored a different AHP Session");
+                            }
+                        }
+                        Err(_) if !self.foreground_switch_is_current(creation_intent) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
-            if !self.database.ahp_detach_session(session_uri)? {
+            if !self.detach_created_session_for_rollback(creation_intent, session_uri)? {
                 bail!("created Session binding disappeared before rollback");
             }
             self.wait_for_ahp_binding_disposed(session_uri, Duration::from_secs(60))
@@ -4377,8 +4521,9 @@ fn validate_ahp_registration(registration: &AhpAdapterRegistration) -> Result<()
 fn validate_ahp_catalog(
     hosts: &[AhpHostDescriptor],
     sessions: &[AhpSessionDescriptor],
+    removed_session_uris: &[String],
 ) -> Result<()> {
-    if hosts.len() > 32 || sessions.len() > 2_000 {
+    if hosts.len() > 32 || sessions.len() > 2_000 || removed_session_uris.len() > 2_000 {
         bail!("AHP catalogue exceeds the configured safety limit");
     }
     for host in hosts {
@@ -4401,6 +4546,15 @@ fn validate_ahp_catalog(
         }
         for uri in &session.workspace_uris {
             validate_identifier("workspace URI", uri)?;
+        }
+    }
+    for session_uri in removed_session_uris {
+        validate_identifier("removed session_uri", session_uri)?;
+        if sessions
+            .iter()
+            .any(|session| session.session_uri == *session_uri)
+        {
+            bail!("AHP catalogue cannot add and remove the same Session");
         }
     }
     Ok(())
@@ -6673,6 +6827,7 @@ mod tests {
                 adapter_instance_id: "adapter-run-1".to_owned(),
                 hosts: vec![test_ahp_host()],
                 sessions,
+                removed_session_uris: vec![],
                 full_snapshot: true,
             })
             .await
@@ -6701,6 +6856,48 @@ mod tests {
             bindings
                 .iter()
                 .all(|binding| binding.session_uri != "copilot:/session-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_switch_intent_cannot_replace_a_newer_foreground_choice() {
+        let fixture = Fixture::new_ahp();
+        let first = test_ahp_session(1, &fixture.workspace, 1);
+        let second = test_ahp_session(2, &fixture.workspace, 2);
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpCatalogReplace {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                hosts: vec![test_ahp_host()],
+                sessions: vec![first.clone(), second.clone()],
+                removed_session_uris: vec![],
+                full_snapshot: true,
+            })
+            .await
+            .expect("replace catalogue");
+
+        let stale_intent = fixture.service.begin_foreground_switch();
+        let newer_intent = fixture.service.begin_foreground_switch();
+        fixture
+            .service
+            .commit_foreground_switch(newer_intent, &second.endpoint_id, &second.session_uri)
+            .expect("newer switch");
+        assert!(
+            fixture
+                .service
+                .commit_foreground_switch(stale_intent, &first.endpoint_id, &first.session_uri)
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_binding()
+                .expect("foreground")
+                .expect("binding")
+                .session_uri,
+            second.session_uri
         );
     }
 
@@ -7166,7 +7363,9 @@ mod tests {
                 old_binding_session_uri: None,
                 old_binding_host_instance_id: None,
                 cancel_requested: false,
-                expires_at: now + 600,
+                expires_at: now
+                    + i64::try_from(AHP_ACTIVE_CREATION_TTL_SECONDS)
+                        .expect("creation TTL fits i64"),
                 created_at: now,
                 updated_at: now,
             })
@@ -7290,6 +7489,18 @@ mod tests {
             .expect("start creation")
             .expect("queued response");
         assert!(reply.contains("正在创建"));
+        let active_wizard = fixture
+            .service
+            .database()
+            .ahp_creation_wizard()
+            .expect("active wizard query")
+            .expect("active wizard");
+        assert_eq!(active_wizard.state, "creating");
+        assert!(
+            active_wizard.expires_at
+                >= Utc::now().timestamp()
+                    + i64::try_from(AHP_ACTIVE_CREATION_TTL_SECONDS - 1).expect("creation TTL")
+        );
 
         let create_command = loop {
             let commands = fixture
@@ -7351,6 +7562,7 @@ mod tests {
                     last_seen_at: Some(Utc::now().timestamp()),
                 }],
                 sessions: vec![created_session.clone()],
+                removed_session_uris: vec![],
                 full_snapshot: false,
             })
             .await

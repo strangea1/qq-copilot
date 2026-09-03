@@ -23,9 +23,23 @@ $SwitchScript = Join-Path $InstallDirectory "scripts\switch-vscode-integration.p
 if (-not (Test-Path -LiteralPath $Bridge -PathType Leaf)) {
     throw "Bridge executable not found: $Bridge"
 }
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "Bridge config not found: $ConfigPath"
+}
+if (-not $SkipRestart) {
+    if (-not (Test-Path -LiteralPath $SwitchScript -PathType Leaf)) {
+        throw "Integration switch script not found: $SwitchScript"
+    }
+    & $SwitchScript `
+        -Mode Ahp `
+        -InstallDirectory $InstallDirectory `
+        -ConfigPath $ConfigPath `
+        -RequireIdle `
+        -CheckIdleOnly
+}
 
 if ($PSCmdlet.ParameterSetName -eq "Local") {
-    $Resolved = (Resolve-Path -LiteralPath $LocalWorkspace).Path
+    $Resolved = [System.IO.Path]::GetFullPath($LocalWorkspace)
     & $Bridge --config $ConfigPath remove-local-target --workspace $Resolved
     if ($LASTEXITCODE -ne 0) {
         throw "qq-bridge remove-local-target failed with exit code $LASTEXITCODE"
@@ -47,13 +61,18 @@ else {
     Write-Host "Removed remote target workspace: ssh:$SshAlias $RemoteWorkspace"
 }
 
-if (-not $SkipRestart -and (Test-Path -LiteralPath $SwitchScript -PathType Leaf)) {
-    & $SwitchScript `
-        -Mode Ahp `
-        -InstallDirectory $InstallDirectory `
-        -ConfigPath $ConfigPath `
-        -RequireIdle
-    if ($LASTEXITCODE -ne 0) {
-        throw "Bridge restart failed with exit code $LASTEXITCODE"
+if (-not $SkipRestart) {
+    try {
+        & $SwitchScript `
+            -Mode Ahp `
+            -InstallDirectory $InstallDirectory `
+            -ConfigPath $ConfigPath `
+            -RequireIdle
+        if ($LASTEXITCODE -ne 0) {
+            throw "Bridge restart failed with exit code $LASTEXITCODE"
+        }
+    }
+    catch {
+        throw "The target removal was saved, but the Bridge restart was deferred. Retry after the Bridge is idle. $($_.Exception.Message)"
     }
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
+import { pathToFileURL } from "node:url";
 
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -143,47 +144,137 @@ export async function createManagedSession(
       "The target still requires an explicit model or approval selection.",
     );
   }
-  const progressToken = `create-${request.sessionUri}`;
-  connection.setProgressToken(progressToken);
-  try {
-    await connection.client.request("createSession", {
-      channel: request.sessionUri,
-      provider: request.provider,
-      workingDirectories: [request.workspaceUri],
-      config: asRecord(resolved.values),
-      progressToken,
-    });
-  } finally {
-    connection.setProgressToken(undefined);
+  const existing = (await refreshManagedSessions(connection.client)).find(
+    (session) => session.resource === request.sessionUri,
+  );
+  if (existing) {
+    requireMatchingCreatedSession(connection, request, existing);
+    return managedSessionResult(connection, existing);
   }
-  for (let attempt = 0; attempt < 25; attempt += 1) {
-    const sessions = await refreshManagedSessions(connection.client);
-    const session = sessions.find(
-      (candidate) => candidate.resource === request.sessionUri,
+  const progressToken = `create-${request.sessionUri}`;
+  try {
+    connection.setProgressToken(progressToken);
+    try {
+      await connection.client.request("createSession", {
+        channel: request.sessionUri,
+        provider: request.provider,
+        workingDirectories: [request.workspaceUri],
+        config: asRecord(resolved.values),
+        progressToken,
+      });
+    } catch (requestError) {
+      let reconciled: SessionSummary | undefined;
+      try {
+        reconciled = await waitForManagedSession(
+          connection.client,
+          request.sessionUri,
+        );
+      } catch (reconciliationError) {
+        throw new AggregateError(
+          [requestError, reconciliationError],
+          "created-session-reconciliation-failed",
+        );
+      }
+      if (reconciled) {
+        requireMatchingCreatedSession(connection, request, reconciled);
+        return managedSessionResult(connection, reconciled);
+      }
+      throw requestError;
+    } finally {
+      connection.setProgressToken(undefined);
+    }
+    const session = await waitForManagedSession(
+      connection.client,
+      request.sessionUri,
     );
     if (session) {
-      return {
-        endpoint_id: connection.prepared.endpointId,
-        host_instance_id: connection.prepared.entry.instanceId,
-        workspace_uri: connection.prepared.workspaceUri,
-        host_label: connection.prepared.hostLabel,
-        editor_client_tools_available:
-          connection.prepared.editorClientToolsAvailable,
-        session,
-      };
+      requireMatchingCreatedSession(connection, request, session);
+      return managedSessionResult(connection, session);
+    }
+    throw new Error("created-session-not-listed");
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "session-uri-conflict"
+    ) {
+      throw error;
+    }
+    try {
+      await disposeManagedSession(connection, request.sessionUri);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "created-session-cleanup-failed",
+      );
+    }
+    throw error;
+  }
+}
+
+async function waitForManagedSession(
+  client: AhpClient,
+  sessionUri: string,
+): Promise<SessionSummary | undefined> {
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const session = (await refreshManagedSessions(client)).find(
+      (candidate) => candidate.resource === sessionUri,
+    );
+    if (session) {
+      return session;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error("created-session-not-listed");
+  return undefined;
+}
+
+function requireMatchingCreatedSession(
+  connection: ConnectedManagedTarget,
+  request: {
+    readonly provider: string;
+    readonly workspaceUri: string;
+  },
+  session: SessionSummary,
+): void {
+  if (
+    session.provider !== request.provider ||
+    !session.workingDirectories?.some((workspaceUri) =>
+      managedTargetMatchesWorkspaceUri(connection.prepared.target, workspaceUri),
+    )
+  ) {
+    throw codedError("session-uri-conflict");
+  }
 }
 
 export async function disposeManagedSession(
   connection: ConnectedManagedTarget,
   sessionUri: string,
 ): Promise<void> {
+  const exists = (await refreshManagedSessions(connection.client)).some(
+    (session) => session.resource === sessionUri,
+  );
+  if (!exists) {
+    return;
+  }
   await connection.client.request("disposeSession", {
     channel: sessionUri,
   });
+}
+
+function managedSessionResult(
+  connection: ConnectedManagedTarget,
+  session: SessionSummary,
+): CreateSessionResult {
+  return {
+    endpoint_id: connection.prepared.endpointId,
+    host_instance_id: connection.prepared.entry.instanceId,
+    workspace_uri: connection.prepared.workspaceUri,
+    host_label: connection.prepared.hostLabel,
+    editor_client_tools_available:
+      connection.prepared.editorClientToolsAvailable,
+    session,
+  };
 }
 
 interface CodeAgentEndpointsDocument {
@@ -233,7 +324,7 @@ export interface ConnectedManagedTarget {
 export async function connectManagedTarget(
   config: AdapterConfig,
   target: ManagedTarget,
-  onProgress?: (progress: ProgressNotification) => void,
+  onProgress?: (progress: ProgressNotification) => Promise<void> | void,
 ): Promise<ConnectedManagedTarget> {
   const prepared = await prepareManagedTarget(config, target);
   let client: AhpClient | undefined;
@@ -320,6 +411,9 @@ async function prepareManagedTarget(
   target: ManagedTarget,
 ): Promise<PreparedTarget> {
   if (target.kind === "local") {
+    if (!config.codeExecutable) {
+      throw codedError("code-not-configured");
+    }
     const started = await runProcessUntilExit(config.codeExecutable, [
       "agent",
       "host",
@@ -594,13 +688,61 @@ function endpointPublicId(entry: EndpointRegistryEntry): string {
   return entry.sourceFile.replace(/\.json$/u, "").slice(0, 12);
 }
 
+export function managedTargetWorkspaceUri(target: ManagedTarget): URI {
+  return target.kind === "local" ? fileUri(target.path) : posixFileUri(target.path);
+}
+
+export function managedTargetMatchesWorkspaceUri(
+  target: ManagedTarget,
+  workspaceUri: string,
+): boolean {
+  if (target.kind === "local") {
+    return workspaceUri.toLocaleLowerCase("en-US") ===
+      fileUri(target.path).toLocaleLowerCase("en-US");
+  }
+  let candidate: URL;
+  try {
+    candidate = new URL(workspaceUri);
+  } catch {
+    return false;
+  }
+  if (
+    candidate.protocol === "vscode-remote:" &&
+    candidate.host.toLocaleLowerCase("en-US") !==
+      `ssh-remote+${target.alias}`.toLocaleLowerCase("en-US")
+  ) {
+    return false;
+  }
+  if (
+    candidate.protocol !== "file:" &&
+    candidate.protocol !== "vscode-remote:"
+  ) {
+    return false;
+  }
+  if (candidate.protocol === "file:" && candidate.host !== "") {
+    return false;
+  }
+  if (candidate.search !== "" || candidate.hash !== "") {
+    return false;
+  }
+  try {
+    return normalizePosixPath(decodeURIComponent(candidate.pathname)) ===
+      normalizePosixPath(target.path);
+  } catch {
+    return false;
+  }
+}
+
 function fileUri(path: string): URI {
-  const normalized = path.replace(/\\/gu, "/");
-  return `file:///${encodeURI(normalized)}`;
+  return pathToFileURL(path).href;
 }
 
 function posixFileUri(path: string): URI {
-  return `file://${encodeURI(normalizePosixPath(path))}`;
+  const encodedPath = normalizePosixPath(path)
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `file://${encodedPath}`;
 }
 
 function normalizePosixPath(path: string): string {
@@ -903,12 +1045,14 @@ function canConnectToLocalPort(port: number): Promise<boolean> {
 
 class ProgressTapTransport implements AhpTransport {
   readonly #inner: AhpTransport;
-  readonly #onProgress: ((progress: ProgressNotification) => void) | undefined;
+  readonly #onProgress:
+    | ((progress: ProgressNotification) => Promise<void> | void)
+    | undefined;
   #progressToken: string | undefined;
 
   constructor(
     inner: AhpTransport,
-    onProgress?: (progress: ProgressNotification) => void,
+    onProgress?: (progress: ProgressNotification) => Promise<void> | void,
   ) {
     this.#inner = inner;
     this.#onProgress = onProgress;
@@ -933,7 +1077,7 @@ class ProgressTapTransport implements AhpTransport {
       this.#onProgress &&
       notification.progressToken === this.#progressToken
     ) {
-      this.#onProgress(notification);
+      await this.#onProgress(notification);
     }
     return frame;
   }

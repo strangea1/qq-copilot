@@ -8,7 +8,9 @@ param(
 
     [string]$ConfigPath = "$env:LOCALAPPDATA\CopilotQQBridge\config.toml",
 
-    [switch]$RequireIdle
+    [switch]$RequireIdle,
+
+    [switch]$CheckIdleOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +33,9 @@ if (-not (Test-Path -LiteralPath $Bridge -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Bridge config not found: $ConfigPath"
+}
+if ($CheckIdleOnly -and -not $RequireIdle) {
+    throw "-CheckIdleOnly requires -RequireIdle."
 }
 if ($RequireIdle) {
     $StatusOutput = & $Bridge --config $ConfigPath status
@@ -63,6 +68,10 @@ if ($RequireIdle) {
     if ($Status.ahp.creation) {
         throw "Finish or cancel the current /new workflow before restarting."
     }
+}
+if ($CheckIdleOnly) {
+    Write-Host "Bridge is idle."
+    return
 }
 
 $StatusOutput = & $Bridge --config $ConfigPath status 2>$null
@@ -202,14 +211,33 @@ foreach ($Process in $ManagedProcesses) {
 }
 
 $ConfigArgument = '"' + $ConfigPath + '"'
-Start-Process `
+$StartedBridge = Start-Process `
     -FilePath $Bridge `
     -ArgumentList @("--config", $ConfigArgument, "run") `
-    -WindowStyle Hidden
-Start-Sleep -Seconds 2
-& $Bridge --config $ConfigPath status | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "Bridge did not become ready after integration switch"
+    -WindowStyle Hidden `
+    -PassThru
+$ReadyDeadline = [DateTime]::UtcNow.AddSeconds(30)
+$BridgeReady = $false
+do {
+    Start-Sleep -Milliseconds 500
+    $StartedBridge.Refresh()
+    if ($StartedBridge.HasExited) {
+        break
+    }
+    & $Bridge --config $ConfigPath status 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $BridgeReady = $true
+        break
+    }
+} while ([DateTime]::UtcNow -lt $ReadyDeadline)
+
+if (-not $BridgeReady) {
+    $StartedBridge.Refresh()
+    if (-not $StartedBridge.HasExited) {
+        Stop-Process -Id $StartedBridge.Id
+        Wait-Process -Id $StartedBridge.Id -Timeout 15 -ErrorAction SilentlyContinue
+    }
+    throw "Bridge process $($StartedBridge.Id) did not become ready within 30 seconds after integration switch."
 }
 
 Write-Host "VS Code integration switched to $Mode mode."

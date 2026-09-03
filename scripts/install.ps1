@@ -15,6 +15,24 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 
+function Get-NativeCommandPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        $CommandInfo,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName
+    )
+
+    foreach ($PropertyName in @("Source", "Path", "FullName")) {
+        $Property = $CommandInfo.PSObject.Properties[$PropertyName]
+        if ($Property -and -not [string]::IsNullOrWhiteSpace([string]$Property.Value)) {
+            return [string]$Property.Value
+        }
+    }
+    throw "$DisplayName path could not be resolved."
+}
+
 if (-not $SkipBuild) {
     Push-Location $ProjectRoot
     try {
@@ -59,6 +77,47 @@ foreach ($Path in $AhpWorkspace) {
         throw "AHP target workspace is not a directory: $Resolved"
     }
     $ResolvedAhpWorkspaces += $Resolved
+}
+
+$NodeCommand = Get-Command node.exe -ErrorAction Stop
+$NodeCommandPath = Get-NativeCommandPath $NodeCommand "Node.js"
+$NodeVersion = (& $NodeCommandPath --version).TrimStart("v")
+$NodeMajor = [int]($NodeVersion.Split(".")[0])
+if ($NodeMajor -lt 24) {
+    throw "AHP Adapter requires Node 24 or newer; found $NodeVersion"
+}
+
+$CodeLauncherPath = $null
+$CodeCommandPath = $null
+$SshCommandPath = $null
+if ($ResolvedAhpWorkspaces.Count -gt 0) {
+    $CodeLauncher = Get-Command code.cmd -ErrorAction SilentlyContinue
+    if ($null -eq $CodeLauncher) {
+        $CodeLauncher = Get-Command code.exe -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $CodeLauncher) {
+        throw "VS Code launcher was not found on PATH (code.cmd/code.exe)."
+    }
+    $CodeLauncherPath = Get-NativeCommandPath $CodeLauncher "VS Code launcher"
+
+    $CodeCommand = Get-Command code-tunnel.exe -ErrorAction SilentlyContinue
+    if ($null -eq $CodeCommand) {
+        $CodeCommand = Get-ChildItem `
+            -LiteralPath (Split-Path -Parent $CodeLauncherPath) `
+            -Filter "code-tunnel.exe" `
+            -File `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
+    if ($null -eq $CodeCommand) {
+        throw "Native VS Code Agent Host CLI code-tunnel.exe was not found."
+    }
+    $CodeCommandPath = Get-NativeCommandPath $CodeCommand "Native VS Code Agent Host CLI"
+
+    $SshCommand = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if ($null -ne $SshCommand) {
+        $SshCommandPath = Get-NativeCommandPath $SshCommand "OpenSSH"
+    }
 }
 
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
@@ -117,43 +176,6 @@ foreach ($ManagedScript in @(
         -LiteralPath (Join-Path $ProjectRoot "scripts\$ManagedScript") `
         -Destination (Join-Path $ManagedScriptsDirectory $ManagedScript) `
         -Force
-}
-
-$NodeCommand = Get-Command node.exe -ErrorAction Stop
-$CodeLauncher = Get-Command code.cmd -ErrorAction SilentlyContinue
-if ($null -eq $CodeLauncher) {
-    $CodeLauncher = Get-Command code.exe -ErrorAction SilentlyContinue
-}
-if ($null -eq $CodeLauncher) {
-    throw "VS Code launcher was not found on PATH (code.cmd/code.exe)."
-}
-$CodeCommand = Get-Command code-tunnel.exe -ErrorAction SilentlyContinue
-if ($null -eq $CodeCommand) {
-    $CodeCommand = Get-ChildItem `
-        -LiteralPath (Split-Path -Parent $CodeLauncher.Source) `
-        -Filter "code-tunnel.exe" `
-        -File `
-        -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-}
-if ($null -eq $CodeCommand) {
-    throw "Native VS Code Agent Host CLI code-tunnel.exe was not found."
-}
-$CodeCommandPath = [string]$CodeCommand.Source
-if ([string]::IsNullOrWhiteSpace($CodeCommandPath)) {
-    $CodeCommandPath = [string]$CodeCommand.FullName
-}
-if ([string]::IsNullOrWhiteSpace($CodeCommandPath)) {
-    throw "Native VS Code Agent Host CLI path could not be resolved."
-}
-$SshCommand = Get-Command ssh.exe -ErrorAction SilentlyContinue
-if ($null -eq $SshCommand) {
-    throw "OpenSSH ssh.exe was not found on PATH."
-}
-$NodeVersion = (& $NodeCommand.Source --version).TrimStart("v")
-$NodeMajor = [int]($NodeVersion.Split(".")[0])
-if ($NodeMajor -lt 24) {
-    throw "AHP Adapter requires Node 24 or newer; found $NodeVersion"
 }
 
 $AdapterDirectory = Join-Path $InstallDirectory "ahp-adapter"
@@ -228,12 +250,14 @@ if ($ResolvedAhpWorkspaces.Count -gt 0) {
         $ConfigureAhpArgs += @("--workspace", $Path)
     }
     $ConfigureAhpArgs += @(
-        "--node", $NodeCommand.Source,
+        "--node", $NodeCommandPath,
         "--adapter-script", (Join-Path $AdapterDirectory "dist\main.js"),
         "--code", $CodeCommandPath,
-        "--code-launcher", $CodeLauncher.Source,
-        "--ssh", $SshCommand.Source
+        "--code-launcher", $CodeLauncherPath
     )
+    if (-not [string]::IsNullOrWhiteSpace($SshCommandPath)) {
+        $ConfigureAhpArgs += @("--ssh", $SshCommandPath)
+    }
     & $Bridge @ConfigureAhpArgs
     if ($LASTEXITCODE -ne 0) {
         throw "qq-bridge configure-ahp failed with exit code $LASTEXITCODE"

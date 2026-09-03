@@ -476,14 +476,9 @@ impl AppConfig {
                 bail!("AHP retention, lease, poll, and stale intervals must be non-zero");
             }
             if self.ahp.adapter_auto_start
-                && (self.ahp.node_executable.is_none()
-                    || self.ahp.adapter_script.is_none()
-                    || self.ahp.code_executable.is_none()
-                    || self.ahp.code_launcher.is_none())
+                && (self.ahp.node_executable.is_none() || self.ahp.adapter_script.is_none())
             {
-                bail!(
-                    "ahp.node_executable, ahp.adapter_script, ahp.code_executable, and ahp.code_launcher are required for auto-start"
-                );
+                bail!("ahp.node_executable and ahp.adapter_script are required for auto-start");
             }
             for path in [
                 self.ahp.node_executable.as_ref(),

@@ -86,6 +86,8 @@ pub enum BridgeRequest {
         adapter_instance_id: String,
         hosts: Vec<AhpHostDescriptor>,
         sessions: Vec<AhpSessionDescriptor>,
+        #[serde(default)]
+        removed_session_uris: Vec<String>,
         #[serde(default = "default_true")]
         full_snapshot: bool,
     },

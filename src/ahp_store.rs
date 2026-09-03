@@ -186,6 +186,15 @@ pub struct AhpCommandStatusRecord {
     pub progress: Option<AhpCommandProgressRecord>,
 }
 
+struct AhpCommandAckRecord {
+    binding_id: String,
+    command_kind: String,
+    state: String,
+    lease_owner: Option<String>,
+    error_code: Option<String>,
+    result_json: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpCreationWizardRecord {
     pub wizard_id: String,
@@ -992,7 +1001,7 @@ impl Database {
         hosts: &[AhpHostDescriptor],
         sessions: &[AhpSessionDescriptor],
     ) -> Result<()> {
-        self.ahp_replace_catalog_scoped(adapter_id, adapter_instance_id, hosts, sessions, true)
+        self.ahp_replace_catalog_scoped(adapter_id, adapter_instance_id, hosts, sessions, &[], true)
     }
 
     pub fn ahp_replace_catalog_scoped(
@@ -1001,6 +1010,7 @@ impl Database {
         adapter_instance_id: &str,
         hosts: &[AhpHostDescriptor],
         sessions: &[AhpSessionDescriptor],
+        removed_session_uris: &[String],
         full_snapshot: bool,
     ) -> Result<()> {
         let now = now();
@@ -1070,6 +1080,89 @@ impl Database {
                 bail!("AHP session references an unknown host");
             }
             upsert_catalog_session(&transaction, session, now)?;
+        }
+        for session_uri in removed_session_uris {
+            let catalog_scope = transaction
+                .query_row(
+                    "SELECT endpoint_id, target_kind, target_path, ssh_alias
+                     FROM ahp_session_catalog WHERE session_uri = ?1",
+                    [session_uri],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if !full_snapshot
+                && catalog_scope.as_ref().is_some_and(
+                    |(endpoint_id, target_kind, target_path, ssh_alias)| {
+                        !hosts.iter().any(|host| {
+                            host_matches_catalog_scope(
+                                host,
+                                endpoint_id,
+                                target_kind.as_deref(),
+                                target_path.as_deref(),
+                                ssh_alias.as_deref(),
+                            )
+                        })
+                    },
+                )
+            {
+                bail!("removed AHP Session is outside the scoped host catalogue");
+            }
+            let binding_id = transaction
+                .query_row(
+                    "SELECT binding_id, endpoint_id FROM ahp_bindings WHERE session_uri = ?1",
+                    [session_uri],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if !full_snapshot
+                && catalog_scope.is_none()
+                && binding_id.as_ref().is_some_and(|(_, endpoint_id)| {
+                    !hosts.iter().any(|host| host.endpoint_id == *endpoint_id)
+                })
+            {
+                bail!("removed AHP Session binding is outside the scoped host catalogue");
+            }
+            if let Some((binding_id, _)) = binding_id {
+                transaction.execute(
+                    "UPDATE ahp_commands
+                     SET state = 'failed', error_code = 'session_removed',
+                         lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+                     WHERE binding_id = ?2 AND state IN ('pending', 'leased')",
+                    params![now, binding_id],
+                )?;
+                transaction.execute(
+                    "UPDATE ahp_approvals
+                     SET state = 'failed', updated_at = ?1
+                     WHERE session_uri = ?2 AND state IN ('pending', 'submitted')",
+                    params![now, session_uri],
+                )?;
+                transaction.execute(
+                    "UPDATE ahp_inputs
+                     SET state = 'failed', updated_at = ?1
+                     WHERE session_uri = ?2 AND state IN ('pending', 'submitted')",
+                    params![now, session_uri],
+                )?;
+                transaction.execute(
+                    "DELETE FROM ahp_foreground_binding WHERE binding_id = ?1",
+                    [&binding_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM ahp_bindings WHERE binding_id = ?1",
+                    [&binding_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM ahp_session_catalog WHERE session_uri = ?1",
+                [session_uri],
+            )?;
+            select_replacement_foreground(&transaction, now)?;
         }
         fail_bindings_for_host_changes(&transaction, hosts, full_snapshot, now)?;
         transaction.execute(
@@ -2163,18 +2256,52 @@ impl Database {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_adapter(&transaction, adapter_id, adapter_instance_id)?;
-        let command: Option<(String, String)> = transaction
+        let result = result.map(canonical_json);
+        let command: Option<AhpCommandAckRecord> = transaction
             .query_row(
-                "SELECT binding_id, kind FROM ahp_commands
-                 WHERE command_id = ?1 AND state = 'leased' AND lease_owner = ?2",
-                params![command_id, adapter_instance_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT binding_id, kind, state, lease_owner, error_code, result_json
+                 FROM ahp_commands WHERE command_id = ?1",
+                [command_id],
+                |row| {
+                    Ok(AhpCommandAckRecord {
+                        binding_id: row.get(0)?,
+                        command_kind: row.get(1)?,
+                        state: row.get(2)?,
+                        lease_owner: row.get(3)?,
+                        error_code: row.get(4)?,
+                        result_json: row.get(5)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((binding_id, command_kind)) = command else {
+        let Some(command) = command else {
             bail!("AHP command acknowledgement is stale or mismatched");
         };
-        let result = result.map(canonical_json);
+        if command.state != "leased" || command.lease_owner.as_deref() != Some(adapter_instance_id)
+        {
+            if command.state == "failed"
+                && matches!(
+                    command.error_code.as_deref(),
+                    Some(
+                        "session_removed"
+                            | "binding_replaced"
+                            | "host_restarted"
+                            | "binding_migration_unresolved"
+                    )
+                )
+            {
+                return Ok(());
+            }
+            if command.state == outcome.as_str()
+                && command.error_code.as_deref() == error_code
+                && command.result_json == result
+            {
+                return Ok(());
+            }
+            bail!("AHP command acknowledgement is stale or mismatched");
+        }
+        let binding_id = command.binding_id;
+        let command_kind = command.command_kind;
         let changed = transaction.execute(
             "UPDATE ahp_commands
              SET state = ?1, error_code = ?2, result_json = ?3,
@@ -2184,7 +2311,7 @@ impl Database {
             params![
                 outcome.as_str(),
                 error_code,
-                result,
+                result.as_deref(),
                 now,
                 command_id,
                 adapter_instance_id
@@ -2252,6 +2379,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ahp_record_command_progress(
         &self,
         adapter_id: &str,
@@ -2260,8 +2388,11 @@ impl Database {
         progress: u64,
         total: Option<u64>,
         message: Option<&str>,
+        lease_seconds: u64,
     ) -> Result<()> {
         let now = now();
+        let lease_expires_at = now
+            + i64::try_from(lease_seconds).context("AHP command lease exceeds supported range")?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_adapter(&transaction, adapter_id, adapter_instance_id)?;
@@ -2272,9 +2403,16 @@ impl Database {
         }));
         let changed = transaction.execute(
             "UPDATE ahp_commands
-             SET progress_json = ?1, progress_updated_at = ?2, updated_at = ?2
-             WHERE command_id = ?3 AND state = 'leased' AND lease_owner = ?4",
-            params![payload, now, command_id, adapter_instance_id],
+             SET progress_json = ?1, progress_updated_at = ?2,
+                 lease_expires_at = ?3, updated_at = ?2
+             WHERE command_id = ?4 AND state = 'leased' AND lease_owner = ?5",
+            params![
+                payload,
+                now,
+                lease_expires_at,
+                command_id,
+                adapter_instance_id
+            ],
         )?;
         if changed != 1 {
             bail!("AHP command progress targets a stale or inactive lease");
@@ -4118,6 +4256,25 @@ fn fail_bindings_for_host_changes(
     Ok(())
 }
 
+fn host_matches_catalog_scope(
+    host: &AhpHostDescriptor,
+    endpoint_id: &str,
+    target_kind: Option<&str>,
+    target_path: Option<&str>,
+    ssh_alias: Option<&str>,
+) -> bool {
+    if host.endpoint_id == endpoint_id {
+        return true;
+    }
+    match (target_kind, host.target_kind) {
+        (Some("local"), Some(AhpTargetKind::Local)) => host.target_path.as_deref() == target_path,
+        (Some("ssh"), Some(AhpTargetKind::Ssh)) => {
+            host.target_path.as_deref() == target_path && host.ssh_alias.as_deref() == ssh_alias
+        }
+        _ => false,
+    }
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -4274,6 +4431,80 @@ mod tests {
                 None,
             )
             .expect("ack");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                commands[0].command_id,
+                AhpCommandOutcome::Applied,
+                None,
+                None,
+            )
+            .expect("duplicate ack is idempotent");
+        assert!(
+            database
+                .ahp_ack_command(
+                    "adapter-stable",
+                    "adapter-run-1",
+                    commands[0].command_id,
+                    AhpCommandOutcome::Failed,
+                    Some("different"),
+                    None,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn command_progress_renews_the_active_lease() {
+        let (_directory, database) = database();
+        database
+            .ahp_register_adapter(&registration("adapter-run-1"))
+            .expect("register");
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &[session("host-1")],
+            )
+            .expect("catalogue");
+        database
+            .ahp_bind_session("endpoint-1", "copilot:/session-1")
+            .expect("bind");
+        let command = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 1)
+            .expect("poll")
+            .into_iter()
+            .next()
+            .expect("leased command");
+        database
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE ahp_commands SET lease_expires_at = ?1 WHERE command_id = ?2",
+                params![now() - 1, command.command_id],
+            )
+            .expect("expire original lease");
+
+        database
+            .ahp_record_command_progress(
+                "adapter-stable",
+                "adapter-run-1",
+                command.command_id,
+                1,
+                Some(2),
+                Some("working"),
+                60,
+            )
+            .expect("record progress");
+
+        assert!(
+            database
+                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+                .expect("poll after progress")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4290,9 +4521,15 @@ mod tests {
                 &[session("host-1")],
             )
             .expect("first catalogue");
-        database
+        let binding = database
             .ahp_bind_session("endpoint-1", "copilot:/session-1")
             .expect("bind");
+        let leased_command = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("poll binding command")
+            .into_iter()
+            .find(|command| command.binding_id == binding.binding_id)
+            .expect("leased binding command");
         database
             .ahp_replace_catalog(
                 "adapter-stable",
@@ -4301,6 +4538,16 @@ mod tests {
                 &[session("host-2")],
             )
             .expect("replacement catalogue");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                leased_command.command_id,
+                AhpCommandOutcome::Applied,
+                None,
+                None,
+            )
+            .expect("late host restart acknowledgement is ignored");
         let binding = database.ahp_binding().expect("binding").expect("bound");
         assert_eq!(binding.state, "lost");
         assert_eq!(database.ahp_status(60).expect("status").pending_commands, 0);
@@ -4335,6 +4582,7 @@ mod tests {
                 "adapter-run-1",
                 &[other_host],
                 &[other_session],
+                &[],
                 false,
             )
             .expect("partial catalogue");
@@ -4345,6 +4593,144 @@ mod tests {
             .expect("binding");
         assert_eq!(unchanged.state, "binding");
         assert_eq!(database.ahp_status(60).expect("status").pending_commands, 1);
+    }
+
+    #[test]
+    fn confirmed_session_removal_deletes_the_cached_catalogue_row() {
+        let (_directory, database) = database();
+        database
+            .ahp_register_adapter(&registration("adapter-run-1"))
+            .expect("register");
+        let host = host("host-1");
+        let session = session("host-1");
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                std::slice::from_ref(&host),
+                std::slice::from_ref(&session),
+            )
+            .expect("initial catalogue");
+        let binding = database
+            .ahp_bind_session(&session.endpoint_id, &session.session_uri)
+            .expect("track disposed session");
+        let leased_command = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("poll binding command")
+            .into_iter()
+            .find(|command| command.binding_id == binding.binding_id)
+            .expect("leased binding command");
+
+        database
+            .ahp_replace_catalog_scoped(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host],
+                &[],
+                std::slice::from_ref(&session.session_uri),
+                false,
+            )
+            .expect("remove disposed session");
+        database
+            .ahp_ack_command(
+                "adapter-stable",
+                "adapter-run-1",
+                leased_command.command_id,
+                AhpCommandOutcome::Applied,
+                None,
+                None,
+            )
+            .expect("late acknowledgement is ignored");
+
+        assert!(
+            database
+                .ahp_session_by_uri(&session.session_uri)
+                .expect("session query")
+                .is_none()
+        );
+        assert!(database.ahp_list_sessions().expect("sessions").is_empty());
+        assert!(
+            database
+                .ahp_binding_for_session(&session.session_uri)
+                .expect("binding query")
+                .is_none()
+        );
+        assert_eq!(database.ahp_status(60).expect("status").pending_commands, 0);
+    }
+
+    #[test]
+    fn scoped_session_removal_cannot_delete_another_hosts_catalogue() {
+        let (_directory, database) = database();
+        database
+            .ahp_register_adapter(&registration("adapter-run-1"))
+            .expect("register");
+        let session = session("host-1");
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                std::slice::from_ref(&session),
+            )
+            .expect("initial catalogue");
+        let mut unrelated_host = host("host-2");
+        unrelated_host.endpoint_id = "endpoint-2".to_owned();
+        unrelated_host.target_path = Some(r"C:\other".to_owned());
+
+        assert!(
+            database
+                .ahp_replace_catalog_scoped(
+                    "adapter-stable",
+                    "adapter-run-1",
+                    &[unrelated_host],
+                    &[],
+                    std::slice::from_ref(&session.session_uri),
+                    false,
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .ahp_session_by_uri(&session.session_uri)
+                .expect("session query")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scoped_session_removal_survives_managed_endpoint_restart() {
+        let (_directory, database) = database();
+        database
+            .ahp_register_adapter(&registration("adapter-run-1"))
+            .expect("register");
+        let session = session("host-1");
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                std::slice::from_ref(&session),
+            )
+            .expect("initial catalogue");
+        let mut restarted_host = host("host-2");
+        restarted_host.endpoint_id = "endpoint-2".to_owned();
+
+        database
+            .ahp_replace_catalog_scoped(
+                "adapter-stable",
+                "adapter-run-1",
+                &[restarted_host],
+                &[],
+                std::slice::from_ref(&session.session_uri),
+                false,
+            )
+            .expect("remove disposed session after endpoint restart");
+        assert!(
+            database
+                .ahp_session_by_uri(&session.session_uri)
+                .expect("session query")
+                .is_none()
+        );
     }
 
     #[test]

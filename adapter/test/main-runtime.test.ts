@@ -98,6 +98,10 @@ class FakeBridgeClient implements BridgeClientLike {
     assert.ok(resolve, "expected a pending poll");
     resolve(result);
   }
+
+  get pendingPollCount(): number {
+    return this.#pendingPolls.length;
+  }
 }
 
 class FakeSessionBinding implements AhpSessionBinding {
@@ -114,6 +118,8 @@ class FakeSessionBinding implements AhpSessionBinding {
     readonly clientSeq: number | undefined;
   }> = [];
 
+  beforeQueueUserText: (() => Promise<void>) | undefined;
+
   closeCount = 0;
 
   constructor(snapshot: BoundSessionSnapshot) {
@@ -129,6 +135,7 @@ class FakeSessionBinding implements AhpSessionBinding {
     text: string,
     clientSeq?: number,
   ): Promise<{ readonly disposition: "queued"; readonly id: string; readonly clientSeq: number }> {
+    await this.beforeQueueUserText?.();
     this.queueUserTextCalls.push({ text, clientSeq });
     return {
       disposition: "queued",
@@ -213,6 +220,10 @@ class FakeCore implements AhpCoreLike {
 
   emitConnection(event: ConnectionEvent): void {
     this.#callbacks.onConnection?.(event);
+  }
+
+  emitCatalogue(snapshot: CatalogueSnapshot): void {
+    this.#callbacks.onCatalogue?.(snapshot);
   }
 
   emitSessionSnapshot(event: SessionSnapshotEvent): void {
@@ -316,6 +327,82 @@ test("runtime restores every registered binding and publishes per binding", asyn
   assert.equal(core?.stopCount, 1);
   assert.equal(firstBinding.closeCount, 1);
   assert.equal(secondBinding.closeCount, 1);
+});
+
+test("runtime serializes catalogue snapshots in observation order", async () => {
+  const bridge = new FakeBridgeClient({ bindings: [] });
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let catalogueCalls = 0;
+  bridge.beforeCall.set("ahp_catalog_replace", async () => {
+    catalogueCalls += 1;
+    if (catalogueCalls === 2) {
+      await blocked;
+    }
+  });
+  let core: FakeCore | undefined;
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) => {
+      core = new FakeCore(options, catalogue([]), []);
+      return core;
+    },
+  });
+
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_catalog_replace").length === 1,
+    "expected initial catalogue",
+  );
+  await waitFor(
+    () => bridge.pendingPollCount === 1,
+    "expected command polling",
+  );
+
+  core?.emitCatalogue(catalogue([summary("copilot:/first", "First")]));
+  await waitFor(
+    () => requestsFor(bridge, "ahp_catalog_replace").length === 2,
+    "expected first callback catalogue",
+  );
+  core?.emitCatalogue(catalogue([summary("copilot:/second", "Second")]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(requestsFor(bridge, "ahp_catalog_replace").length, 2);
+
+  release?.();
+  await waitFor(
+    () => requestsFor(bridge, "ahp_catalog_replace").length === 3,
+    "expected queued callback catalogue",
+  );
+  const catalogues = requestsFor(bridge, "ahp_catalog_replace");
+  const firstCallback = catalogues.at(1);
+  const secondCallback = catalogues.at(2);
+  assert.ok(firstCallback);
+  assert.ok(secondCallback);
+  assert.ok(Array.isArray(firstCallback.sessions));
+  assert.ok(Array.isArray(secondCallback.sessions));
+  const firstSession = firstCallback.sessions.at(0) as
+    | Record<string, unknown>
+    | undefined;
+  const secondSession = secondCallback.sessions.at(0) as
+    | Record<string, unknown>
+    | undefined;
+  assert.ok(firstSession);
+  assert.ok(secondSession);
+  assert.equal(
+    firstSession.session_uri,
+    "copilot:/first",
+  );
+  assert.equal(
+    secondSession.session_uri,
+    "copilot:/second",
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
 });
 
 test("runtime routes pending and active bindings by binding id and generation", async () => {
@@ -464,6 +551,359 @@ test("runtime routes pending and active bindings by binding id and generation", 
   assert.equal(firstBinding.closeCount, 1);
   assert.equal(secondBinding.closeCount, 1);
   assert.equal(core?.stopCount, 1);
+});
+
+test("runtime executes commands for different bindings concurrently", async () => {
+  const first = bindingRecord(
+    "binding-1",
+    1,
+    "copilot:/session-1",
+    "ahp-chat://default/session-1",
+  );
+  const second = bindingRecord(
+    "binding-2",
+    1,
+    "copilot:/session-2",
+    "ahp-chat://default/session-2",
+  );
+  const bridge = new FakeBridgeClient({ bindings: [first, second] });
+  const firstBinding = new FakeSessionBinding(
+    boundSnapshot(first.session_uri, chatUriOf(first)),
+  );
+  const secondBinding = new FakeSessionBinding(
+    boundSnapshot(second.session_uri, chatUriOf(second)),
+  );
+  let releaseFirst: (() => void) | undefined;
+  const firstBlocked = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  firstBinding.beforeQueueUserText = async () => {
+    await firstBlocked;
+  };
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) =>
+      new FakeCore(
+        options,
+        catalogue([
+          summary(first.session_uri, "First"),
+          summary(second.session_uri, "Second"),
+        ]),
+        [firstBinding, secondBinding],
+      ),
+  });
+
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_binding_ready").length === 2,
+    "expected both bindings to restore",
+  );
+
+  bridge.resolvePoll({
+    commands: [
+      {
+        command_id: 1,
+        command_key: "send:binding-1",
+        binding_id: first.binding_id,
+        binding_generation: first.generation,
+        kind: "send_message",
+        data: { content: "blocked" },
+      },
+      {
+        command_id: 2,
+        command_key: "send:binding-2",
+        binding_id: second.binding_id,
+        binding_generation: second.generation,
+        kind: "send_message",
+        data: { content: "not blocked" },
+      },
+    ],
+  });
+
+  await waitFor(
+    () => secondBinding.queueUserTextCalls.length === 1,
+    "expected the second binding command to complete independently",
+  );
+  assert.equal(firstBinding.queueUserTextCalls.length, 0);
+  assert.equal(requestsFor(bridge, "ahp_ack_command").length, 1);
+  assert.equal(
+    requestsFor(bridge, "ahp_ack_command")[0]?.command_id,
+    2,
+  );
+
+  releaseFirst?.();
+  await waitFor(
+    () => requestsFor(bridge, "ahp_ack_command").length === 2,
+    "expected the blocked binding command to finish",
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
+});
+
+test("runtime preserves command order within one binding", async () => {
+  const record = bindingRecord(
+    "binding-1",
+    1,
+    "copilot:/session-1",
+    "ahp-chat://default/session-1",
+  );
+  const bridge = new FakeBridgeClient({ bindings: [record] });
+  const sessionBinding = new FakeSessionBinding(
+    boundSnapshot(record.session_uri, chatUriOf(record)),
+  );
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let invocations = 0;
+  sessionBinding.beforeQueueUserText = async () => {
+    invocations += 1;
+    if (invocations === 1) {
+      await blocked;
+    }
+  };
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) =>
+      new FakeCore(
+        options,
+        catalogue([summary(record.session_uri, "First")]),
+        [sessionBinding],
+      ),
+  });
+
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_binding_ready").length === 1,
+    "expected binding restore",
+  );
+  bridge.resolvePoll({
+    commands: [
+      {
+        command_id: 1,
+        command_key: "send:first",
+        binding_id: record.binding_id,
+        binding_generation: record.generation,
+        kind: "send_message",
+        data: { content: "first" },
+      },
+      {
+        command_id: 2,
+        command_key: "send:second",
+        binding_id: record.binding_id,
+        binding_generation: record.generation,
+        kind: "send_message",
+        data: { content: "second" },
+      },
+    ],
+  });
+
+  await waitFor(() => invocations === 1, "expected first command to begin");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(invocations, 1);
+  release?.();
+  await waitFor(
+    () => sessionBinding.queueUserTextCalls.length === 2,
+    "expected both commands",
+  );
+  assert.deepEqual(
+    sessionBinding.queueUserTextCalls.map((call) => call.text),
+    ["first", "second"],
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
+});
+
+test("runtime does not enqueue a leased command twice while it is in flight", async () => {
+  const record = bindingRecord(
+    "binding-1",
+    1,
+    "copilot:/session-1",
+    "ahp-chat://default/session-1",
+  );
+  const bridge = new FakeBridgeClient({ bindings: [record] });
+  const sessionBinding = new FakeSessionBinding(
+    boundSnapshot(record.session_uri, chatUriOf(record)),
+  );
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let invocations = 0;
+  sessionBinding.beforeQueueUserText = async () => {
+    invocations += 1;
+    await blocked;
+  };
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) =>
+      new FakeCore(
+        options,
+        catalogue([summary(record.session_uri, "First")]),
+        [sessionBinding],
+      ),
+  });
+
+  const command: AdapterCommand = {
+    command_id: 1,
+    command_key: "send:binding-1",
+    binding_id: record.binding_id,
+    binding_generation: record.generation,
+    kind: "send_message",
+    data: { content: "once" },
+  };
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_binding_ready").length === 1,
+    "expected binding restore",
+  );
+
+  bridge.resolvePoll({ commands: [command] });
+  await waitFor(() => invocations === 1, "expected command execution to begin");
+  await waitFor(
+    () => bridge.pendingPollCount === 1,
+    "expected another command poll while the first command runs",
+  );
+  bridge.resolvePoll({ commands: [command] });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(invocations, 1);
+
+  release?.();
+  await waitFor(
+    () => requestsFor(bridge, "ahp_ack_command").length === 1,
+    "expected one command acknowledgement",
+  );
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
+});
+
+test("runtime retries an applied acknowledgement without replaying the command", async () => {
+  const record = bindingRecord(
+    "binding-1",
+    1,
+    "copilot:/session-1",
+    "ahp-chat://default/session-1",
+  );
+  const bridge = new FakeBridgeClient({ bindings: [record] });
+  const sessionBinding = new FakeSessionBinding(
+    boundSnapshot(record.session_uri, chatUriOf(record)),
+  );
+  let firstAck = true;
+  bridge.beforeCall.set("ahp_ack_command", () => {
+    if (firstAck) {
+      firstAck = false;
+      throw new Error("simulated lost ACK response");
+    }
+  });
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) =>
+      new FakeCore(
+        options,
+        catalogue([summary(record.session_uri, "First")]),
+        [sessionBinding],
+      ),
+  });
+
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_binding_ready").length === 1,
+    "expected binding restore",
+  );
+  bridge.resolvePoll({
+    commands: [
+      {
+        command_id: 1,
+        command_key: "send:binding-1",
+        binding_id: record.binding_id,
+        binding_generation: record.generation,
+        kind: "send_message",
+        data: { content: "once" },
+      },
+    ],
+  });
+
+  await waitFor(
+    () => requestsFor(bridge, "ahp_ack_command").length === 2,
+    "expected the acknowledgement retry",
+  );
+  assert.equal(sessionBinding.queueUserTextCalls.length, 1);
+  assert.deepEqual(
+    requestsFor(bridge, "ahp_ack_command").map((request) => request.outcome),
+    ["applied", "applied"],
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
+});
+
+test("runtime acknowledges a command that finishes during shutdown", async () => {
+  const record = bindingRecord(
+    "binding-1",
+    1,
+    "copilot:/session-1",
+    "ahp-chat://default/session-1",
+  );
+  const bridge = new FakeBridgeClient({ bindings: [record] });
+  const sessionBinding = new FakeSessionBinding(
+    boundSnapshot(record.session_uri, chatUriOf(record)),
+  );
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sessionBinding.beforeQueueUserText = () => blocked;
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) =>
+      new FakeCore(
+        options,
+        catalogue([summary(record.session_uri, "First")]),
+        [sessionBinding],
+      ),
+  });
+
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => requestsFor(bridge, "ahp_binding_ready").length === 1,
+    "expected binding restore",
+  );
+  bridge.resolvePoll({
+    commands: [
+      {
+        command_id: 1,
+        command_key: "send:binding-1",
+        binding_id: record.binding_id,
+        binding_generation: record.generation,
+        kind: "send_message",
+        data: { content: "finish while stopping" },
+      },
+    ],
+  });
+  await waitFor(
+    () => bridge.pendingPollCount === 1,
+    "expected another command poll",
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release?.();
+  await runTask;
+  const acknowledgements = requestsFor(bridge, "ahp_ack_command");
+  assert.equal(acknowledgements.length, 1);
+  assert.equal(acknowledgements[0]?.outcome, "applied");
 });
 
 test("runtime applies a duplicate bind command idempotently during an active turn", async () => {

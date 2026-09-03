@@ -13,7 +13,7 @@ export interface AdapterConfig {
   readonly adapterId: string;
   readonly userDataDirectory: string;
   readonly pollSeconds: number;
-  readonly codeExecutable: string;
+  readonly codeExecutable?: string;
   readonly sshExecutable?: string;
   readonly authorizedTargets: readonly AuthorizedTargetConfig[];
 }
@@ -63,10 +63,10 @@ export async function loadAdapterConfig(
   if (pollSeconds < 1 || pollSeconds > 60) {
     throw new Error("ahp.poll_seconds must be between 1 and 60");
   }
-  const codeExecutable = requireString(
-    ahp.code_executable,
-    "ahp.code_executable",
-  );
+  const codeExecutable =
+    typeof ahp.code_executable === "string" && ahp.code_executable.length > 0
+      ? ahp.code_executable
+      : undefined;
   const sshExecutable =
     typeof ahp.ssh_executable === "string" && ahp.ssh_executable.length > 0
       ? ahp.ssh_executable
@@ -85,7 +85,7 @@ export async function loadAdapterConfig(
       userDataDirectory ?? defaultUserDataDirectory(),
     ),
     pollSeconds,
-    codeExecutable: resolve(codeExecutable),
+    ...(codeExecutable ? { codeExecutable: resolve(codeExecutable) } : {}),
     ...(sshExecutable ? { sshExecutable: resolve(sshExecutable) } : {}),
     authorizedTargets,
   };

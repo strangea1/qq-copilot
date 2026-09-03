@@ -474,10 +474,11 @@ fn register_local_target(
     open_vscode: bool,
     trust_timeout_seconds: u64,
 ) -> Result<()> {
-    let mut config = AppConfig::load(config_path)?;
+    let config = AppConfig::load(config_path)?;
     if !config.ahp.enabled {
         bail!("AHP mode is not configured");
     }
+    let database_path = config.bridge.database_path.clone();
     let code = config
         .ahp
         .code_executable
@@ -494,14 +495,11 @@ fn register_local_target(
     if !workspace.is_dir() {
         bail!("workspace is not a directory: {}", workspace.display());
     }
-    if !config
-        .bridge
-        .workspace_roots
+    let was_authorized = config
+        .ahp
+        .authorized_targets
         .iter()
-        .any(|root| path_is_within(&workspace, root))
-    {
-        config.bridge.workspace_roots.push(workspace.clone());
-    }
+        .any(|target| matches!(target, AhpAuthorizedTarget::Local { path } if paths_equal(path, &workspace)));
     let workspace_uri = url::Url::from_directory_path(&workspace)
         .map_err(|()| anyhow::anyhow!("failed to build workspace URI"))?
         .to_string();
@@ -517,6 +515,33 @@ fn register_local_target(
         open_local_target_in_vscode(&code_launcher, &workspace)?;
     }
     wait_for_trust_request(&database, &request_id, trust_timeout_seconds)?;
+    let mut config = AppConfig::load(config_path)?;
+    if !config.ahp.enabled {
+        bail!("AHP mode was disabled while workspace trust confirmation was pending");
+    }
+    if config.bridge.database_path != database_path {
+        bail!(
+            "Bridge database configuration changed while workspace trust confirmation was pending"
+        );
+    }
+    let remains_authorized = config
+        .ahp
+        .authorized_targets
+        .iter()
+        .any(|target| matches!(target, AhpAuthorizedTarget::Local { path } if paths_equal(path, &workspace)));
+    if was_authorized && !remains_authorized {
+        bail!(
+            "local target authorization was revoked while workspace trust confirmation was pending"
+        );
+    }
+    if !config
+        .bridge
+        .workspace_roots
+        .iter()
+        .any(|root| path_is_within(&workspace, root))
+    {
+        config.bridge.workspace_roots.push(workspace.clone());
+    }
     if !config
         .ahp
         .authorized_targets
@@ -544,10 +569,11 @@ fn register_remote_target(
     open_vscode: bool,
     trust_timeout_seconds: u64,
 ) -> Result<()> {
-    let mut config = AppConfig::load(config_path)?;
+    let config = AppConfig::load(config_path)?;
     if !config.ahp.enabled {
         bail!("AHP mode is not configured");
     }
+    let database_path = config.bridge.database_path.clone();
     let code_launcher = config
         .ahp
         .code_launcher
@@ -558,21 +584,52 @@ fn register_remote_target(
         .ssh_executable
         .clone()
         .context("ahp.ssh_executable is not configured")?;
+    let alias_authorized_target = config
+        .ahp
+        .authorized_targets
+        .iter()
+        .find(|target| {
+            matches!(
+                target,
+                AhpAuthorizedTarget::Ssh { alias, .. } if alias == ssh_alias
+            )
+        })
+        .cloned();
     let expected_host_key_fingerprints =
-        config
-            .ahp
-            .authorized_targets
-            .iter()
-            .find_map(|target| match target {
+        alias_authorized_target
+            .as_ref()
+            .and_then(|target| match target {
                 AhpAuthorizedTarget::Ssh {
-                    alias,
                     host_key_fingerprints,
                     ..
-                } if alias == ssh_alias => Some(host_key_fingerprints.as_slice()),
-                _ => None,
+                } => Some(host_key_fingerprints.as_slice()),
+                AhpAuthorizedTarget::Local { .. } => None,
             });
     let remote =
         validate_remote_target(&ssh, ssh_alias, workspace, expected_host_key_fingerprints)?;
+    if let Some(AhpAuthorizedTarget::Ssh {
+        user, host, port, ..
+    }) = alias_authorized_target.as_ref()
+        && (user != &remote.user || host != &remote.host || *port != remote.port)
+    {
+        bail!(
+            "SSH Host alias identity changed; remove its existing authorized targets before registering it again"
+        );
+    }
+    let target = AhpAuthorizedTarget::Ssh {
+        alias: ssh_alias.to_owned(),
+        path: remote.canonical_path.clone(),
+        user: remote.user.clone(),
+        host: remote.host.clone(),
+        port: remote.port,
+        host_key_fingerprints: remote.host_key_fingerprints.clone(),
+    };
+    let original_authorized_target = config
+        .ahp
+        .authorized_targets
+        .iter()
+        .find(|configured| configured.matches(&target))
+        .cloned();
     let workspace_uri = remote_workspace_uri(ssh_alias, &remote.canonical_path)?;
     let database = Database::open(&config.bridge.database_path)?;
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -586,14 +643,24 @@ fn register_remote_target(
         open_remote_target_in_vscode(&code_launcher, &workspace_uri)?;
     }
     wait_for_trust_request(&database, &request_id, trust_timeout_seconds)?;
-    let target = AhpAuthorizedTarget::Ssh {
-        alias: ssh_alias.to_owned(),
-        path: remote.canonical_path.clone(),
-        user: remote.user,
-        host: remote.host,
-        port: remote.port,
-        host_key_fingerprints: remote.host_key_fingerprints,
-    };
+    let mut config = AppConfig::load(config_path)?;
+    if !config.ahp.enabled {
+        bail!("AHP mode was disabled while workspace trust confirmation was pending");
+    }
+    if config.bridge.database_path != database_path {
+        bail!(
+            "Bridge database configuration changed while workspace trust confirmation was pending"
+        );
+    }
+    if original_authorized_target.as_ref().is_some_and(|original| {
+        !config
+            .ahp
+            .authorized_targets
+            .iter()
+            .any(|configured| configured.matches(original))
+    }) {
+        bail!("SSH target authorization changed while workspace trust confirmation was pending");
+    }
     if !config
         .ahp
         .authorized_targets
@@ -613,8 +680,8 @@ fn register_remote_target(
 
 fn remove_local_target(config_path: &Path, workspace: &Path) -> Result<()> {
     let mut config = AppConfig::load(config_path)?;
-    let workspace = process_path(workspace)
-        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
+    let workspace = process_removal_path(workspace)
+        .with_context(|| format!("failed to normalize workspace {}", workspace.display()))?;
     let before = config.ahp.effective_authorized_targets().len();
     config.ahp.authorized_targets.retain(|target| {
         !matches!(target, AhpAuthorizedTarget::Local { path } if paths_equal(path, &workspace))
@@ -1164,6 +1231,27 @@ fn process_path(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+fn process_removal_path(path: &Path) -> Result<PathBuf> {
+    if path
+        .try_exists()
+        .with_context(|| format!("failed to inspect path {}", path.display()))?
+    {
+        return process_path(path);
+    }
+    let absolute = std::path::absolute(path)?;
+    #[cfg(windows)]
+    {
+        let text = absolute.to_string_lossy();
+        if let Some(path) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{path}")));
+        }
+        if let Some(path) = text.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    Ok(absolute)
+}
+
 async fn admin_call(config_path: &Path, request: BridgeRequest) -> Result<serde_json::Value> {
     let config = AppConfig::load(config_path)?;
     ipc::call(&config, request, Duration::from_secs(15)).await
@@ -1260,6 +1348,7 @@ mod tests {
                 path: workspace.clone(),
             });
         config.save(&config_path).expect("save config");
+        std::fs::remove_dir(&workspace).expect("remove workspace before revoking target");
 
         remove_local_target(&config_path, &workspace).expect("remove target");
 
