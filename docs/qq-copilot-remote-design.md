@@ -33,6 +33,11 @@ flowchart LR
 - VS Code 与 QQ Adapter 同时订阅用户已创建的 Session。Adapter 以 `binding_id` 为键
   维护独立的 SessionBinding、事件 normalizer 和发布队列，最多同时监控 5 个跨
   Editor、Local Standalone 和 Remote SSH Host 的 Session。
+- 高频 `chat/delta` 只更新权威 mirror 并进入增量 normalizer，不为每个 token 深拷贝
+  完整历史 ChatState；Bridge 发送受阻时，每个 Binding 只保留最新 session/chat 状态
+  Snapshot，用户消息、最终回复、工具边界、审批、输入和 Turn 终态事件保持有序且不合并。
+- 长历史 Session的初始 Snapshot可能超过 8 MiB；Windows Named Pipe WebSocket保留
+  32 MiB硬上限，足以接收已测约9.8 MiB快照，同时拒绝无界 payload。
 - SQLite `ahp_bindings` 保存所有 Binding，`ahp_foreground_binding` 只保存 QQ 前台
   指针。普通 QQ 文本/语音进入前台 Chat；`/send <code>` 可定向进入后台 Chat；
   Agent 忙碌时继续使用 AHP queued message。
@@ -74,7 +79,11 @@ flowchart LR
   `session_uri + turn_id` 独立跟踪；60 秒状态每 45 秒续期，完成、取消、失败、审批或
   澄清等待时只停止对应 Session。
 - QQ Keyboard 用于审批和 Boolean/单选问题，文本命令始终作为兜底。
-- Bridge 保存 30 天脱敏事件和 projection outbox；下次 QQ 入站被动回复补发遗漏。
+- Bridge 保存 30 天脱敏事件和 projection outbox；下次 QQ 入站触发独立主动补发，避免
+  与普通被动回复复用 `msg_id + msg_seq`。补发先把固定 event集合的 `replay_key` 和
+  `replay_generation` 原子写入SQLite，并由跨 Service克隆的共享锁串行领取；成功或
+  `in_doubt` 后标记 delivered。明确未发送的失败会释放领取并递增generation，因此并发
+  入站、批次成员变化和重启窗口都不会重复发送已经尝试过的批次。
 - VS Code 完全退出时编辑器托管 Host 终止；Local Standalone Host 可继续执行。
 - Remote SSH 目标通过 Windows `ssh.exe` 按需启动/复用远端默认 Standalone Host，因此
   仍要求 Windows PC 在线、已登录且 Bridge 正在运行。
@@ -92,7 +101,17 @@ registry overlay。公开 npm 0.8 tarball 与该 Host 不完全匹配，因此�
 `scripts/vendor-ahp-client.ps1` 固定 revision 并应用仓库 overlay 后生成。
 
 Local Standalone/Remote SSH 通过 `code agent host` / `code agent endpoints` 接入，
-并且只有在 Host 宣告 vendored 客户端支持的协议版本时才可连接；未知版本继续 fail-closed。
+VS Code 1.136 standalone 注册表中的 `protocolVersion = 0.1.0` 是 launcher 元数据
+版本，实际 `initialize` wire 服务器为 `0.9.0`。Adapter 保留前者用于状态展示，只对
+这一已探针验证的组合使用 `wireProtocolVersion = 0.9.0`；未知 registry-to-wire 组合
+继续 fail-closed，且 `0.1.0` 不会加入 wire 协议支持列表。
+Local managed Host 使用 `--new-instance --foreground` 启动并由 Adapter 持有进程；
+standalone 多 provider 环境固定优先 `copilotcli`。`createSession` 使用
+`ahp-session:/<uuid>`，创建后即使 deferred Copilot backing 尚未进入 `listSessions`，
+也必须通过精确 URI 订阅 Snapshot 确认，并在 create ACK 前建立 provisional Binding；
+正式 Binding 在 ACK 后 90 秒内接管，否则 dispose Session、发布 removal 并释放 Host。临时 Summary 本身不能
+阻止 Host 回收。每个目标复用 retained Host，避免新建 Session 时替换 Host identity；
+本地 owned Host 用 instance ID 精确清理，Remote SSH 仅关闭本地 tunnel。
 
 下文第 1–20 节保留最初 Hooks/MCP 设计和安全分析，作为 Legacy 模式与演进记录；
 其“不能从 QQ 创建空闲回合”等结论不适用于当前已绑定的 AHP Session。

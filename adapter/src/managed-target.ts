@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
+import { win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -8,11 +9,14 @@ import {
   type ConfigPropertySchema,
   type ConfigSchema,
   type RootState,
+  type SessionState,
   type SessionSummary,
   type URI,
 } from "@microsoft/agent-host-protocol";
 import {
   AhpClient,
+  ClientClosedError,
+  RpcError,
   type JsonRpcMessage,
   TransportError,
   type AhpTransport,
@@ -49,6 +53,48 @@ export interface SessionConfigOption {
   readonly description?: string;
 }
 
+function localWorkspaceUriMatches(
+  targetPath: string,
+  workspaceUri: string,
+): boolean {
+  let candidate: URL;
+  try {
+    candidate = new URL(workspaceUri);
+  } catch {
+    return false;
+  }
+  if (
+    candidate.protocol !== "file:" ||
+    candidate.search !== "" ||
+    candidate.hash !== ""
+  ) {
+    return false;
+  }
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(candidate.pathname);
+  } catch {
+    return false;
+  }
+  const windowsPath =
+    candidate.host.length > 0
+      ? `\\\\${candidate.host}${decodedPath.replaceAll("/", "\\")}`
+      : /^\/[A-Za-z]:\//u.test(decodedPath)
+        ? decodedPath.slice(1).replaceAll("/", "\\")
+        : undefined;
+  return (
+    windowsPath !== undefined &&
+    normalizeWindowsPath(windowsPath) === normalizeWindowsPath(targetPath)
+  );
+}
+
+function normalizeWindowsPath(path: string): string {
+  return win32
+    .normalize(path)
+    .replace(/\\+$/u, "")
+    .toLocaleLowerCase("en-US");
+}
+
 export interface SupportedSessionField {
   readonly property: string;
   readonly options: readonly SessionConfigOption[];
@@ -74,6 +120,16 @@ export interface CreateSessionResult {
   readonly host_label: string;
   readonly editor_client_tools_available: boolean;
   readonly session: SessionSummary;
+  readonly confirmation?: ManagedSessionConfirmation;
+}
+
+export interface ManagedSessionConfirmation {
+  close(): Promise<void>;
+}
+
+interface ManagedSessionObservation {
+  readonly session: SessionSummary;
+  readonly confirmation?: ManagedSessionConfirmation;
 }
 
 export async function prepareTargetResult(
@@ -81,7 +137,7 @@ export async function prepareTargetResult(
   advanced: boolean,
   config: Record<string, unknown> = {},
 ): Promise<PrepareTargetResult> {
-  const provider = defaultProvider(connection.rootState);
+  const provider = defaultManagedProvider(connection.rootState);
   const resolved = await resolveSessionConfig(
     connection.client,
     provider,
@@ -149,9 +205,10 @@ export async function createManagedSession(
   );
   if (existing) {
     requireMatchingCreatedSession(connection, request, existing);
-    return managedSessionResult(connection, existing);
+    return managedSessionResult(connection, { session: existing });
   }
   const progressToken = `create-${request.sessionUri}`;
+  let confirmation: ManagedSessionConfirmation | undefined;
   try {
     connection.setProgressToken(progressToken);
     try {
@@ -163,7 +220,7 @@ export async function createManagedSession(
         progressToken,
       });
     } catch (requestError) {
-      let reconciled: SessionSummary | undefined;
+      let reconciled: ManagedSessionObservation | undefined;
       try {
         reconciled = await waitForManagedSession(
           connection.client,
@@ -176,37 +233,61 @@ export async function createManagedSession(
         );
       }
       if (reconciled) {
-        requireMatchingCreatedSession(connection, request, reconciled);
+        confirmation = reconciled.confirmation;
+        requireMatchingCreatedSession(connection, request, reconciled.session);
         return managedSessionResult(connection, reconciled);
       }
       throw requestError;
     } finally {
       connection.setProgressToken(undefined);
     }
-    const session = await waitForManagedSession(
+    const observation = await waitForManagedSession(
       connection.client,
       request.sessionUri,
     );
-    if (session) {
-      requireMatchingCreatedSession(connection, request, session);
-      return managedSessionResult(connection, session);
+    if (observation) {
+      confirmation = observation.confirmation;
+      requireMatchingCreatedSession(connection, request, observation.session);
+      return managedSessionResult(connection, observation);
     }
     throw new Error("created-session-not-listed");
   } catch (error) {
+    let confirmationError: unknown;
+    try {
+      await confirmation?.close();
+    } catch (closeError) {
+      confirmationError = closeError;
+    }
     if (
       typeof error === "object" &&
       error !== null &&
       "code" in error &&
       error.code === "session-uri-conflict"
     ) {
+      if (confirmationError !== undefined) {
+        throw new AggregateError(
+          [error, confirmationError],
+          "conflicting-session-confirmation-cleanup-failed",
+        );
+      }
       throw error;
     }
     try {
       await disposeManagedSession(connection, request.sessionUri);
     } catch (cleanupError) {
       throw new AggregateError(
-        [error, cleanupError],
+        [
+          error,
+          ...(confirmationError === undefined ? [] : [confirmationError]),
+          cleanupError,
+        ],
         "created-session-cleanup-failed",
+      );
+    }
+    if (confirmationError !== undefined) {
+      throw new AggregateError(
+        [error, confirmationError],
+        "created-session-confirmation-cleanup-failed",
       );
     }
     throw error;
@@ -216,17 +297,223 @@ export async function createManagedSession(
 async function waitForManagedSession(
   client: AhpClient,
   sessionUri: string,
-): Promise<SessionSummary | undefined> {
-  for (let attempt = 0; attempt < 25; attempt += 1) {
-    const session = (await refreshManagedSessions(client)).find(
+): Promise<ManagedSessionObservation | undefined> {
+  const deadline = Date.now() + MANAGED_SESSION_RECONCILIATION_TIMEOUT_MS;
+  for (;;) {
+    if (Date.now() >= deadline) {
+      return undefined;
+    }
+    const sessions = await beforeDeadline(
+      () => refreshManagedSessions(client),
+      deadline,
+      "managed-session-reconciliation-timeout",
+    );
+    const session = sessions.find(
       (candidate) => candidate.resource === sessionUri,
     );
     if (session) {
-      return session;
+      return { session };
     }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    const subscribed = await managedSessionFromSubscription(
+      client,
+      sessionUri,
+      deadline,
+    );
+    if (subscribed) {
+      return subscribed;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return undefined;
+    }
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(200, remaining)),
+    );
   }
-  return undefined;
+}
+
+async function managedSessionFromSubscription(
+  client: AhpClient,
+  sessionUri: string,
+  deadline: number,
+): Promise<ManagedSessionObservation | undefined> {
+  let subscribed: Awaited<ReturnType<AhpClient["subscribe"]>>;
+  try {
+    subscribed = await beforeDeadline(
+      () =>
+        client.subscribe(sessionUri, {
+          delivery: { maxLatencyMs: 0 },
+        }),
+      deadline,
+      "managed-session-reconciliation-timeout",
+      (lateSubscription) =>
+        closeManagedSessionSubscription(
+          client,
+          sessionUri,
+          lateSubscription,
+        ),
+    );
+  } catch (error) {
+    if (error instanceof RpcError && error.code === AHP_RESOURCE_NOT_FOUND) {
+      return undefined;
+    }
+    throw error;
+  }
+  try {
+    const snapshot = subscribed.result.snapshot;
+    if (!snapshot || snapshot.resource !== sessionUri) {
+      throw codedError("invalid-created-session-snapshot");
+    }
+    const state = snapshot.state;
+    if (!isSessionState(state)) {
+      throw codedError("invalid-created-session-snapshot");
+    }
+    const timestamp = new Date().toISOString();
+    let closeTask: Promise<void> | undefined;
+    return {
+      session: {
+        resource: sessionUri,
+        provider: state.provider,
+        title: state.title.trim() || "New Session",
+        status: state.status,
+        ...(typeof state.activity === "string"
+          ? { activity: state.activity }
+          : {}),
+        ...(Array.isArray(state.workingDirectories) &&
+        state.workingDirectories.every(
+          (workspaceUri) => typeof workspaceUri === "string",
+        )
+          ? { workingDirectories: state.workingDirectories }
+          : {}),
+        createdAt: timestamp,
+        modifiedAt: timestamp,
+      },
+      confirmation: {
+        close(): Promise<void> {
+          closeTask ??= closeManagedSessionSubscription(
+            client,
+            sessionUri,
+            subscribed,
+          );
+          return closeTask;
+        },
+      },
+    };
+  } catch (error) {
+    try {
+      await closeManagedSessionSubscription(client, sessionUri, subscribed);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "invalid-created-session-subscription-cleanup-failed",
+      );
+    }
+    throw error;
+  }
+}
+
+async function closeManagedSessionSubscription(
+  client: AhpClient,
+  sessionUri: string,
+  subscribed: Awaited<ReturnType<AhpClient["subscribe"]>>,
+): Promise<void> {
+  const errors: unknown[] = [];
+  try {
+    await subscribed.subscription.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await client.unsubscribe(sessionUri);
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      "created-session-subscription-cleanup-failed",
+    );
+  }
+}
+
+function beforeDeadline<T>(
+  startOperation: () => Promise<T>,
+  deadline: number,
+  timeoutCode: string,
+  lateSuccess?: (value: T) => Promise<void>,
+): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(codedError(timeoutCode));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(codedError(timeoutCode));
+    }, remaining);
+    let operation: Promise<T>;
+    try {
+      operation = startOperation();
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    operation.then(
+      (value) => {
+        if (settled) {
+          if (lateSuccess) {
+            void lateSuccess(value).catch(() => {
+              process.stderr.write(
+                '{"level":"warn","message":"Late AHP subscription cleanup failed"}\n',
+              );
+            });
+          }
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function isSessionState(value: unknown): value is SessionState {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    return false;
+  }
+  return (
+    "provider" in value &&
+    typeof value.provider === "string" &&
+    "title" in value &&
+    typeof value.title === "string" &&
+    "status" in value &&
+    typeof value.status === "number" &&
+    Number.isSafeInteger(value.status) &&
+    "lifecycle" in value &&
+    typeof value.lifecycle === "string" &&
+    "chats" in value &&
+    Array.isArray(value.chats) &&
+    "activeClients" in value &&
+    Array.isArray(value.activeClients)
+  );
 }
 
 function requireMatchingCreatedSession(
@@ -251,20 +538,37 @@ export async function disposeManagedSession(
   connection: ConnectedManagedTarget,
   sessionUri: string,
 ): Promise<void> {
-  const exists = (await refreshManagedSessions(connection.client)).some(
-    (session) => session.resource === sessionUri,
+  const observation = await waitForManagedSession(
+    connection.client,
+    sessionUri,
   );
-  if (!exists) {
+  if (!observation) {
     return;
   }
-  await connection.client.request("disposeSession", {
-    channel: sessionUri,
-  });
+  const errors: unknown[] = [];
+  try {
+    await observation.confirmation?.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await beforeDeadline(
+      () =>
+        connection.client.request("disposeSession", {
+          channel: sessionUri,
+        }),
+      Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
+      "managed-session-disposal-timeout",
+    );
+  } catch (error) {
+    errors.push(error);
+  }
+  throwCleanupErrors(errors, "managed-session-disposal-failed");
 }
 
 function managedSessionResult(
   connection: ConnectedManagedTarget,
-  session: SessionSummary,
+  observation: ManagedSessionObservation,
 ): CreateSessionResult {
   return {
     endpoint_id: connection.prepared.endpointId,
@@ -273,7 +577,10 @@ function managedSessionResult(
     host_label: connection.prepared.hostLabel,
     editor_client_tools_available:
       connection.prepared.editorClientToolsAvailable,
-    session,
+    session: observation.session,
+    ...(observation.confirmation
+      ? { confirmation: observation.confirmation }
+      : {}),
   };
 }
 
@@ -299,18 +606,39 @@ interface ProgressNotification {
   readonly message?: string;
 }
 
-interface PreparedTarget {
+export interface PreparedTarget {
   readonly target: ManagedTarget;
   readonly entry: EndpointRegistryEntry;
   readonly endpointId: string;
   readonly hostLabel: string;
   readonly workspaceUri: string;
   readonly editorClientToolsAvailable: boolean;
+  readonly host?: ChildProcess;
+  readonly hostExecutable?: string;
   readonly tunnel?: ChildProcess;
 }
 
 const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 const MANAGED_REQUEST_TIMEOUT_MS = 295_000;
+const MANAGED_CONTROL_REQUEST_TIMEOUT_MS = 30_000;
+const MANAGED_SESSION_RECONCILIATION_TIMEOUT_MS = 10_000;
+const LOCAL_STANDALONE_START_TIMEOUT_MS = 240_000;
+const LOCAL_STANDALONE_POLL_INTERVAL_MS = 250;
+const LOCAL_STANDALONE_OUTPUT_LIMIT = 64 * 1024;
+const AHP_RESOURCE_NOT_FOUND = -32_001;
+const STANDALONE_REGISTRY_PROTOCOL_ALIASES = new Map<string, string>([
+  ["0.1.0", "0.9.0"],
+]);
+const PREFERRED_MANAGED_PROVIDERS = ["copilotcli", "copilot"] as const;
+
+export function standaloneWireProtocolVersion(
+  registryProtocolVersion: string,
+): string | undefined {
+  if (NEGOTIATED_PROTOCOL_VERSIONS.includes(registryProtocolVersion)) {
+    return registryProtocolVersion;
+  }
+  return STANDALONE_REGISTRY_PROTOCOL_ALIASES.get(registryProtocolVersion);
+}
 
 export interface ConnectedManagedTarget {
   readonly prepared: PreparedTarget;
@@ -318,6 +646,8 @@ export interface ConnectedManagedTarget {
   readonly rootState: RootState;
   readonly sessions: readonly SessionSummary[];
   readonly setProgressToken: (token: string | undefined) => void;
+  releasePreparedOwnership(): void;
+  disconnect(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -327,7 +657,25 @@ export async function connectManagedTarget(
   onProgress?: (progress: ProgressNotification) => Promise<void> | void,
 ): Promise<ConnectedManagedTarget> {
   const prepared = await prepareManagedTarget(config, target);
+  return connectPreparedTarget(prepared, onProgress, true);
+}
+
+export async function connectPreparedManagedTarget(
+  prepared: PreparedTarget,
+  onProgress?: (progress: ProgressNotification) => Promise<void> | void,
+): Promise<ConnectedManagedTarget> {
+  return connectPreparedTarget(prepared, onProgress, false);
+}
+
+async function connectPreparedTarget(
+  prepared: PreparedTarget,
+  onProgress:
+    | ((progress: ProgressNotification) => Promise<void> | void)
+    | undefined,
+  stopPreparedOnClose: boolean,
+): Promise<ConnectedManagedTarget> {
   let client: AhpClient | undefined;
+  let ownsPrepared = stopPreparedOnClose;
   try {
     const transport = new ProgressTapTransport(
       await openEndpointTransport(
@@ -339,47 +687,155 @@ export async function connectManagedTarget(
     client = new AhpClient(transport, {
       requestTimeoutMs: MANAGED_REQUEST_TIMEOUT_MS,
     });
-    client.connect();
-    const initialized = await client.request("initialize", {
-      channel: "ahp-root://",
-      clientId: `qq-copilot-managed-${prepared.entry.instanceId}`,
-      clientInfo: {
-        name: "qq-copilot-ahp-adapter",
-        version: "0.1.0",
-        title: "QQ Copilot AHP Adapter",
-      },
-      protocolVersions: [...NEGOTIATED_PROTOCOL_VERSIONS],
-      initialSubscriptions: ["ahp-root://"],
-      locale: "zh-CN",
-    });
-    if (!NEGOTIATED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)) {
+    const managedClient = client;
+    managedClient.connect();
+    const initialized = await beforeDeadline(
+      () =>
+        managedClient.request("initialize", {
+          channel: "ahp-root://",
+          clientId: `qq-copilot-managed-${prepared.entry.instanceId}`,
+          clientInfo: {
+            name: "qq-copilot-ahp-adapter",
+            version: "0.1.0",
+            title: "QQ Copilot AHP Adapter",
+          },
+          protocolVersions: [...NEGOTIATED_PROTOCOL_VERSIONS],
+          initialSubscriptions: ["ahp-root://"],
+          locale: "zh-CN",
+        }),
+      Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
+      "managed-initialize-timeout",
+    );
+    const expectedWireProtocolVersion =
+      prepared.entry.wireProtocolVersion ?? prepared.entry.protocolVersion;
+    if (
+      initialized.protocolVersion !== expectedWireProtocolVersion ||
+      !NEGOTIATED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)
+    ) {
       throw codedError(
         "incompatible-protocol",
-        `incompatible-protocol:${initialized.protocolVersion}`,
+        `incompatible-protocol:${prepared.entry.protocolVersion}->${initialized.protocolVersion}`,
       );
     }
     const rootState = extractRootState(initialized.snapshots);
-    const sessions = await listSessions(client);
-    const connectedClient = client;
+    const sessions = await listSessions(managedClient);
+    const connectedClient = managedClient;
     return {
       prepared,
       client: connectedClient,
       rootState,
       sessions,
       setProgressToken: (token) => transport.setProgressToken(token),
+      releasePreparedOwnership(): void {
+        ownsPrepared = false;
+      },
+      async disconnect(): Promise<void> {
+        await shutdownManagedClient(connectedClient);
+      },
       async close(): Promise<void> {
-        await connectedClient.shutdown().catch(() => undefined);
-        if (prepared.tunnel && !prepared.tunnel.killed) {
-          prepared.tunnel.kill();
+        const errors: unknown[] = [];
+        try {
+          await shutdownManagedClient(connectedClient);
+        } catch (error) {
+          errors.push(error);
         }
+        if (ownsPrepared) {
+          try {
+            await stopManagedTargetProcesses(prepared);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        throwCleanupErrors(errors, "managed-target-close-failed");
       },
     };
   } catch (error) {
-    await client?.shutdown().catch(() => undefined);
-    if (prepared.tunnel && !prepared.tunnel.killed) {
-      prepared.tunnel.kill();
+    const errors: unknown[] = [error];
+    if (client) {
+      try {
+        await shutdownManagedClient(client);
+      } catch (shutdownError) {
+        errors.push(shutdownError);
+      }
+    }
+    if (ownsPrepared) {
+      try {
+        await stopManagedTargetProcesses(prepared);
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+      }
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "managed-target-cleanup-failed");
     }
     throw error;
+  }
+}
+
+async function shutdownManagedClient(client: AhpClient): Promise<void> {
+  try {
+    await client.shutdown();
+  } catch (error) {
+    if (!(error instanceof ClientClosedError)) {
+      throw error;
+    }
+  }
+}
+
+function throwCleanupErrors(errors: unknown[], message: string): void {
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, message);
+  }
+}
+
+export async function stopManagedTargetProcesses(
+  prepared: Pick<
+    PreparedTarget,
+    "entry" | "host" | "hostExecutable" | "tunnel"
+  >,
+): Promise<void> {
+  stopChildProcess(prepared.tunnel);
+  if (!prepared.hostExecutable) {
+    stopChildProcess(prepared.host);
+    return;
+  }
+
+  await stopOwnedLocalStandalone(
+    prepared.hostExecutable,
+    prepared.host,
+    prepared.entry,
+  );
+}
+
+async function stopOwnedLocalStandalone(
+  executable: string,
+  host: ChildProcess | undefined,
+  entry: Pick<CodeAgentEndpoint, "instanceId" | "pid">,
+): Promise<void> {
+  let killError: unknown;
+  try {
+    await runProcess(
+      executable,
+      ["agent", "kill", "--instance-id", entry.instanceId],
+      10_000,
+    );
+  } catch (error) {
+    killError = error;
+  }
+  stopChildProcess(host);
+  const stopped = await waitForLocalStandaloneStopped(
+    executable,
+    entry,
+    host,
+  );
+  stopChildProcess(host);
+  if (!stopped) {
+    throw new Error("managed-standalone-cleanup-timeout", {
+      cause: killError,
+    });
   }
 }
 
@@ -414,15 +870,8 @@ async function prepareManagedTarget(
     if (!config.codeExecutable) {
       throw codedError("code-not-configured");
     }
-    const started = await runProcessUntilExit(config.codeExecutable, [
-      "agent",
-      "host",
-    ]);
-    const endpoints = await listCodeAgentEndpoints(config.codeExecutable);
-    const endpoint = selectStandaloneEndpoint(
-      endpoints.endpoints,
-      `${started.stdout}\n${started.stderr}`,
-    );
+    const started = await startLocalStandaloneEndpoint(config.codeExecutable);
+    const endpoint = started.endpoint;
     const entry = toRegistryEntry(endpoint);
     return {
       target,
@@ -431,6 +880,8 @@ async function prepareManagedTarget(
       hostLabel: "local",
       workspaceUri: fileUri(target.path),
       editorClientToolsAvailable: false,
+      host: started.host,
+      hostExecutable: config.codeExecutable,
     };
   }
   const sshExecutable = config.sshExecutable;
@@ -545,6 +996,7 @@ code agent endpoints
     target.alias,
     script,
     [normalizePosixPath(target.path), normalizePosixPath(target.path)],
+    300_000,
   );
   const startedEndpointMarker = "__QQ_STARTED_ENDPOINT__\n";
   const endpointsMarker = "\n__QQ_ENDPOINTS__\n";
@@ -625,8 +1077,13 @@ async function resolveSshAlias(
 
 async function listCodeAgentEndpoints(
   codeExecutable: string,
+  timeoutMs = 30_000,
 ): Promise<CodeAgentEndpointsDocument> {
-  const output = await runProcess(codeExecutable, ["agent", "endpoints"]);
+  const output = await runProcess(
+    codeExecutable,
+    ["agent", "endpoints"],
+    timeoutMs,
+  );
   return parseEndpointsDocument(output.stdout);
 }
 
@@ -642,14 +1099,19 @@ function selectStandaloneEndpoint(
   endpoints: readonly CodeAgentEndpoint[],
   startedOutput?: string,
 ): CodeAgentEndpoint {
-  const compatible = endpoints.filter(
+  const standalone = endpoints.filter(
     (candidate) =>
       candidate.schemaVersion === 2 &&
-      candidate.type === "standalone" &&
-      NEGOTIATED_PROTOCOL_VERSIONS.includes(candidate.protocolVersion),
+      candidate.type === "standalone",
+  );
+  const compatible = standalone.filter(
+    (candidate) =>
+      standaloneWireProtocolVersion(candidate.protocolVersion) !== undefined,
   );
   if (startedOutput) {
-    const startedUrl = startedOutput.match(/\bws:\/\/[^\s]+/u)?.[0];
+    const startedUrl = startedOutput.match(
+      /\bws:\/\/[^\s\u0000-\u001f]+/u,
+    )?.[0];
     if (startedUrl) {
       const token = new URL(startedUrl).searchParams.get("tkn");
       const endpoint = compatible.find(
@@ -664,12 +1126,26 @@ function selectStandaloneEndpoint(
     return compatible[0];
   }
   if (compatible.length === 0) {
+    if (standalone.length > 0) {
+      throw codedError(
+        "incompatible-standalone-protocol",
+        `unsupported standalone registry protocols: ${[
+          ...new Set(standalone.map((candidate) => candidate.protocolVersion)),
+        ].join(",")}`,
+      );
+    }
     throw codedError("standalone-endpoint-not-found");
   }
   throw codedError("standalone-endpoint-ambiguous");
 }
 
 function toRegistryEntry(endpoint: CodeAgentEndpoint): EndpointRegistryEntry {
+  const wireProtocolVersion = standaloneWireProtocolVersion(
+    endpoint.protocolVersion,
+  );
+  if (!wireProtocolVersion) {
+    throw codedError("incompatible-standalone-protocol");
+  }
   const identity = `${endpoint.type}\0${endpoint.pid}\0${endpoint.instanceId}`;
   const sourceFile = `${createHash("sha256").update(identity, "utf8").digest("hex")}.json`;
   return {
@@ -678,6 +1154,9 @@ function toRegistryEntry(endpoint: CodeAgentEndpoint): EndpointRegistryEntry {
     pid: endpoint.pid,
     instanceId: endpoint.instanceId,
     protocolVersion: endpoint.protocolVersion,
+    ...(wireProtocolVersion === endpoint.protocolVersion
+      ? {}
+      : { wireProtocolVersion }),
     connectionToken: endpoint.connectionToken,
     endpoint: endpoint.endpoint,
     sourceFile,
@@ -697,8 +1176,7 @@ export function managedTargetMatchesWorkspaceUri(
   workspaceUri: string,
 ): boolean {
   if (target.kind === "local") {
-    return workspaceUri.toLocaleLowerCase("en-US") ===
-      fileUri(target.path).toLocaleLowerCase("en-US");
+    return localWorkspaceUriMatches(target.path, workspaceUri);
   }
   let candidate: URL;
   try {
@@ -767,12 +1245,18 @@ async function listSessions(client: AhpClient): Promise<readonly SessionSummary[
   const sessions = new Map<string, SessionSummary>();
   let cursor: string | undefined;
   const seen = new Set<string>();
+  const deadline = Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS;
   for (let page = 0; page < 100; page += 1) {
-    const result = await client.request("listSessions", {
-      channel: "ahp-root://",
-      limit: 100,
-      ...(cursor ? { cursor } : {}),
-    });
+    const result = await beforeDeadline(
+      () =>
+        client.request("listSessions", {
+          channel: "ahp-root://",
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        }),
+      deadline,
+      "managed-list-sessions-timeout",
+    );
     for (const item of result.items) {
       sessions.set(item.resource, item);
     }
@@ -791,6 +1275,7 @@ async function listSessions(client: AhpClient): Promise<readonly SessionSummary[
 async function runProcess(
   executable: string,
   args: readonly string[],
+  timeoutMs = 30_000,
 ): Promise<{ readonly stdout: string; readonly stderr: string }> {
   const child = spawn(executable, args, {
     stdio: ["ignore", "pipe", "pipe"],
@@ -802,7 +1287,7 @@ async function runProcess(
   child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
   let code: number | null;
   try {
-    code = await waitForChildClose(child);
+    code = await waitForChildClose(child, timeoutMs);
   } catch (error) {
     if (!child.killed) {
       child.kill();
@@ -819,38 +1304,226 @@ async function runProcess(
   return { stdout: out, stderr: err };
 }
 
-async function runProcessUntilExit(
+async function startLocalStandaloneEndpoint(
   executable: string,
-  args: readonly string[],
-): Promise<{ readonly stdout: string; readonly stderr: string }> {
-  const child = spawn(executable, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-  child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-  let code: number | null;
+): Promise<{
+  readonly endpoint: CodeAgentEndpoint;
+  readonly host: ChildProcess;
+}> {
+  const child = spawn(
+    executable,
+    [
+      "agent",
+      "host",
+      "--new-instance",
+      "--foreground",
+      "--idle-timeout",
+      "30",
+    ],
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  let spawnError: Error | undefined;
+  let ownedEndpoint: CodeAgentEndpoint | undefined;
+  const appendStdout = (chunk: Buffer): void => {
+    stdout = appendBoundedOutput(stdout, chunk);
+  };
+  const appendStderr = (chunk: Buffer): void => {
+    stderr = appendBoundedOutput(stderr, chunk);
+  };
+  const recordSpawnError = (error: Error): void => {
+    spawnError = error;
+  };
+  child.stdout?.on("data", appendStdout);
+  child.stderr?.on("data", appendStderr);
+  child.once("error", recordSpawnError);
+
+  const deadline = Date.now() + LOCAL_STANDALONE_START_TIMEOUT_MS;
+  let lastEndpointError: unknown;
   try {
-    code = await waitForChildExit(child);
+    for (;;) {
+      if (spawnError) {
+        throw spawnError;
+      }
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw codedError(
+          "standalone-host-exited",
+          sanitizeHostOutput(stderr).trim() || "standalone-host-exited",
+        );
+      }
+
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw codedError("standalone-endpoint-start-timeout");
+        }
+        const endpoints = await listCodeAgentEndpoints(
+          executable,
+          Math.min(30_000, remaining),
+        );
+        const output = `${stdout}\n${stderr}`;
+        const startedToken = startedEndpointToken(output);
+        const matching = endpoints.endpoints.find(
+          (candidate) =>
+            candidate.schemaVersion === 2 &&
+            candidate.type === "standalone" &&
+            ((startedToken !== undefined &&
+              candidate.connectionToken === startedToken) ||
+              (child.pid !== undefined && candidate.pid === child.pid)),
+        );
+        if (matching) {
+          ownedEndpoint = matching;
+          return {
+            endpoint: selectStandaloneEndpoint([matching], output),
+            host: child,
+          };
+        }
+      } catch (error) {
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "incompatible-standalone-protocol"
+        ) {
+          throw error;
+        }
+        lastEndpointError = error;
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error("standalone-endpoint-start-timeout", {
+          cause: lastEndpointError,
+        });
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, LOCAL_STANDALONE_POLL_INTERVAL_MS);
+      });
+    }
   } catch (error) {
-    if (!child.killed) {
-      child.kill();
+    if (ownedEndpoint) {
+      try {
+        await stopOwnedLocalStandalone(executable, child, ownedEndpoint);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "standalone-start-cleanup-failed",
+        );
+      }
+    } else {
+      stopChildProcess(child);
     }
     throw error;
-  } finally {
-    child.stdout?.destroy();
-    child.stderr?.destroy();
   }
-  if (code !== 0) {
-    const error = Buffer.concat(stderr).toString("utf8").trim();
-    throw new Error(error || `${executable} exited with code ${code}`);
+}
+
+function appendBoundedOutput(current: string, chunk: Buffer): string {
+  const remaining = LOCAL_STANDALONE_OUTPUT_LIMIT - Buffer.byteLength(current);
+  if (remaining <= 0) {
+    return current;
   }
-  return {
-    stdout: Buffer.concat(stdout).toString("utf8"),
-    stderr: Buffer.concat(stderr).toString("utf8"),
-  };
+  return current + chunk.subarray(0, remaining).toString("utf8");
+}
+
+function startedEndpointToken(output: string): string | undefined {
+  const startedUrl = output.match(/\bws:\/\/[^\s\u0000-\u001f]+/u)?.[0];
+  if (!startedUrl) {
+    return undefined;
+  }
+  try {
+    return new URL(startedUrl).searchParams.get("tkn") ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeHostOutput(output: string): string {
+  return output.replace(/([?&]tkn=)[^&\s]+/gu, "$1[redacted]");
+}
+
+function stopChildProcess(child: ChildProcess | undefined): void {
+  if (!child) {
+    return;
+  }
+  if (
+    child.exitCode === null &&
+    child.signalCode === null &&
+    !child.killed
+  ) {
+    child.kill();
+  }
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
+async function waitForLocalStandaloneStopped(
+  executable: string,
+  entry: Pick<CodeAgentEndpoint, "instanceId" | "pid">,
+  host: ChildProcess | undefined,
+): Promise<boolean> {
+  const deadline = Date.now() + 35_000;
+  let staleRegistryCleanupAttempted = false;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return false;
+    }
+    let registered = true;
+    try {
+      const endpoints = await listCodeAgentEndpoints(
+        executable,
+        Math.min(5_000, remaining),
+      );
+      registered = endpoints.endpoints.some(
+        (candidate) => candidate.instanceId === entry.instanceId,
+      );
+    } catch {
+      registered = true;
+    }
+    const hostStopped =
+      !host || host.exitCode !== null || host.signalCode !== null;
+    const processStopped = hostStopped || !processIsAlive(entry.pid);
+    if (!registered && processStopped) {
+      return true;
+    }
+    if (
+      registered &&
+      processStopped &&
+      !staleRegistryCleanupAttempted
+    ) {
+      staleRegistryCleanupAttempted = true;
+      try {
+        await runProcess(
+          executable,
+          ["agent", "kill", "--instance-id", entry.instanceId],
+          10_000,
+        );
+      } catch {
+        // The next registry read determines whether cleanup succeeded.
+      }
+      continue;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(250, deadline - Date.now()));
+    });
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "EPERM"
+    );
+  }
 }
 
 async function runSshScript(
@@ -858,6 +1531,7 @@ async function runSshScript(
   alias: string,
   script: string,
   args: readonly string[],
+  timeoutMs = 90_000,
 ): Promise<string> {
   validateSshAlias(alias);
   const remoteCommand = ["sh", "-s", "--", ...args]
@@ -892,7 +1566,7 @@ async function runSshScript(
   child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
   let code: number | null;
   try {
-    code = await waitForChildClose(child);
+    code = await waitForChildClose(child, timeoutMs);
   } catch (error) {
     if (!child.killed) {
       child.kill();
@@ -909,19 +1583,20 @@ async function runSshScript(
   return out;
 }
 
-function waitForChildClose(child: ChildProcess): Promise<number | null> {
-  return waitForChild(child, "close");
-}
-
-function waitForChildExit(child: ChildProcess): Promise<number | null> {
-  return waitForChild(child, "exit");
+function waitForChildClose(
+  child: ChildProcess,
+  timeoutMs?: number,
+): Promise<number | null> {
+  return waitForChild(child, "close", timeoutMs);
 }
 
 function waitForChild(
   child: ChildProcess,
   event: "close" | "exit",
+  timeoutMs?: number,
 ): Promise<number | null> {
   return new Promise((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined;
     const completed = (code: number | null): void => {
       cleanup();
       resolve(code);
@@ -931,11 +1606,23 @@ function waitForChild(
       reject(error);
     };
     const cleanup = (): void => {
+      if (timer) {
+        clearTimeout(timer);
+      }
       child.off(event, completed);
       child.off("error", failed);
     };
     child.once(event, completed);
     child.once("error", failed);
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        cleanup();
+        if (!child.killed) {
+          child.kill();
+        }
+        reject(codedError("agent-cli-timeout"));
+      }, timeoutMs);
+    }
   });
 }
 
@@ -1131,12 +1818,13 @@ function readProgressNotification(
   }
 }
 
-function defaultProvider(rootState: RootState): string {
-  const copilot = rootState.agents.find(
-    (agent) => agent.provider === "copilot",
-  );
-  if (copilot) {
-    return copilot.provider;
+export function defaultManagedProvider(
+  rootState: Pick<RootState, "agents">,
+): string {
+  for (const provider of PREFERRED_MANAGED_PROVIDERS) {
+    if (rootState.agents.some((agent) => agent.provider === provider)) {
+      return provider;
+    }
   }
   if (rootState.agents.length === 1 && rootState.agents[0]) {
     return rootState.agents[0].provider;
@@ -1154,12 +1842,18 @@ async function resolveSessionConfig(
   readonly model?: SupportedSessionField;
   readonly approval?: SupportedSessionField;
 }> {
-  const result = await client.request("resolveSessionConfig", {
-    channel: "ahp-root://",
-    provider,
-    workingDirectory: workspaceUri,
-    config,
-  });
+  const deadline = Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS;
+  const result = await beforeDeadline(
+    () =>
+      client.request("resolveSessionConfig", {
+        channel: "ahp-root://",
+        provider,
+        workingDirectory: workspaceUri,
+        config,
+      }),
+    deadline,
+    "managed-config-resolution-timeout",
+  );
   const schema = asSchema(result.schema);
   const values = asRecord(result.values);
   const model = await supportedField(
@@ -1169,6 +1863,7 @@ async function resolveSessionConfig(
     schema,
     values,
     /model/iu,
+    deadline,
   );
   const approval = await supportedField(
     client,
@@ -1177,6 +1872,7 @@ async function resolveSessionConfig(
     schema,
     values,
     /approval|confirm|permission/iu,
+    deadline,
   );
   const required = schema.required ?? [];
   for (const property of required) {
@@ -1205,6 +1901,7 @@ async function supportedField(
   schema: ConfigSchema,
   values: Record<string, unknown>,
   matcher: RegExp,
+  deadline: number,
 ): Promise<SupportedSessionField | undefined> {
   for (const [property, descriptor] of Object.entries(schema.properties)) {
     if (
@@ -1221,6 +1918,7 @@ async function supportedField(
       property,
       descriptor,
       values,
+      deadline,
     );
     if (!options.length) {
       continue;
@@ -1257,6 +1955,7 @@ async function propertyOptions(
   property: string,
   descriptor: ConfigPropertySchema,
   values: Record<string, unknown>,
+  deadline: number,
 ): Promise<readonly SessionConfigOption[]> {
   if (Array.isArray(descriptor.enum) && descriptor.enum.length > 0) {
     return descriptor.enum.map((value, index) => ({
@@ -1273,14 +1972,19 @@ async function propertyOptions(
   if (!("enumDynamic" in descriptor) || descriptor.enumDynamic !== true) {
     return [];
   }
-  const result = await client.request("sessionConfigCompletions", {
-    channel: "ahp-root://",
-    provider,
-    workingDirectory: workspaceUri,
-    config: values,
-    property,
-    query: "",
-  });
+  const result = await beforeDeadline(
+    () =>
+      client.request("sessionConfigCompletions", {
+        channel: "ahp-root://",
+        provider,
+        workingDirectory: workspaceUri,
+        config: values,
+        property,
+        query: "",
+      }),
+    deadline,
+    "managed-config-completions-timeout",
+  );
   return result.items.map((item) => ({
     value: item.value,
     label: item.label,

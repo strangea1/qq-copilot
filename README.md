@@ -7,6 +7,10 @@ Remote SSH 目标上创建、绑定和启动新的 Session。
 完整安装、升级、回滚和故障排查见 [部署指南](docs/deployment.md)；协议与安全设计见
 [远程交互设计](docs/qq-copilot-remote-design.md)。
 
+当前 VS Code 1.136 Local Standalone 手机创建的认证、模型选择和首任务失败回滚仍有
+已确认缺口；复现证据与后续实现边界见
+[Mobile Session Creation Handoff](docs/mobile-session-creation-handoff.md)。
+
 ## 架构
 
 ```text
@@ -56,7 +60,8 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
   完成、取消、失败或等待审批/澄清时停止。
 - Host/Adapter 重连恢复 Session 订阅；Host 实例更换时未决操作 fail-closed。
 - 脱敏事件和未送达 projection 保留 30 天。
-- QQ 实时投递失败后，在 Owner 下一条 QQ 消息的被动回复中补发。
+- QQ 实时投递失败后，在 Owner 下一条 QQ 消息到达时单独补发；同一事件批次使用稳定
+  幂等键，成功或投递结果不确定后都不会再次发送。
 - QQ 私聊语音使用事件自带的 ASR 结果作为普通共享会话输入；敏感控制命令仍要求文字或按钮。
 - AHP/Legacy 模式一键切换。
 
@@ -87,12 +92,15 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - UAC、密码、MFA、系统弹窗和工具认证 Secret 不通过 QQ 处理。
 - AHP 是 VS Code 快速演进的接口。本项目固定并验证了 VS Code 1.136 的协议 revision；
   升级 VS Code 后应重新执行兼容性验收。
+- VS Code 1.136 的 Editor endpoint 宣告并协商 `0.9.0`；`code-tunnel agent host`
+  的 standalone 注册表宣告 `0.1.0`，但实际 wire 仍严格协商 `0.9.0`。Adapter 只对这一
+  已验证组合应用元数据映射，不把 `0.1.0` 当作 wire 协议。
 
 ## 前置条件
 
 - Windows 当前标准用户。
-- VS Code 1.136 或经过兼容测试的后续版本；Standalone/Remote SSH 还要求 CLI Host
-  宣告当前 vendored 客户端支持的协议版本。
+- VS Code 1.136 或经过兼容测试的后续版本；Standalone/Remote SSH 必须匹配已审计的
+  registry-to-wire 版本组合，未知组合继续 fail-closed。
 - Node.js 24.18 或更高版本。
 - Rust 1.89 或更高版本（仅源码构建需要）。
 - QQ Bot 已开通：

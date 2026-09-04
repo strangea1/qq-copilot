@@ -10,9 +10,13 @@ import {
   SessionStatus,
   ToolCallStatus,
   TurnState,
+  type ChatState,
 } from "@microsoft/agent-host-protocol";
 
-import type { DomainActionEvent } from "../src/ahp-core.js";
+import type {
+  ChatSnapshotEvent,
+  DomainActionEvent,
+} from "../src/ahp-core.js";
 import { AhpEventNormalizer } from "../src/event-normalizer.js";
 
 const sessionUri = "copilot:/session-1";
@@ -381,6 +385,92 @@ test("normalizer emits each assistant response part once at its boundary", () =>
     completedSnapshot.filter((event) => event.kind === "assistant_message")
       .length,
     0,
+  );
+});
+
+test("normalizer coalesces mirrored snapshots while accumulating delta chunks", () => {
+  const events = normalizer();
+  const startedAt = "2026-08-27T00:05:00Z";
+  const activeTurn = (
+    content: string,
+  ): NonNullable<ChatState["activeTurn"]> => ({
+    id: "delta-turn",
+    startedAt,
+    message: {
+      text: "stream a long response",
+      origin: { kind: MessageKind.User },
+    },
+    responseParts:
+      content.length === 0
+        ? []
+        : [
+            {
+              kind: ResponsePartKind.Markdown,
+              id: "delta-part",
+              content,
+            },
+          ],
+    usage: undefined,
+  });
+  const snapshot = (
+    serverSeq: number,
+    content: string,
+  ): ChatSnapshotEvent => ({
+    endpointId: "endpoint-1",
+    sessionUri,
+    provider: "copilot",
+    chatUri,
+    serverSeq,
+    state: {
+      resource: chatUri,
+      title: "Shared",
+      status: SessionStatus.InProgress,
+      modifiedAt: startedAt,
+      turns: [],
+      activeTurn: activeTurn(content),
+    },
+  });
+
+  events.chatSnapshot(snapshot(1, ""));
+  events.action(
+    chatAction(2, {
+      type: ActionType.ChatResponsePart,
+      turnId: "delta-turn",
+      part: {
+        kind: ResponsePartKind.Markdown,
+        id: "delta-part",
+        content: "",
+      },
+    }),
+  );
+
+  for (let index = 0; index < 1_000; index += 1) {
+    const serverSeq = index + 3;
+    events.action(
+      chatAction(serverSeq, {
+        type: ActionType.ChatDelta,
+        turnId: "delta-turn",
+        partId: "delta-part",
+        content: "x",
+      }),
+    );
+    assert.deepEqual(events.chatSnapshot(snapshot(serverSeq, "x".repeat(index + 1))), []);
+  }
+
+  const flushed = events.action(
+    chatAction(1_003, {
+      type: ActionType.ChatToolCallStart,
+      turnId: "delta-turn",
+      toolCallId: "tool-after-delta",
+      toolName: "view",
+      displayName: "View",
+    }),
+  );
+  assert.equal(flushed.length, 1);
+  assert.equal(flushed[0]?.kind, "assistant_message");
+  assert.equal(
+    (flushed[0]?.data as { readonly content?: string }).content,
+    "x".repeat(1_000),
   );
 });
 

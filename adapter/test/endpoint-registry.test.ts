@@ -44,6 +44,7 @@ test("registry watcher detects editor endpoint creation and aborts cleanly", asy
         pid: process.pid,
         instanceId,
         protocolVersion: "0.9.0",
+        wireProtocolVersion: "1.0.0",
         connectionToken,
         endpoint: {
           type: "socket",
@@ -57,6 +58,7 @@ test("registry watcher detects editor endpoint creation and aborts cleanly", asy
     assert.equal(changed.done, false);
     assert.equal(changed.value?.length, 1);
     assert.equal(changed.value?.[0]?.instanceId, instanceId);
+    assert.equal(changed.value?.[0]?.wireProtocolVersion, undefined);
 
     abort.abort();
     const completed = await watcher.next();

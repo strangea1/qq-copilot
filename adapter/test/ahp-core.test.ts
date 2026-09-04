@@ -8,6 +8,7 @@ import {
   ChatInputQuestionKind,
   ChatInputResponseKind,
   ConfirmationOptionKind,
+  ResponsePartKind,
   SessionInputRequestKind,
   SessionLifecycle,
   SessionStatus,
@@ -363,6 +364,72 @@ test("core rejects a negotiated protocol that differs from the endpoint advertis
   }
 });
 
+test("core preserves standalone 0.1.0 metadata while negotiating its audited 0.9.0 wire", async () => {
+  const entry: EndpointRegistryEntry = {
+    ...fakeEndpoint(
+      "s",
+      "endpoint_S_123456",
+      "token_S_123456789012345678901234",
+      "\\\\.\\pipe\\secret-ahp-s",
+      "0.1.0",
+    ),
+    type: "standalone",
+    wireProtocolVersion: "0.9.0",
+  };
+  const [clientTransport, serverTransport] = InMemoryTransport.pair();
+  const server = new FakeAhpServer(serverTransport, {
+    summary: summary("opaque-session-s", "Standalone alias"),
+    resources: new Map(),
+    protocolVersion: "0.9.0",
+  });
+  const connections: ConnectionEvent[] = [];
+  const core = new AhpCore({
+    userDataDirectory: "unused",
+    clientId: "standalone-alias-client",
+    watch: false,
+    callbacks: {
+      onConnection: (event) => connections.push(event),
+    },
+    dependencies: {
+      discoverEndpoints: async () => [entry],
+      openTransport: async () => clientTransport,
+    },
+  });
+
+  try {
+    const catalogue = await core.start();
+    assert.equal(catalogue.endpoints[0]?.connection, "connected");
+    assert.equal(catalogue.endpoints[0]?.endpoint.advertisedProtocol, "0.1.0");
+    assert.equal(catalogue.endpoints[0]?.selectedProtocol, "0.9.0");
+    assert.ok(
+      connections.some(
+        (event) =>
+          event.status === "connected" &&
+          event.endpoint.advertisedProtocol === "0.1.0" &&
+          event.selectedProtocol === "0.9.0",
+      ),
+    );
+    assert.ok(server.initializeProtocolVersions[0]?.includes("0.9.0"));
+    assert.equal(server.initializeProtocolVersions[0]?.includes("0.1.0"), false);
+    const endpointId = catalogue.endpoints[0]?.endpoint.id;
+    assert.ok(endpointId);
+    const deferred = summary(
+      "ahp-session:/deferred-standalone",
+      "Deferred standalone",
+    );
+    core.rememberSession(endpointId, deferred);
+    assert.deepEqual(
+      core.catalogue.endpoints[0]?.sessions.find(
+        (session) => session.resource === deferred.resource,
+      ),
+      deferred,
+    );
+  } finally {
+    await core.stop();
+    await server.done;
+  }
+});
+
 test("binding losslessly hydrates opaque session/default-chat URIs and dispatches typed operations", async () => {
   const sessionUri = "urn:provider:session:exact-value";
   const chatA = "chat+vendor://opaque/A";
@@ -582,6 +649,39 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
       () =>
         binding.snapshot().defaultChat?.activeTurn?.id === "new-turn",
     );
+    await server.emitAction(
+      chatB,
+      {
+        type: ActionType.ChatResponsePart,
+        turnId: "new-turn",
+        part: {
+          kind: ResponsePartKind.Markdown,
+          id: "streamed-part",
+          content: "",
+        },
+      },
+      102,
+    );
+    await waitFor(() =>
+      actions.some((event) => event.envelope.serverSeq === 102),
+    );
+    const snapshotsBeforeDeltas = chatSnapshots.length;
+    for (let serverSeq = 103; serverSeq < 1_103; serverSeq += 1) {
+      await server.emitAction(
+        chatB,
+        {
+          type: ActionType.ChatDelta,
+          turnId: "new-turn",
+          partId: "streamed-part",
+          content: "x",
+        },
+        serverSeq,
+      );
+    }
+    await waitFor(() =>
+      actions.some((event) => event.envelope.serverSeq === 1_102),
+    );
+    assert.equal(chatSnapshots.length, snapshotsBeforeDeltas);
 
     monotonicNow = 575;
     const cancelled = await binding.cancelActiveTurn();

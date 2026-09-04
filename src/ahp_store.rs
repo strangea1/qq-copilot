@@ -166,6 +166,8 @@ pub struct AhpProjectionRecord {
     pub event_id: String,
     pub kind: String,
     pub content: String,
+    pub replay_key: Option<String>,
+    pub replay_generation: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +464,8 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 state TEXT NOT NULL CHECK (state IN ('pending', 'delivered')),
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
+                replay_key TEXT,
+                replay_generation INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -535,6 +539,23 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
             "ALTER TABLE ahp_binding ADD COLUMN queued_message_count INTEGER NOT NULL DEFAULT 0",
         )?;
     }
+    ensure_column(
+        connection,
+        "ahp_projections",
+        "replay_key",
+        "ALTER TABLE ahp_projections ADD COLUMN replay_key TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_projections",
+        "replay_generation",
+        "ALTER TABLE ahp_projections ADD COLUMN replay_generation INTEGER NOT NULL DEFAULT 0",
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ahp_projections_replay
+         ON ahp_projections(state, replay_key, created_at, event_id)",
+        [],
+    )?;
     ensure_column(
         connection,
         "ahp_commands",
@@ -2944,15 +2965,15 @@ impl Database {
         Ok(changed)
     }
 
-    pub fn ahp_queue_projection(&self, event_id: &str, kind: &str, content: &str) -> Result<()> {
-        self.connection()?.execute(
+    pub fn ahp_queue_projection(&self, event_id: &str, kind: &str, content: &str) -> Result<bool> {
+        let changed = self.connection()?.execute(
             "INSERT INTO ahp_projections(
                 event_id, kind, content, state, created_at, updated_at
              ) VALUES (?1, ?2, ?3, 'pending', ?4, ?4)
              ON CONFLICT(event_id) DO NOTHING",
             params![event_id, kind, content, now()],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     pub fn ahp_projection_failed(&self, event_id: &str, error_code: &str) -> Result<()> {
@@ -2975,7 +2996,7 @@ impl Database {
         for event_id in event_ids {
             transaction.execute(
                 "UPDATE ahp_projections
-                 SET state = 'delivered', last_error = NULL, updated_at = ?1
+                 SET state = 'delivered', last_error = NULL, replay_key = NULL, updated_at = ?1
                  WHERE event_id = ?2",
                 params![now, event_id],
             )?;
@@ -2986,21 +3007,129 @@ impl Database {
 
     pub fn ahp_pending_projections(&self, limit: u32) -> Result<Vec<AhpProjectionRecord>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT event_id, kind, content FROM ahp_projections
+        let now = now();
+        connection.execute(
+            "UPDATE ahp_projections
+             SET state = 'delivered', last_error = NULL, replay_key = NULL, updated_at = ?1
              WHERE state = 'pending'
-             ORDER BY created_at ASC LIMIT ?1",
+               AND EXISTS (
+                    SELECT 1 FROM deliveries d
+                    WHERE d.idempotency_key =
+                              'ahp-event-projection:' || ahp_projections.event_id
+                      AND (
+                           d.status = 'sent'
+                           OR (
+                                d.status = 'in_doubt'
+                                AND (
+                                     d.qq_message_id IS NOT NULL
+                                     OR EXISTS (
+                                          SELECT 1 FROM sent_message_events s
+                                          WHERE s.delivery_id = d.delivery_id
+                                     )
+                                )
+                           )
+                      )
+               )",
+            [now],
+        )?;
+        let claimed_key = connection
+            .query_row(
+                "SELECT replay_key FROM ahp_projections
+                 WHERE state = 'pending' AND replay_key IS NOT NULL
+                 ORDER BY created_at ASC, event_id ASC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(replay_key) = claimed_key {
+            let mut statement = connection.prepare(
+                "SELECT event_id, kind, content, replay_key, replay_generation
+                 FROM ahp_projections
+                 WHERE state = 'pending' AND replay_key = ?1
+                 ORDER BY created_at ASC, event_id ASC",
+            )?;
+            return statement
+                .query_map([replay_key], map_projection)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("failed to query claimed AHP projection replay");
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT p.event_id, p.kind, p.content, p.replay_key, p.replay_generation
+             FROM ahp_projections p
+             LEFT JOIN deliveries d
+               ON d.idempotency_key = 'ahp-event-projection:' || p.event_id
+             WHERE p.state = 'pending' AND p.replay_key IS NULL
+               AND (
+                    d.status = 'failed'
+                    OR (
+                         d.status = 'in_doubt'
+                         AND d.qq_message_id IS NULL
+                         AND NOT EXISTS (
+                              SELECT 1 FROM sent_message_events s
+                              WHERE s.delivery_id = d.delivery_id
+                         )
+                    )
+                    OR (
+                         d.delivery_id IS NULL
+                         AND p.last_error IS NOT NULL
+                    )
+               )
+             ORDER BY p.created_at ASC, p.event_id ASC LIMIT ?1",
         )?;
         statement
-            .query_map([i64::from(limit)], |row| {
-                Ok(AhpProjectionRecord {
-                    event_id: row.get(0)?,
-                    kind: row.get(1)?,
-                    content: row.get(2)?,
-                })
-            })?
+            .query_map([i64::from(limit)], map_projection)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to query pending AHP projections")
+    }
+
+    pub fn ahp_claim_projection_replay(
+        &self,
+        projections: &[AhpProjectionRecord],
+        replay_key: &str,
+    ) -> Result<bool> {
+        if projections.is_empty() {
+            return Ok(false);
+        }
+        if replay_key.trim().is_empty() || replay_key.len() > 256 {
+            bail!("AHP projection replay key is invalid");
+        }
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for projection in projections {
+            if projection.replay_key.is_some() {
+                bail!("AHP projection is already claimed for replay");
+            }
+            let changed = transaction.execute(
+                "UPDATE ahp_projections
+                 SET replay_key = ?1, updated_at = ?2
+                 WHERE event_id = ?3 AND state = 'pending'
+                   AND replay_key IS NULL AND replay_generation = ?4",
+                params![
+                    replay_key,
+                    now,
+                    projection.event_id,
+                    projection.replay_generation
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn ahp_release_projection_replay(&self, replay_key: &str, error_code: &str) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE ahp_projections
+             SET replay_key = NULL, replay_generation = replay_generation + 1,
+                 attempts = attempts + 1, last_error = ?1, updated_at = ?2
+             WHERE state = 'pending' AND replay_key = ?3",
+            params![error_code, now(), replay_key],
+        )?;
+        Ok(())
     }
 
     pub fn ahp_purge_events(&self, retention_days: u32) -> Result<()> {
@@ -3630,6 +3759,16 @@ fn map_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpAdapterCommand> {
         data: serde_json::from_str(&data).map_err(|error| {
             SqliteError::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
         })?,
+    })
+}
+
+fn map_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpProjectionRecord> {
+    Ok(AhpProjectionRecord {
+        event_id: row.get(0)?,
+        kind: row.get(1)?,
+        content: row.get(2)?,
+        replay_key: row.get(3)?,
+        replay_generation: row.get(4)?,
     })
 }
 
@@ -4396,6 +4535,41 @@ mod tests {
             .expect("foreign keys");
         assert_eq!(legacy_count, 1);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn migration_adds_projection_replay_state() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE ahp_projections (
+                    event_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                "#,
+            )
+            .expect("legacy projection schema");
+
+        initialize_schema(&connection).expect("migrate projection schema");
+        let columns = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(ahp_projections)")
+                .expect("projection columns");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("query columns")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect columns")
+        };
+        assert!(columns.iter().any(|column| column == "replay_key"));
+        assert!(columns.iter().any(|column| column == "replay_generation"));
     }
 
     #[test]

@@ -30,6 +30,9 @@ export interface EndpointRegistryEntry {
   readonly pid: number;
   readonly instanceId: string;
   readonly protocolVersion: string;
+  // Some standalone launchers version their registry independently from the wire.
+  // This field is assigned only by the audited managed-target adapter, never from disk.
+  readonly wireProtocolVersion?: string;
   readonly connectionToken: string;
   readonly endpoint: SocketEndpoint | TcpEndpoint | WebSocketEndpoint;
   readonly sourceFile: string;

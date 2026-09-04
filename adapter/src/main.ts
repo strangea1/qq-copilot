@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-import { SUPPORTED_PROTOCOL_VERSIONS } from "@microsoft/agent-host-protocol";
+import {
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type SessionSummary,
+} from "@microsoft/agent-host-protocol";
 
 import {
   AhpCore,
@@ -27,11 +30,13 @@ import {
 } from "./config.js";
 import {
   connectManagedTarget,
+  connectPreparedManagedTarget,
   createManagedSession,
   disposeManagedSession,
   managedTargetMatchesWorkspaceUri,
   prepareTargetResult,
   refreshManagedSessions,
+  stopManagedTargetProcesses,
   type ConnectedManagedTarget,
   type ManagedTarget,
   type PrepareTargetResult,
@@ -53,7 +58,7 @@ const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
 const RETRY_DELAY_MS = 1_000;
 const ACK_RETRY_DELAY_MS = 1_000;
-const MANAGED_BIND_GRACE_MS = 60_000;
+const MANAGED_BIND_GRACE_MS = 90_000;
 const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 
 export interface BridgeBinding {
@@ -131,6 +136,7 @@ export interface AhpCoreLike {
   start(): Promise<CatalogueSnapshot | void>;
   stop(): Promise<void>;
   refreshEndpoints(): Promise<CatalogueSnapshot>;
+  rememberSession(endpointId: string, summary: SessionSummary): void;
   bindSession(endpointId: string, sessionUri: string): Promise<AhpSessionBinding>;
 }
 
@@ -145,6 +151,23 @@ interface ManagedEntryState {
   readonly entry: EndpointRegistryEntry;
   readonly prepared: ConnectedManagedTarget["prepared"];
   readonly protectedUntil: number;
+  activeOperations: number;
+  pruning: boolean;
+}
+
+interface ProvisionalBindingState {
+  readonly commandId: number;
+  readonly endpointId: string;
+  readonly sessionUri: string;
+  readonly binding: AhpSessionBinding;
+  readonly target: ManagedTarget;
+  expiresAt?: number;
+  disposing: boolean;
+}
+
+interface BridgeCatalogueSession extends Record<string, unknown> {
+  readonly endpoint_id: string;
+  readonly session_uri: string;
 }
 
 class SerialQueue {
@@ -182,11 +205,25 @@ export class AdapterRuntime {
 
   readonly #events = new Map<string, Map<string, PublishedEvent>>();
 
+  readonly #coalescedSnapshotEventIds = new Map<
+    string,
+    Map<string, string>
+  >();
+
   readonly #managedEntries = new Map<string, ManagedEntryState>();
+
+  readonly #managedTargetReservations = new Map<string, Promise<void>>();
+
+  readonly #retiringManagedEndpointIds = new Set<string>();
 
   readonly #bindings = new Map<string, ActiveBinding>();
 
   readonly #pendingBindings = new Map<string, PendingBinding>();
+
+  readonly #provisionalBindings = new Map<
+    string,
+    ProvisionalBindingState
+  >();
 
   readonly #eventFlushes = new Map<string, Promise<void>>();
 
@@ -201,6 +238,12 @@ export class AdapterRuntime {
   #restoreRetryTimer: NodeJS.Timeout | undefined;
 
   #managedPruneTimer: NodeJS.Timeout | undefined;
+
+  #managedPruneTask: Promise<void> | undefined;
+
+  #managedPruneRerunRequested = false;
+
+  #managedRefreshPending = false;
 
   #stopping = false;
 
@@ -361,6 +404,7 @@ export class AdapterRuntime {
       clearTimeout(this.#managedPruneTimer);
       this.#managedPruneTimer = undefined;
     }
+    let failure: unknown;
     await Promise.all(
       [...this.#commandQueues.values()].map((queue) => queue.drain()),
     );
@@ -369,7 +413,13 @@ export class AdapterRuntime {
     await this.#callbackQueue.drain();
     await this.#catalogueQueue.drain();
 
-    let failure: unknown;
+    if (this.#managedPruneTask) {
+      try {
+        await this.#managedPruneTask;
+      } catch (error) {
+        failure = error;
+      }
+    }
     try {
       await Promise.all([...this.#eventFlushes.values()]);
     } catch (error) {
@@ -379,10 +429,15 @@ export class AdapterRuntime {
     const bindings = [...this.#bindings.values()];
     this.#bindings.clear();
     this.#pendingBindings.clear();
+    this.#provisionalBindings.clear();
     this.#restoreBindings.clear();
     this.#restoreManagedTargets.clear();
     this.#restoringBindings.clear();
+    this.#managedTargetReservations.clear();
+    this.#retiringManagedEndpointIds.clear();
+    this.#managedRefreshPending = false;
     this.#events.clear();
+    this.#coalescedSnapshotEventIds.clear();
     this.#eventFlushes.clear();
 
     try {
@@ -397,10 +452,14 @@ export class AdapterRuntime {
       failure ??= error;
     }
 
-    for (const entry of this.#managedEntries.values()) {
-      if (entry.prepared.tunnel && !entry.prepared.tunnel.killed) {
-        entry.prepared.tunnel.kill();
-      }
+    try {
+      await Promise.all(
+        [...this.#managedEntries.values()].map((entry) =>
+          stopManagedTargetProcesses(entry.prepared),
+        ),
+      );
+    } catch (error) {
+      failure ??= error;
     }
     this.#managedEntries.clear();
 
@@ -570,6 +629,9 @@ export class AdapterRuntime {
       undefined,
       result,
     );
+    if (command.kind === "create_session") {
+      await this.#armProvisionalBinding(command.command_id);
+    }
   }
 
   #requireBinding(command: AdapterCommand): ActiveBinding {
@@ -599,12 +661,12 @@ export class AdapterRuntime {
       await this.#flushEvents(command.binding_id);
     }
     this.#pendingBindings.delete(command.binding_id);
-    this.#events.delete(command.binding_id);
-    if (!active) {
-      return;
+    this.#clearQueuedEvents(command.binding_id);
+    if (active) {
+      this.#bindings.delete(command.binding_id);
+      await active.binding.close();
     }
-    this.#bindings.delete(command.binding_id);
-    await active.binding.close();
+    await this.#pruneManagedEntries();
   }
 
   async #activateBinding(binding: BridgeBinding): Promise<void> {
@@ -619,6 +681,20 @@ export class AdapterRuntime {
       throw new AhpOperationError(
         "binding-unavailable",
         "Bound Agent Host is not connected",
+      );
+    }
+    const provisionalKey = provisionalBindingKey(
+      binding.endpoint_id,
+      binding.session_uri,
+    );
+    if (
+      this.#retiringManagedEndpointIds.has(binding.endpoint_id) ||
+      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning ||
+      this.#provisionalBindings.get(provisionalKey)?.disposing
+    ) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "Bound Agent Host is being released",
       );
     }
 
@@ -648,12 +724,22 @@ export class AdapterRuntime {
 
     if (existing) {
       this.#bindings.delete(binding.binding_id);
-      this.#events.delete(binding.binding_id);
+      this.#clearQueuedEvents(binding.binding_id);
       await existing.binding.close();
     } else {
-      this.#events.delete(binding.binding_id);
+      this.#clearQueuedEvents(binding.binding_id);
     }
 
+    if (
+      this.#retiringManagedEndpointIds.has(binding.endpoint_id) ||
+      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning ||
+      this.#provisionalBindings.get(provisionalKey)?.disposing
+    ) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "Bound Agent Host is being released",
+      );
+    }
     const pending: PendingBinding = {
       bindingId: binding.binding_id,
       generation: binding.generation,
@@ -690,6 +776,7 @@ export class AdapterRuntime {
         normalizer,
       };
       this.#bindings.set(binding.binding_id, active);
+      this.#provisionalBindings.delete(provisionalKey);
       await this.#bridge.call({
         operation: "ahp_binding_ready",
         adapter_id: this.#config.adapterId,
@@ -706,7 +793,8 @@ export class AdapterRuntime {
       await this.#flushEvents(binding.binding_id);
     } catch (error) {
       this.#pendingBindings.delete(binding.binding_id);
-      this.#events.delete(binding.binding_id);
+      this.#provisionalBindings.delete(provisionalKey);
+      this.#clearQueuedEvents(binding.binding_id);
       this.#bindings.delete(binding.binding_id);
       await sessionBinding?.close().catch((closeError: unknown) => {
         safeLog("warn", "Failed to close rejected AHP binding", {
@@ -844,7 +932,7 @@ export class AdapterRuntime {
         : false;
     const currentConfig =
       "config" in data ? requireRecord(data.config, "config") : {};
-    const connection = await connectManagedTarget(this.#config, target);
+    const connection = await this.#connectTarget(target);
     const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
     let retained = false;
     try {
@@ -856,14 +944,15 @@ export class AdapterRuntime {
       if (retainConnection) {
         await this.#publishManagedCatalogue(connection);
         await this.#retainManagedPrepared(target, connection.prepared);
+        connection.releasePreparedOwnership();
         retained = true;
       }
       return result;
     } finally {
       if (retained) {
-        await connection.client.shutdown().catch(() => undefined);
+        await connection.disconnect();
       } else {
-        await connection.close().catch(() => undefined);
+        await connection.close();
         if (!alreadyRetained) {
           await this.#publishManagedCatalogue(
             connection,
@@ -876,13 +965,21 @@ export class AdapterRuntime {
   }
 
   async #prepareManagedBindingTarget(target: ManagedTarget): Promise<void> {
-    const connection = await connectManagedTarget(this.#config, target);
+    const connection = await this.#connectTarget(target);
     try {
       await this.#publishManagedCatalogue(connection);
       await this.#retainManagedPrepared(target, connection.prepared);
-      await connection.client.shutdown().catch(() => undefined);
+      connection.releasePreparedOwnership();
+      await connection.disconnect();
     } catch (error) {
-      await connection.close().catch(() => undefined);
+      try {
+        await connection.close();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "managed-binding-target-cleanup-failed",
+        );
+      }
       throw error;
     }
   }
@@ -895,8 +992,7 @@ export class AdapterRuntime {
     const workspaceUri = requireString(data.workspace_uri, "workspace_uri");
     const resolvedValues = requireRecord(data.resolved_values, "resolved_values");
     const overrides = requireRecord(data.overrides, "overrides");
-    const connection = await connectManagedTarget(
-      this.#config,
+    const connection = await this.#connectTarget(
       target,
       async (progress) => {
         await this.#bridge.call({
@@ -911,6 +1007,9 @@ export class AdapterRuntime {
       },
     );
     let createdSessionUri: string | undefined;
+    let confirmation: Awaited<
+      ReturnType<typeof createManagedSession>
+    >["confirmation"];
     try {
       const result = await createManagedSession(connection, {
         provider,
@@ -919,6 +1018,7 @@ export class AdapterRuntime {
         resolvedValues,
         overrides,
       });
+      confirmation = result.confirmation;
       createdSessionUri = result.session.resource;
       this.#removedSessionUris.delete(createdSessionUri);
       const session = toBridgeSession(
@@ -926,10 +1026,38 @@ export class AdapterRuntime {
         target,
         result.session,
       );
-      const sessions = await refreshManagedSessions(connection.client);
-      await this.#publishManagedCatalogue(connection, sessions);
       await this.#retainManagedPrepared(target, connection.prepared);
-      await connection.client.shutdown().catch(() => undefined);
+      connection.releasePreparedOwnership();
+      this.#core.rememberSession(result.endpoint_id, result.session);
+      const provisionalBinding = await this.#core.bindSession(
+        result.endpoint_id,
+        result.session.resource,
+      );
+      this.#provisionalBindings.set(
+        provisionalBindingKey(
+          result.endpoint_id,
+          result.session.resource,
+        ),
+        {
+          commandId: command.command_id,
+          endpointId: result.endpoint_id,
+          sessionUri: result.session.resource,
+          binding: provisionalBinding,
+          target,
+          disposing: false,
+        },
+      );
+      await confirmation?.close();
+      confirmation = undefined;
+      const listedSessions = await refreshManagedSessions(connection.client);
+      const sessions = listedSessions.some(
+        (listed) => listed.resource === result.session.resource,
+      )
+        ? listedSessions
+        : [...listedSessions, result.session];
+      await this.#publishManagedCatalogue(connection, sessions);
+      await this.#publishCatalogue(this.#core.catalogue);
+      await connection.disconnect();
       return {
         endpoint_id: result.endpoint_id,
         host_instance_id: result.host_instance_id,
@@ -939,31 +1067,58 @@ export class AdapterRuntime {
         session,
       };
     } catch (error) {
-      let cleanupError: unknown;
+      const cleanupErrors: unknown[] = [];
       if (createdSessionUri) {
         try {
+          await confirmation?.close();
+        } catch (closeError) {
+          cleanupErrors.push(closeError);
+        }
+        try {
+          await this.#forgetProvisionalBindings(createdSessionUri);
+        } catch (provisionalError) {
+          cleanupErrors.push(provisionalError);
+        }
+        let disposed = false;
+        try {
           await disposeManagedSession(connection, createdSessionUri);
+          disposed = true;
+        } catch (disposeError) {
+          cleanupErrors.push(disposeError);
+        }
+        if (disposed) {
           this.#removedSessionUris.set(
             createdSessionUri,
             managedTargetKey(target),
           );
-          const sessions = await refreshManagedSessions(connection.client);
-          await this.#publishManagedCatalogue(
-            connection,
-            sessions,
-            this.#managedEntries.has(managedTargetKey(target))
-              ? "connected"
-              : "unreachable",
-            [createdSessionUri],
-          );
-        } catch (disposeError) {
-          cleanupError = disposeError;
+          try {
+            const sessions = await refreshManagedSessions(connection.client);
+            await this.#publishManagedCatalogue(
+              connection,
+              sessions,
+              this.#managedEntries.has(managedTargetKey(target))
+                ? "connected"
+                : "unreachable",
+              [createdSessionUri],
+            );
+          } catch (publishError) {
+            cleanupErrors.push(publishError);
+          }
         }
       }
-      await connection.close().catch(() => undefined);
-      if (cleanupError !== undefined) {
+      try {
+        await connection.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
+      try {
+        await this.#pruneManagedEntries();
+      } catch (pruneError) {
+        cleanupErrors.push(pruneError);
+      }
+      if (cleanupErrors.length > 0) {
         throw new AggregateError(
-          [error, cleanupError],
+          [error, ...cleanupErrors],
           "created-session-cleanup-failed",
         );
       }
@@ -976,7 +1131,9 @@ export class AdapterRuntime {
     const target = parseManagedTarget(data.target);
     const sessionUri = requireString(data.session_uri, "session_uri");
     const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
-    const connection = await connectManagedTarget(this.#config, target);
+    const connection = await this.#connectTarget(target);
+    let operationFailed = false;
+    let operationError: unknown;
     try {
       await disposeManagedSession(connection, sessionUri);
       this.#removedSessionUris.set(sessionUri, managedTargetKey(target));
@@ -988,18 +1145,43 @@ export class AdapterRuntime {
         alreadyRetained ? "connected" : "unreachable",
         [sessionUri],
       );
-    } finally {
-      await connection.close().catch(() => undefined);
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
+    }
+    const cleanupErrors: unknown[] = [];
+    if (operationFailed) {
+      cleanupErrors.push(operationError);
+    }
+    try {
+      await connection.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      await this.#pruneManagedEntries();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (cleanupErrors.length === 1) {
+      throw cleanupErrors[0];
+    }
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        "disposed-session-cleanup-failed",
+      );
     }
   }
 
   async #forgetRemovedSessionBindings(sessionUri: string): Promise<void> {
+    await this.#forgetProvisionalBindings(sessionUri);
     for (const [bindingId, binding] of [...this.#bindings]) {
       if (binding.sessionUri !== sessionUri) {
         continue;
       }
       this.#bindings.delete(bindingId);
-      this.#events.delete(bindingId);
+      this.#clearQueuedEvents(bindingId);
       this.#eventFlushes.delete(bindingId);
       try {
         await binding.binding.close();
@@ -1013,7 +1195,7 @@ export class AdapterRuntime {
     for (const [bindingId, binding] of [...this.#pendingBindings]) {
       if (binding.sessionUri === sessionUri) {
         this.#pendingBindings.delete(bindingId);
-        this.#events.delete(bindingId);
+        this.#clearQueuedEvents(bindingId);
         this.#eventFlushes.delete(bindingId);
       }
     }
@@ -1024,59 +1206,361 @@ export class AdapterRuntime {
     }
   }
 
+  async #forgetProvisionalBindings(sessionUri: string): Promise<void> {
+    const matches = [...this.#provisionalBindings].filter(
+      ([, binding]) => binding.sessionUri === sessionUri,
+    );
+    for (const [key] of matches) {
+      this.#provisionalBindings.delete(key);
+    }
+    await Promise.all(
+      matches.map(([, binding]) => binding.binding.close()),
+    );
+  }
+
+  async #armProvisionalBinding(commandId: number): Promise<void> {
+    const expiresAt = Date.now() + MANAGED_BIND_GRACE_MS;
+    let armed = false;
+    for (const provisional of this.#provisionalBindings.values()) {
+      if (provisional.commandId === commandId) {
+        provisional.expiresAt = expiresAt;
+        armed = true;
+      }
+    }
+    if (!armed) {
+      return;
+    }
+    try {
+      await this.#pruneManagedEntries();
+    } catch (error) {
+      safeLog("warn", "Failed to schedule provisional binding expiry", {
+        commandId,
+        code: errorCode(error),
+      });
+    }
+  }
+
+  async #connectTarget(
+    target: ManagedTarget,
+    onProgress?: Parameters<typeof connectManagedTarget>[2],
+  ): Promise<ConnectedManagedTarget> {
+    const key = managedTargetKey(target);
+    const reservation = this.#managedTargetReservations.get(key);
+    if (reservation) {
+      await reservation;
+      return this.#connectTarget(target, onProgress);
+    }
+    const retained = this.#managedEntries.get(key);
+    if (!retained) {
+      let releaseReservation: (() => void) | undefined;
+      const pending = new Promise<void>((resolve) => {
+        releaseReservation = resolve;
+      });
+      this.#managedTargetReservations.set(key, pending);
+      const release = (): void => {
+        if (this.#managedTargetReservations.get(key) === pending) {
+          this.#managedTargetReservations.delete(key);
+        }
+        releaseReservation?.();
+      };
+      try {
+        const connection = await connectManagedTarget(
+          this.#config,
+          target,
+          onProgress,
+        );
+        return this.#wrapManagedConnection(connection, release);
+      } catch (error) {
+        release();
+        throw error;
+      }
+    }
+    if (retained.pruning) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "The managed Agent Host is being released",
+      );
+    }
+    retained.activeOperations += 1;
+    let connection: ConnectedManagedTarget;
+    try {
+      connection = await connectPreparedManagedTarget(
+        retained.prepared,
+        onProgress,
+      );
+    } catch (error) {
+      this.#releaseManagedOperation(key, retained.prepared);
+      throw error;
+    }
+    return this.#wrapManagedConnection(connection, () => {
+      this.#releaseManagedOperation(key, retained.prepared);
+    });
+  }
+
+  #wrapManagedConnection(
+    connection: ConnectedManagedTarget,
+    releaseConnection: () => void,
+  ): ConnectedManagedTarget {
+    let released = false;
+    const release = (): void => {
+      if (!released) {
+        released = true;
+        releaseConnection();
+      }
+    };
+    return {
+      ...connection,
+      releasePreparedOwnership(): void {
+        connection.releasePreparedOwnership();
+      },
+      async disconnect(): Promise<void> {
+        try {
+          await connection.disconnect();
+        } finally {
+          release();
+        }
+      },
+      async close(): Promise<void> {
+        try {
+          await connection.close();
+        } finally {
+          release();
+        }
+      },
+    };
+  }
+
+  #releaseManagedOperation(
+    key: string,
+    prepared: ConnectedManagedTarget["prepared"],
+  ): void {
+    const current = this.#managedEntries.get(key);
+    if (
+      current?.prepared === prepared &&
+      current.activeOperations > 0
+    ) {
+      current.activeOperations -= 1;
+    }
+    void this.#pruneManagedEntries().catch((error) => {
+      safeLog("warn", "Failed to prune after managed operation", {
+        code: errorCode(error),
+      });
+    });
+  }
+
   async #retainManagedPrepared(
     target: ManagedTarget,
     prepared: ConnectedManagedTarget["prepared"],
   ): Promise<void> {
     const key = managedTargetKey(target);
     const previous = this.#managedEntries.get(key);
+    const replacing = previous !== undefined && previous.prepared !== prepared;
+    const previousEndpointId = previous
+      ? endpointPublicId(previous.entry)
+      : undefined;
+    if (
+      replacing &&
+      previous &&
+      (previous.activeOperations > 0 ||
+        previous.pruning ||
+        (previousEndpointId !== undefined &&
+          this.#retiringManagedEndpointIds.has(previousEndpointId)) ||
+        [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
+          (binding) => binding.endpointId === previousEndpointId,
+        ) ||
+        [...this.#provisionalBindings.values()].some(
+          (binding) => binding.endpointId === previousEndpointId,
+        ))
+    ) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "Cannot replace a managed Host while it has active users",
+      );
+    }
+    if (replacing && previous && previousEndpointId) {
+      previous.pruning = true;
+      this.#retiringManagedEndpointIds.add(previousEndpointId);
+      try {
+        await stopManagedTargetProcesses(previous.prepared);
+      } catch (error) {
+        previous.pruning = false;
+        this.#retiringManagedEndpointIds.delete(previousEndpointId);
+        throw error;
+      }
+      if (this.#managedEntries.get(key) === previous) {
+        this.#managedEntries.delete(key);
+      }
+    }
     this.#managedEntries.set(key, {
       key,
       target,
       entry: prepared.entry,
       prepared,
       protectedUntil: Date.now() + MANAGED_BIND_GRACE_MS,
+      activeOperations:
+        previous?.prepared === prepared ? previous.activeOperations : 0,
+      pruning: false,
     });
     try {
       await this.#core.refreshEndpoints();
     } catch (error) {
-      if (previous) {
+      if (previous?.prepared === prepared) {
         this.#managedEntries.set(key, previous);
-      } else {
+        throw error;
+      }
+      if (this.#managedEntries.get(key)?.prepared === prepared) {
         this.#managedEntries.delete(key);
       }
-      if (prepared.tunnel && !prepared.tunnel.killed) {
-        prepared.tunnel.kill();
+      const cleanupErrors: unknown[] = [error];
+      try {
+        await stopManagedTargetProcesses(prepared);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
       }
-      await this.#core.refreshEndpoints().catch(() => undefined);
-      throw error;
+      this.#managedRefreshPending = true;
+      try {
+        await this.#core.refreshEndpoints();
+        this.#managedRefreshPending = false;
+        if (previousEndpointId) {
+          this.#retiringManagedEndpointIds.delete(previousEndpointId);
+        }
+      } catch (refreshError) {
+        cleanupErrors.push(refreshError);
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        "managed-target-retention-failed",
+      );
     }
-    if (
-      previous?.prepared !== prepared &&
-      previous?.prepared.tunnel &&
-      !previous.prepared.tunnel.killed
-    ) {
-      previous.prepared.tunnel.kill();
+    if (previousEndpointId && replacing) {
+      this.#retiringManagedEndpointIds.delete(previousEndpointId);
     }
     await this.#pruneManagedEntries();
   }
 
-  async #pruneManagedEntries(): Promise<void> {
+  #pruneManagedEntries(): Promise<void> {
+    const existing = this.#managedPruneTask;
+    if (existing) {
+      this.#managedPruneRerunRequested = true;
+      return existing;
+    }
+    const task = this.#runManagedPrunePasses().finally(() => {
+      if (this.#managedPruneTask === task) {
+        this.#managedPruneTask = undefined;
+      }
+    });
+    this.#managedPruneTask = task;
+    return task;
+  }
+
+  async #runManagedPrunePasses(): Promise<void> {
+    const errors: unknown[] = [];
+    do {
+      this.#managedPruneRerunRequested = false;
+      try {
+        await this.#pruneManagedEntriesInner();
+      } catch (error) {
+        errors.push(error);
+      }
+    } while (this.#managedPruneRerunRequested && !this.#stopping);
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "managed-target-prune-passes-failed");
+    }
+  }
+
+  async #pruneManagedEntriesInner(): Promise<void> {
     if (this.#managedPruneTimer) {
       clearTimeout(this.#managedPruneTimer);
       this.#managedPruneTimer = undefined;
     }
     let changed = false;
     let nextPruneDelay: number | undefined;
+    const errors: unknown[] = [];
     const now = Date.now();
+    for (const [key, provisional] of [...this.#provisionalBindings]) {
+      const active = [...this.#bindings.values()].some(
+        (binding) =>
+          binding.endpointId === provisional.endpointId &&
+          binding.sessionUri === provisional.sessionUri,
+      );
+      if (active) {
+        this.#provisionalBindings.delete(key);
+        continue;
+      }
+      const bindingPending = [...this.#pendingBindings.values()].some(
+        (binding) =>
+          binding.endpointId === provisional.endpointId &&
+          binding.sessionUri === provisional.sessionUri,
+      );
+      if (bindingPending) {
+        provisional.expiresAt = now + RETRY_DELAY_MS;
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? RETRY_DELAY_MS
+            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
+        continue;
+      }
+      if (provisional.disposing) {
+        continue;
+      }
+      if (provisional.expiresAt === undefined) {
+        continue;
+      }
+      if (provisional.expiresAt > now) {
+        const delay = provisional.expiresAt - now;
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? delay
+            : Math.min(nextPruneDelay, delay);
+        continue;
+      }
+      provisional.disposing = true;
+      delete provisional.expiresAt;
+      try {
+        await provisional.binding.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      let disposed = false;
+      try {
+        await this.#disposeExpiredProvisional(provisional);
+        disposed = true;
+      } catch (error) {
+        errors.push(error);
+      }
+      if (disposed) {
+        this.#provisionalBindings.delete(key);
+      } else {
+        provisional.disposing = false;
+        provisional.expiresAt = Date.now() + RETRY_DELAY_MS;
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? RETRY_DELAY_MS
+            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
+      }
+    }
     for (const [key, entry] of [...this.#managedEntries.entries()]) {
       const endpointId = endpointPublicId(entry.entry);
+      if (entry.activeOperations > 0) {
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? RETRY_DELAY_MS
+            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
+        continue;
+      }
       if (
+        entry.pruning ||
         [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
           (binding) => binding.endpointId === endpointId,
         ) ||
         [...this.#restoreBindings.values()].some(
           (binding) => binding.endpoint_id === endpointId,
+        ) ||
+        [...this.#provisionalBindings.values()].some(
+          (binding) => binding.endpointId === endpointId,
         )
       ) {
         continue;
@@ -1087,14 +1571,43 @@ export class AdapterRuntime {
           nextPruneDelay === undefined ? delay : Math.min(nextPruneDelay, delay);
         continue;
       }
-      if (entry.prepared.tunnel && !entry.prepared.tunnel.killed) {
-        entry.prepared.tunnel.kill();
+      entry.pruning = true;
+      this.#retiringManagedEndpointIds.add(endpointId);
+      try {
+        await stopManagedTargetProcesses(entry.prepared);
+        if (this.#managedEntries.get(key) === entry) {
+          this.#managedEntries.delete(key);
+        }
+        changed = true;
+      } catch (error) {
+        entry.pruning = false;
+        this.#retiringManagedEndpointIds.delete(endpointId);
+        errors.push(error);
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? RETRY_DELAY_MS
+            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
       }
-      this.#managedEntries.delete(key);
-      changed = true;
     }
     if (changed) {
-      await this.#core.refreshEndpoints();
+      this.#managedRefreshPending = true;
+    }
+    if (this.#managedRefreshPending) {
+      try {
+        await this.#core.refreshEndpoints();
+        this.#managedRefreshPending = false;
+        for (const endpointId of [...this.#retiringManagedEndpointIds]) {
+          if (!this.#managedEntryByEndpointId(endpointId)) {
+            this.#retiringManagedEndpointIds.delete(endpointId);
+          }
+        }
+      } catch (error) {
+        errors.push(error);
+        nextPruneDelay =
+          nextPruneDelay === undefined
+            ? RETRY_DELAY_MS
+            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
+      }
     }
     if (nextPruneDelay !== undefined && !this.#stopping) {
       this.#managedPruneTimer = setTimeout(() => {
@@ -1106,6 +1619,54 @@ export class AdapterRuntime {
         });
       }, Math.max(1, nextPruneDelay));
       this.#managedPruneTimer.unref();
+    }
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "managed-target-prune-failed");
+    }
+  }
+
+  async #disposeExpiredProvisional(
+    provisional: ProvisionalBindingState,
+  ): Promise<void> {
+    const connection = await this.#connectTarget(provisional.target);
+    const errors: unknown[] = [];
+    let disposed = false;
+    try {
+      await disposeManagedSession(connection, provisional.sessionUri);
+      disposed = true;
+      this.#removedSessionUris.set(
+        provisional.sessionUri,
+        managedTargetKey(provisional.target),
+      );
+      const sessions = await refreshManagedSessions(connection.client);
+      await this.#publishManagedCatalogue(
+        connection,
+        sessions,
+        "connected",
+        [provisional.sessionUri],
+      );
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await connection.close();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (!disposed && errors.length === 0) {
+      errors.push(new Error("expired-provisional-session-not-disposed"));
+    }
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        "expired-provisional-session-cleanup-failed",
+      );
     }
   }
 
@@ -1133,7 +1694,9 @@ export class AdapterRuntime {
             host_instance_id: prepared.entry.instanceId,
             pid: prepared.entry.pid,
             advertised_protocol: prepared.entry.protocolVersion,
-            selected_protocol: prepared.entry.protocolVersion,
+            selected_protocol:
+              prepared.entry.wireProtocolVersion ??
+              prepared.entry.protocolVersion,
             state: hostState,
             host_label: prepared.hostLabel,
             ...(target.kind === "ssh"
@@ -1346,7 +1909,20 @@ export class AdapterRuntime {
       pending = new Map<string, PublishedEvent>();
       this.#events.set(bindingId, pending);
     }
+    let coalescedSnapshots = this.#coalescedSnapshotEventIds.get(bindingId);
+    if (!coalescedSnapshots) {
+      coalescedSnapshots = new Map<string, string>();
+      this.#coalescedSnapshotEventIds.set(bindingId, coalescedSnapshots);
+    }
     for (const event of events) {
+      const coalescingKey = snapshotCoalescingKey(event);
+      if (coalescingKey) {
+        const previousEventId = coalescedSnapshots.get(coalescingKey);
+        if (previousEventId && previousEventId !== event.event_id) {
+          pending.delete(previousEventId);
+        }
+        coalescedSnapshots.set(coalescingKey, event.event_id);
+      }
       pending.set(event.event_id, event);
     }
     if (this.#bindings.has(bindingId)) {
@@ -1395,11 +1971,26 @@ export class AdapterRuntime {
       });
       for (const event of batch) {
         pending.delete(event.event_id);
+        const coalescingKey = snapshotCoalescingKey(event);
+        const coalescedSnapshots =
+          this.#coalescedSnapshotEventIds.get(bindingId);
+        if (
+          coalescingKey &&
+          coalescedSnapshots?.get(coalescingKey) === event.event_id
+        ) {
+          coalescedSnapshots.delete(coalescingKey);
+        }
       }
       if (pending.size === 0) {
         this.#events.delete(bindingId);
+        this.#coalescedSnapshotEventIds.delete(bindingId);
       }
     }
+  }
+
+  #clearQueuedEvents(bindingId: string): void {
+    this.#events.delete(bindingId);
+    this.#coalescedSnapshotEventIds.delete(bindingId);
   }
 
   async #publishCatalogue(snapshot: CatalogueSnapshot): Promise<void> {
@@ -1437,30 +2028,33 @@ export class AdapterRuntime {
           managed?.prepared.editorClientToolsAvailable ?? true,
       };
     });
-    const sessions = snapshot.endpoints.flatMap((entry) => {
+    const sessionsByUri = new Map<string, BridgeCatalogueSession>();
+    for (const entry of snapshot.endpoints) {
+      if (entry.connection !== "connected") {
+        continue;
+      }
       const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
-      return entry.sessions
-        .filter(
-          (session) => !this.#removedSessionUris.has(session.resource),
-        )
-        .map((session) =>
-          managed
-            ? toBridgeSession(managed.prepared, managed.target, session)
-            : {
-                endpoint_id: entry.endpoint.id,
-                host_instance_id: entry.endpoint.instanceId,
-                session_uri: session.resource,
-                provider: session.provider,
-                title: session.title,
-                status: session.status,
-                workspace_uris: session.workingDirectories ?? [],
-                created_at: session.createdAt,
-                modified_at: session.modifiedAt,
-                host_label: "local",
-                editor_client_tools_available: true,
-              },
-        );
-    });
+      for (const session of entry.sessions) {
+        if (this.#removedSessionUris.has(session.resource)) {
+          continue;
+        }
+        const candidate = managed
+          ? toBridgeSession(managed.prepared, managed.target, session)
+          : toEditorBridgeSession(entry, session);
+        const current = sessionsByUri.get(session.resource);
+        const preferredEndpoint =
+          this.#preferredEndpointForSession(session.resource);
+        if (
+          !current ||
+          candidate.endpoint_id === preferredEndpoint ||
+          (current.endpoint_id !== preferredEndpoint &&
+            candidate.endpoint_id.localeCompare(current.endpoint_id) < 0)
+        ) {
+          sessionsByUri.set(session.resource, candidate);
+        }
+      }
+    }
+    const sessions = [...sessionsByUri.values()];
     const pendingRemovals = [...this.#removedSessionUris.keys()];
     await this.#catalogueQueue.run(async () => {
       await this.#bridge.call({
@@ -1476,6 +2070,17 @@ export class AdapterRuntime {
         this.#removedSessionUris.delete(sessionUri);
       }
     });
+  }
+
+  #preferredEndpointForSession(sessionUri: string): string | undefined {
+    return (
+      [...this.#bindings.values(), ...this.#pendingBindings.values()].find(
+        (binding) => binding.sessionUri === sessionUri,
+      )?.endpointId ??
+      [...this.#restoreBindings.values()].find(
+        (binding) => binding.session_uri === sessionUri,
+      )?.endpoint_id
+    );
   }
 
   #managedEntryByEndpointId(endpointId: string): ManagedEntryState | undefined {
@@ -1516,6 +2121,23 @@ export class AdapterRuntime {
     }
     throw lastError ?? new Error("Adapter stopped before command acknowledgement");
   }
+}
+
+function snapshotCoalescingKey(event: PublishedEvent): string | undefined {
+  if (event.kind === "session_snapshot") {
+    return `${event.kind}\0${event.session_uri}`;
+  }
+  if (event.kind === "chat_snapshot") {
+    return `${event.kind}\0${event.session_uri}\0${event.chat_uri ?? ""}`;
+  }
+  return undefined;
+}
+
+function provisionalBindingKey(
+  endpointId: string,
+  sessionUri: string,
+): string {
+  return `${endpointId}\0${sessionUri}`;
 }
 
 function parseRegisterResult(value: unknown): RegisterResult {
@@ -1656,7 +2278,7 @@ function toBridgeSession(
     readonly createdAt: string;
     readonly modifiedAt: string;
   },
-): Record<string, unknown> {
+): BridgeCatalogueSession {
   const workingDirectories = session.workingDirectories ?? [];
   const matchesTarget = workingDirectories.some((workspaceUri) =>
     managedTargetMatchesWorkspaceUri(target, workspaceUri),
@@ -1689,6 +2311,25 @@ function toBridgeSession(
           }
         : {}),
     editor_client_tools_available: prepared.editorClientToolsAvailable,
+  };
+}
+
+function toEditorBridgeSession(
+  entry: CatalogueSnapshot["endpoints"][number],
+  session: SessionSummary,
+): BridgeCatalogueSession {
+  return {
+    endpoint_id: entry.endpoint.id,
+    host_instance_id: entry.endpoint.instanceId,
+    session_uri: session.resource,
+    provider: session.provider,
+    title: session.title,
+    status: session.status,
+    workspace_uris: session.workingDirectories ?? [],
+    created_at: session.createdAt,
+    modified_at: session.modifiedAt,
+    host_label: "local",
+    editor_client_tools_available: true,
   };
 }
 

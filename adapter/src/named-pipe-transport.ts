@@ -11,7 +11,7 @@ import type {
 } from "./endpoint-registry.js";
 
 const OPEN_TIMEOUT_MS = 10_000;
-const MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
 
 export async function openNamedPipeTransport(
   pipePath: string,

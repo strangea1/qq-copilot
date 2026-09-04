@@ -292,6 +292,7 @@ async fn run(config_path: &Path) -> Result<()> {
         .try_lock_exclusive()
         .context("another QQ Bridge daemon is already using this configuration")?;
     let database = Database::open(&config.bridge.database_path)?;
+    database.recover_interrupted_state()?;
     database.purge_expired(config.bridge.audit_retention_days)?;
 
     let qq_client = Arc::new(QqClient::new(config.qq.clone(), config.app_secret()?)?);

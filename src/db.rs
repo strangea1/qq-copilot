@@ -322,54 +322,75 @@ impl Database {
             )
             .context("failed to initialize database schema")?;
         crate::ahp_store::initialize_schema(&connection)?;
-        connection
-            .execute(
-                "UPDATE deliveries SET status = 'in_doubt', error_code = 'daemon_restarted',
-                     updated_at = ?1
-                 WHERE status = 'pending'",
-                [now()],
-            )
-            .context("failed to recover interrupted deliveries")?;
-        connection
-            .execute(
-                "UPDATE approvals SET state = 'denied', updated_at = ?1
-                 WHERE state = 'pending'",
-                [now()],
-            )
-            .context("failed to deny approvals interrupted by daemon restart")?;
-        connection
-            .execute(
-                "UPDATE approvals SET state = 'unknown_failure', updated_at = ?1
-                 WHERE state = 'allowed'",
-                [now()],
-            )
-            .context("failed to close interrupted approved tools")?;
-        connection
-            .execute(
-                "UPDATE questions SET state = 'cancelled', answer = NULL, updated_at = ?1
-                 WHERE state = 'pending'",
-                [now()],
-            )
-            .context("failed to cancel interrupted questions")?;
-        connection
-            .execute(
-                "UPDATE inbound_messages
-                 SET kind = 'discarded', content = NULL, consumed_at = ?1
-                 WHERE kind = 'queued' AND consumed_at IS NULL",
-                [now()],
-            )
-            .context("failed to discard interrupted remote message queue")?;
-        connection
-            .execute(
-                "UPDATE agent_sessions SET state = 'lost', updated_at = ?1
-                 WHERE state IN ('active', 'waiting')",
-                [now()],
-            )
-            .context("failed to mark interrupted Agent sessions lost")?;
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    pub fn recover_interrupted_state(&self) -> Result<()> {
+        let now = now();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction
+            .execute(
+                "UPDATE deliveries SET status = 'in_doubt', error_code = 'daemon_restarted',
+                     updated_at = ?1
+                 WHERE status = 'pending'",
+                [now],
+            )
+            .context("failed to recover interrupted deliveries")?;
+        transaction
+            .execute(
+                "UPDATE ahp_projections
+                 SET attempts = attempts + 1, last_error = 'daemon_restarted', updated_at = ?1
+                 WHERE state = 'pending' AND last_error IS NULL AND replay_key IS NULL
+                   AND NOT EXISTS (
+                        SELECT 1 FROM deliveries
+                        WHERE idempotency_key =
+                                  'ahp-event-projection:' || ahp_projections.event_id
+                   )",
+                [now],
+            )
+            .context("failed to recover orphaned AHP projections")?;
+        transaction
+            .execute(
+                "UPDATE approvals SET state = 'denied', updated_at = ?1
+                 WHERE state = 'pending'",
+                [now],
+            )
+            .context("failed to deny approvals interrupted by daemon restart")?;
+        transaction
+            .execute(
+                "UPDATE approvals SET state = 'unknown_failure', updated_at = ?1
+                 WHERE state = 'allowed'",
+                [now],
+            )
+            .context("failed to close interrupted approved tools")?;
+        transaction
+            .execute(
+                "UPDATE questions SET state = 'cancelled', answer = NULL, updated_at = ?1
+                 WHERE state = 'pending'",
+                [now],
+            )
+            .context("failed to cancel interrupted questions")?;
+        transaction
+            .execute(
+                "UPDATE inbound_messages
+                 SET kind = 'discarded', content = NULL, consumed_at = ?1
+                 WHERE kind = 'queued' AND consumed_at IS NULL",
+                [now],
+            )
+            .context("failed to discard interrupted remote message queue")?;
+        transaction
+            .execute(
+                "UPDATE agent_sessions SET state = 'lost', updated_at = ?1
+                 WHERE state IN ('active', 'waiting')",
+                [now],
+            )
+            .context("failed to mark interrupted Agent sessions lost")?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn owner(&self) -> Result<Option<Owner>> {
@@ -1446,12 +1467,32 @@ impl Database {
             [now],
         )?;
         connection.execute(
-            "DELETE FROM sent_message_events WHERE sent_at < ?1",
+            "DELETE FROM sent_message_events
+             WHERE sent_at < ?1
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM deliveries d
+                    JOIN ahp_projections p
+                      ON p.state = 'pending'
+                     AND (
+                          d.idempotency_key =
+                              'ahp-event-projection:' || p.event_id
+                          OR d.idempotency_key = p.replay_key
+                     )
+                    WHERE d.delivery_id = sent_message_events.delivery_id
+               )",
             [audit_cutoff],
         )?;
         connection.execute(
             "DELETE FROM deliveries
-             WHERE status != 'pending' AND updated_at < ?1",
+             WHERE status != 'pending' AND updated_at < ?1
+               AND idempotency_key NOT IN (
+                    SELECT 'ahp-event-projection:' || event_id
+                    FROM ahp_projections WHERE state = 'pending'
+                    UNION
+                    SELECT replay_key FROM ahp_projections
+                    WHERE state = 'pending' AND replay_key IS NOT NULL
+               )",
             [audit_cutoff],
         )?;
         connection.execute(
@@ -1775,6 +1816,289 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = Database::open(&directory.path().join("test.sqlite3")).expect("database");
         (directory, database)
+    }
+
+    #[test]
+    fn daemon_recovery_makes_interrupted_projection_replayable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("test.sqlite3");
+        let event_id = sha256_hex(b"interrupted-projection");
+        let orphan_event_id = sha256_hex(b"orphaned-projection");
+        let direct_delivery_key = format!("ahp-event-projection:{event_id}");
+        {
+            let database = Database::open(&path).expect("database");
+            database
+                .connection()
+                .expect("connection")
+                .execute(
+                    "INSERT INTO ahp_events(
+                        event_id, host_instance_id, binding_id, binding_generation,
+                        session_uri, kind, occurred_at, data_redacted_json, created_at
+                     ) VALUES (?1, 'host-1', 'binding-1', 1, 'copilot:/session-1',
+                               'assistant_message', '2026-09-04T00:00:00Z', '{}', ?2)",
+                    params![event_id, now()],
+                )
+                .expect("event");
+            database
+                .connection()
+                .expect("connection")
+                .execute(
+                    "INSERT INTO ahp_events(
+                        event_id, host_instance_id, binding_id, binding_generation,
+                        session_uri, kind, occurred_at, data_redacted_json, created_at
+                     ) VALUES (?1, 'host-1', 'binding-1', 1, 'copilot:/session-1',
+                               'assistant_message', '2026-09-04T00:00:00Z', '{}', ?2)",
+                    params![orphan_event_id, now()],
+                )
+                .expect("orphan event");
+            database
+                .ahp_queue_projection(&event_id, "ahp_assistant_message", "missed")
+                .expect("projection");
+            database
+                .ahp_queue_projection(&orphan_event_id, "ahp_assistant_message", "orphaned")
+                .expect("orphan projection");
+            database
+                .connection()
+                .expect("connection")
+                .execute(
+                    "UPDATE ahp_projections SET created_at = ?1 WHERE event_id = ?2",
+                    params![now() - 120, orphan_event_id],
+                )
+                .expect("age orphan projection");
+            database
+                .begin_delivery(NewDelivery {
+                    delivery_id: Uuid::new_v4(),
+                    idempotency_key: direct_delivery_key.clone(),
+                    kind: "ahp_assistant_message".to_owned(),
+                    session_id: None,
+                })
+                .expect("direct delivery");
+            assert!(
+                database
+                    .ahp_pending_projections(10)
+                    .expect("pending projections")
+                    .is_empty()
+            );
+        }
+
+        let recovered = Database::open(&path).expect("recovered database");
+        assert_eq!(
+            recovered
+                .delivery_by_idempotency_key(&direct_delivery_key)
+                .expect("delivery")
+                .expect("direct delivery")
+                .status,
+            "pending"
+        );
+        assert!(
+            recovered
+                .ahp_pending_projections(10)
+                .expect("pending projections")
+                .is_empty()
+        );
+        recovered
+            .recover_interrupted_state()
+            .expect("daemon recovery");
+        assert_eq!(
+            recovered
+                .delivery_by_idempotency_key(&direct_delivery_key)
+                .expect("delivery")
+                .expect("direct delivery")
+                .status,
+            "in_doubt"
+        );
+        let pending = recovered
+            .ahp_pending_projections(10)
+            .expect("recovered projections");
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .any(|projection| projection.event_id == event_id)
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|projection| projection.event_id == orphan_event_id)
+        );
+    }
+
+    #[test]
+    fn purge_retains_deliveries_referenced_by_pending_projections() {
+        let (_directory, database) = database();
+        let direct_event_id = sha256_hex(b"pending-direct-delivery");
+        let replay_event_id = sha256_hex(b"pending-replay-delivery");
+        for event_id in [&direct_event_id, &replay_event_id] {
+            database
+                .connection()
+                .expect("connection")
+                .execute(
+                    "INSERT INTO ahp_events(
+                        event_id, host_instance_id, binding_id, binding_generation,
+                        session_uri, kind, occurred_at, data_redacted_json, created_at
+                     ) VALUES (?1, 'host-1', 'binding-1', 1, 'copilot:/session-1',
+                               'assistant_message', '2026-09-04T00:00:00Z', '{}', ?2)",
+                    params![event_id, now()],
+                )
+                .expect("event");
+            database
+                .ahp_queue_projection(event_id, "ahp_assistant_message", "missed")
+                .expect("projection");
+        }
+
+        let direct_key = format!("ahp-event-projection:{direct_event_id}");
+        let replay_key = "ahp-offline-replay:retention";
+        database
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE ahp_projections SET replay_key = ?1 WHERE event_id = ?2",
+                params![replay_key, replay_event_id],
+            )
+            .expect("claim replay");
+        for (key, status) in [(direct_key.as_str(), "sent"), (replay_key, "in_doubt")] {
+            let delivery = database
+                .begin_delivery(NewDelivery {
+                    delivery_id: Uuid::new_v4(),
+                    idempotency_key: key.to_owned(),
+                    kind: "ahp_offline_replay".to_owned(),
+                    session_id: None,
+                })
+                .expect("begin delivery");
+            if key == replay_key {
+                database
+                    .record_sent_message(delivery.record.delivery_id, 1)
+                    .expect("record replay send evidence");
+            }
+            database
+                .finish_delivery(delivery.record.delivery_id, status, None, None)
+                .expect("finish delivery");
+        }
+        database
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE deliveries SET updated_at = ?1
+                 WHERE idempotency_key IN (?2, ?3)",
+                params![now() - 172_800, direct_key, replay_key],
+            )
+            .expect("age deliveries");
+        database
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE sent_message_events SET sent_at = ?1",
+                [now() - 172_800],
+            )
+            .expect("age sent evidence");
+
+        database.purge_expired(1).expect("purge pending references");
+        assert!(
+            database
+                .delivery_by_idempotency_key(&direct_key)
+                .expect("direct delivery")
+                .is_some()
+        );
+        let replay_evidence: i64 = database
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sent_message_events s
+                 JOIN deliveries d ON d.delivery_id = s.delivery_id
+                 WHERE d.idempotency_key = ?1",
+                [replay_key],
+                |row| row.get(0),
+            )
+            .expect("replay evidence");
+        assert_eq!(replay_evidence, 1);
+        assert!(
+            database
+                .delivery_by_idempotency_key(replay_key)
+                .expect("replay delivery")
+                .is_some()
+        );
+
+        database
+            .ahp_mark_projections_delivered(&[direct_event_id.clone(), replay_event_id.clone()])
+            .expect("complete projections");
+        database
+            .purge_expired(1)
+            .expect("purge terminal references");
+        assert!(
+            database
+                .delivery_by_idempotency_key(&direct_key)
+                .expect("direct delivery")
+                .is_none()
+        );
+        assert!(
+            database
+                .delivery_by_idempotency_key(replay_key)
+                .expect("replay delivery")
+                .is_none()
+        );
+        let replay_evidence: i64 = database
+            .connection()
+            .expect("connection")
+            .query_row("SELECT COUNT(*) FROM sent_message_events", [], |row| {
+                row.get(0)
+            })
+            .expect("purged replay evidence");
+        assert_eq!(replay_evidence, 0);
+    }
+
+    #[test]
+    fn projection_with_recorded_direct_chunk_is_not_replayed() {
+        let (_directory, database) = database();
+        let event_id = sha256_hex(b"partially-sent-direct-projection");
+        database
+            .connection()
+            .expect("connection")
+            .execute(
+                "INSERT INTO ahp_events(
+                    event_id, host_instance_id, binding_id, binding_generation,
+                    session_uri, kind, occurred_at, data_redacted_json, created_at
+                 ) VALUES (?1, 'host-1', 'binding-1', 1, 'copilot:/session-1',
+                           'assistant_message', '2026-09-04T00:00:00Z', '{}', ?2)",
+                params![event_id, now()],
+            )
+            .expect("event");
+        database
+            .ahp_queue_projection(&event_id, "ahp_assistant_message", "missed")
+            .expect("projection");
+        database
+            .ahp_projection_failed(&event_id, "qq_delivery_failed")
+            .expect("projection failure");
+        let delivery = database
+            .begin_delivery(NewDelivery {
+                delivery_id: Uuid::new_v4(),
+                idempotency_key: format!("ahp-event-projection:{event_id}"),
+                kind: "ahp_assistant_message".to_owned(),
+                session_id: None,
+            })
+            .expect("begin direct delivery");
+        database
+            .record_sent_message(delivery.record.delivery_id, 1)
+            .expect("record sent chunk");
+        database
+            .finish_delivery(
+                delivery.record.delivery_id,
+                "in_doubt",
+                Some("message-1"),
+                Some("qq_delivery_error"),
+            )
+            .expect("finish uncertain delivery");
+
+        assert!(
+            database
+                .ahp_pending_projections(10)
+                .expect("pending projections")
+                .is_empty()
+        );
+        assert_eq!(
+            database.ahp_status(60).expect("status").pending_projections,
+            0
+        );
     }
 
     #[test]

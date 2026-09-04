@@ -63,7 +63,7 @@ export interface NormalizerBinding {
 
 interface OpenAssistantPart {
   readonly partId: string;
-  readonly content: string;
+  readonly chunks: string[];
 }
 
 export class AhpEventNormalizer {
@@ -92,6 +92,8 @@ export class AhpEventNormalizer {
   #initialChatSnapshot = true;
 
   #activeTurnId: string | undefined;
+
+  #redundantChatSnapshotSequence: number | undefined;
 
   constructor(binding: NormalizerBinding) {
     this.#binding = binding;
@@ -125,6 +127,11 @@ export class AhpEventNormalizer {
     ) {
       return [];
     }
+    if (this.#redundantChatSnapshotSequence === event.serverSeq) {
+      this.#redundantChatSnapshotSequence = undefined;
+      return [];
+    }
+    this.#redundantChatSnapshotSequence = undefined;
     const historical = this.#initialChatSnapshot;
     const events: PublishedEvent[] = [
       this.#event(
@@ -239,10 +246,8 @@ export class AhpEventNormalizer {
             assistantPartKey(action.turnId, action.partId),
           )
         ) {
-          this.#openAssistantParts.set(action.turnId, {
-            partId: action.partId,
-            content: openPart.content + action.content,
-          });
+          openPart.chunks.push(action.content);
+          this.#redundantChatSnapshotSequence = sequence;
         }
         return [];
       }
@@ -261,7 +266,7 @@ export class AhpEventNormalizer {
         ) {
           this.#openAssistantParts.set(action.turnId, {
             partId: action.part.id,
-            content: action.part.content,
+            chunks: [action.part.content],
           });
         }
         return events;
@@ -614,7 +619,7 @@ export class AhpEventNormalizer {
       }
       this.#openAssistantParts.set(turn.id, {
         partId: part.id,
-        content: part.content,
+        chunks: [part.content],
       });
     }
     return events;
@@ -634,7 +639,7 @@ export class AhpEventNormalizer {
     return this.#assistantPartEvent(
       turnId,
       part.partId,
-      part.content,
+      part.chunks.join(""),
       sequence,
       chatUri,
       finalResponse,

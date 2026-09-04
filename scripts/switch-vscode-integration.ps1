@@ -37,12 +37,32 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 if ($CheckIdleOnly -and -not $RequireIdle) {
     throw "-CheckIdleOnly requires -RequireIdle."
 }
-if ($RequireIdle) {
-    $StatusOutput = & $Bridge --config $ConfigPath status
-    if ($LASTEXITCODE -ne 0) {
-        throw "The Bridge must be running so its idle state can be verified before restart."
+
+function Get-BridgeStatus {
+    param(
+        [switch]$RequireRunning
+    )
+
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $StatusOutput = & $Bridge --config $ConfigPath status 2>$null
+        $StatusExitCode = $LASTEXITCODE
     }
-    $Status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    if ($StatusExitCode -ne 0) {
+        if ($RequireRunning) {
+            throw "The Bridge must be running so its idle state can be verified before restart."
+        }
+        return $null
+    }
+    return ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
+}
+
+if ($RequireIdle) {
+    $Status = Get-BridgeStatus -RequireRunning
     $Bindings = @()
     if ($Status.ahp.bindings) {
         $Bindings = @($Status.ahp.bindings)
@@ -74,9 +94,8 @@ if ($CheckIdleOnly) {
     return
 }
 
-$StatusOutput = & $Bridge --config $ConfigPath status 2>$null
-if ($LASTEXITCODE -eq 0) {
-    $Status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
+$Status = Get-BridgeStatus
+if ($null -ne $Status) {
     if ($Status.ahp) {
         $Bindings = @()
         if ($Status.ahp.bindings) {
@@ -191,14 +210,16 @@ if ($LASTEXITCODE -ne 0) {
     $Utf8NoBom
 )
 
-$ManagedExecutables = @(
-    (Join-Path $InstallDirectory "qq-bridge.exe"),
-    (Join-Path $InstallDirectory "qq-mcp.exe")
-)
+$ManagedBridge = Join-Path $InstallDirectory "qq-bridge.exe"
+$ManagedMcp = Join-Path $InstallDirectory "qq-mcp.exe"
 $ManagedProcesses = @(
     Get-CimInstance Win32_Process |
         Where-Object {
-            $_.ExecutablePath -in $ManagedExecutables -or
+            (
+                $_.ExecutablePath -eq $ManagedBridge -and
+                $_.CommandLine -match "\srun\s*$"
+            ) -or
+            $_.ExecutablePath -eq $ManagedMcp -or
             (
                 $_.Name -eq "node.exe" -and
                 $_.CommandLine -match "CopilotQQBridge[\\/]ahp-adapter[\\/]dist[\\/]main\.js"
@@ -206,7 +227,7 @@ $ManagedProcesses = @(
         }
 )
 foreach ($Process in $ManagedProcesses) {
-    Stop-Process -Id $Process.ProcessId
+    Stop-Process -Id $Process.ProcessId -ErrorAction SilentlyContinue
     Wait-Process -Id $Process.ProcessId -Timeout 15 -ErrorAction SilentlyContinue
 }
 
@@ -224,8 +245,8 @@ do {
     if ($StartedBridge.HasExited) {
         break
     }
-    & $Bridge --config $ConfigPath status 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    $Status = Get-BridgeStatus
+    if ($null -ne $Status) {
         $BridgeReady = $true
         break
     }

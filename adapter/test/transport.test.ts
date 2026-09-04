@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import test from "node:test";
 
 import { WebSocketServer } from "ws";
@@ -12,6 +13,44 @@ test("endpoint transport connects to tcp and websocket endpoints with the token 
   server.on("connection", (_socket, request) => {
     queries.push(request.url ?? "");
   });
+
+  test(
+    "named-pipe transport accepts large bounded Session snapshots",
+    { skip: process.platform !== "win32" },
+    async () => {
+      const pipePath = `\\\\.\\pipe\\qq-copilot-payload-${process.pid}-${Date.now()}`;
+      const server = createServer();
+      const websocketServer = new WebSocketServer({ server });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(pipePath, resolve);
+      });
+
+      const connected = once(websocketServer, "connection");
+      const transport = await openEndpointTransport(
+        { type: "socket", path: pipePath },
+        "large-payload-secret",
+      );
+      const [socket] = await connected;
+      socket.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "snapshot",
+          params: { content: "x".repeat(10 * 1024 * 1024) },
+        }),
+      );
+      const frame = await transport.recv();
+      assert.notEqual(frame, null);
+
+      await Promise.resolve(transport.close());
+      await new Promise<void>((resolve, reject) => {
+        websocketServer.close((error) => (error ? reject(error) : resolve()));
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    },
+  );
   await once(server, "listening");
   const address = server.address();
   assert.ok(address && typeof address !== "string");

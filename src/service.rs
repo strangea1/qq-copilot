@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     ahp_store::{
-        AhpApprovalRecord, AhpInputRecord, AhpStatus, MAX_TRACKED_AHP_SESSIONS, NewAhpApproval,
-        NewAhpInput,
+        AhpApprovalRecord, AhpInputRecord, AhpProjectionRecord, AhpStatus,
+        MAX_TRACKED_AHP_SESSIONS, NewAhpApproval, NewAhpInput,
     },
     config::{AhpAuthorizedTarget, AhpToolNotificationMode, AppConfig},
     db::{
@@ -43,8 +43,8 @@ use crate::{
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_WAIT_FOR_MESSAGE_SECONDS: u64 = 300;
 const INBOUND_MESSAGE_TTL_SECONDS: u64 = 1800;
-const AHP_CREATION_COMMAND_TIMEOUT_SECONDS: u64 = 300;
-const AHP_ACTIVE_CREATION_TTL_SECONDS: u64 = 600;
+const AHP_MANAGED_COMMAND_TIMEOUT_SECONDS: u64 = 960;
+const AHP_ACTIVE_CREATION_TTL_SECONDS: u64 = 1800;
 
 #[derive(Clone, Copy)]
 enum InboundMessage<'a> {
@@ -59,6 +59,7 @@ pub struct BridgeService {
     qq: Arc<dyn QqMessenger>,
     tool_notification_mode: Arc<RwLock<AhpToolNotificationMode>>,
     final_delivery_lock: Mutex<()>,
+    offline_replay_lock: Arc<Mutex<()>>,
     typing_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     foreground_switch_intent: Arc<StdMutex<u64>>,
 }
@@ -146,6 +147,12 @@ struct CreationWizardContext {
     prepare: AhpPrepareTargetResult,
 }
 
+struct OfflineReplayBatch {
+    delivery_key: String,
+    content: String,
+    event_ids: Vec<String>,
+}
+
 impl BridgeService {
     pub fn new(
         config: Arc<AppConfig>,
@@ -161,6 +168,7 @@ impl BridgeService {
             qq,
             tool_notification_mode: Arc::new(RwLock::new(tool_notification_mode)),
             final_delivery_lock: Mutex::new(()),
+            offline_replay_lock: Arc::new(Mutex::new(())),
             typing_tasks: Mutex::new(HashMap::new()),
             foreground_switch_intent: Arc::new(StdMutex::new(0)),
         }
@@ -178,6 +186,7 @@ impl BridgeService {
             qq: self.qq.clone(),
             tool_notification_mode: self.tool_notification_mode.clone(),
             final_delivery_lock: Mutex::new(()),
+            offline_replay_lock: self.offline_replay_lock.clone(),
             typing_tasks: Mutex::new(HashMap::new()),
             foreground_switch_intent: self.foreground_switch_intent.clone(),
         }
@@ -714,21 +723,6 @@ impl BridgeService {
                     .await?
             }
         };
-        let (replay, replay_event_ids) = if self.config.ahp.enabled {
-            self.pending_ahp_replay(
-                response
-                    .as_ref()
-                    .map_or(0, |response| response.chars().count()),
-            )
-        } else {
-            (None, Vec::new())
-        };
-        let response = match (response, replay) {
-            (Some(response), Some(replay)) => Some(format!("{response}\n\n{replay}")),
-            (Some(response), None) => Some(response),
-            (None, Some(replay)) => Some(replay),
-            (None, None) => None,
-        };
         if let Some(response) = response {
             self.send_if_owner(
                 "command_reply",
@@ -738,8 +732,9 @@ impl BridgeService {
                 Some(message_id),
             )
             .await?;
-            self.database
-                .ahp_mark_projections_delivered(&replay_event_ids)?;
+        }
+        if self.config.ahp.enabled {
+            self.replay_pending_ahp_projections().await?;
         }
         Ok(())
     }
@@ -2170,11 +2165,14 @@ impl BridgeService {
         wizard_id: &str,
         target: AhpManagedTarget,
     ) -> Result<()> {
-        let wizard = self
+        let mut wizard = self
             .database
             .ahp_creation_wizard()?
             .filter(|wizard| wizard.wizard_id == wizard_id && wizard.state == "select_target")
             .context("AHP creation wizard is no longer waiting for a target")?;
+        wizard.updated_at = Utc::now().timestamp();
+        wizard.expires_at = wizard.updated_at + i64::try_from(AHP_ACTIVE_CREATION_TTL_SECONDS)?;
+        self.database.ahp_save_creation_wizard(&wizard)?;
         let command = AhpPrepareTargetCommand {
             target: target.clone(),
             advanced: wizard.mode == "advanced",
@@ -2186,7 +2184,12 @@ impl BridgeService {
             &serde_json::to_value(&command)?,
         )?;
         let status = self
-            .wait_for_ahp_command_terminal(wizard_id, command_id, Duration::from_secs(60), false)
+            .wait_for_ahp_command_terminal(
+                wizard_id,
+                command_id,
+                Duration::from_secs(AHP_MANAGED_COMMAND_TIMEOUT_SECONDS),
+                false,
+            )
             .await?;
         if self.creation_cancel_requested(wizard_id)? {
             self.database.ahp_clear_creation_wizard()?;
@@ -2201,6 +2204,10 @@ impl BridgeService {
                 }
                 error if error.starts_with("unsupported-required-config-") => {
                     "该目标仍要求额外的 Host 字段，当前移动端不支持，请回到 PC 创建。".to_owned()
+                }
+                "incompatible-standalone-protocol" | "incompatible-protocol" => {
+                    "Standalone Host 的注册表版本与实际 AHP wire 协议不兼容，请更新 QQ-AHP Adapter 或 VS Code。"
+                        .to_owned()
                 }
                 error => format!("目标准备失败：{error}。请稍后重试或在电脑端创建。"),
             };
@@ -2372,7 +2379,7 @@ impl BridgeService {
         action_kind: &str,
         payload: &Value,
     ) -> Result<()> {
-        let Some((wizard, mut context)) = self.current_creation_context()? else {
+        let Some((mut wizard, mut context)) = self.current_creation_context()? else {
             return Ok(());
         };
         if wizard.wizard_id != wizard_id {
@@ -2426,6 +2433,9 @@ impl BridgeService {
             current_config.insert(field.property.clone(), field.selected.clone());
         }
         current_config.insert(selected_property, selected);
+        wizard.updated_at = Utc::now().timestamp();
+        wizard.expires_at = wizard.updated_at + i64::try_from(AHP_ACTIVE_CREATION_TTL_SECONDS)?;
+        self.database.ahp_save_creation_wizard(&wizard)?;
         let command = AhpPrepareTargetCommand {
             target: context.target.clone(),
             advanced: true,
@@ -2437,7 +2447,12 @@ impl BridgeService {
             &serde_json::to_value(&command)?,
         )?;
         let status = self
-            .wait_for_ahp_command_terminal(wizard_id, command_id, Duration::from_secs(60), false)
+            .wait_for_ahp_command_terminal(
+                wizard_id,
+                command_id,
+                Duration::from_secs(AHP_MANAGED_COMMAND_TIMEOUT_SECONDS),
+                false,
+            )
             .await?;
         if status.state != "acked" {
             bail!(
@@ -2558,7 +2573,7 @@ impl BridgeService {
         let command = AhpCreateSessionCommand {
             target: context.target.clone(),
             provider: context.prepare.provider.clone(),
-            session_uri: format!("{}:/{}", context.prepare.provider, Uuid::new_v4()),
+            session_uri: format!("ahp-session:/{}", Uuid::new_v4()),
             workspace_uri: context.prepare.workspace_uri.clone(),
             resolved_values: context.prepare.resolved_values.clone(),
             overrides: creation_overrides(&context),
@@ -2624,7 +2639,7 @@ impl BridgeService {
             .wait_for_ahp_command_terminal(
                 &wizard.wizard_id,
                 create_command_id,
-                Duration::from_secs(AHP_CREATION_COMMAND_TIMEOUT_SECONDS),
+                Duration::from_secs(AHP_MANAGED_COMMAND_TIMEOUT_SECONDS),
                 true,
             )
             .await?;
@@ -2987,7 +3002,12 @@ impl BridgeService {
             &serde_json::to_value(&command)?,
         )?;
         let status = self
-            .wait_for_ahp_command_terminal("switch", command_id, Duration::from_secs(60), false)
+            .wait_for_ahp_command_terminal(
+                "switch",
+                command_id,
+                Duration::from_secs(AHP_MANAGED_COMMAND_TIMEOUT_SECONDS),
+                false,
+            )
             .await?;
         if status.state != "acked" {
             bail!(
@@ -3116,7 +3136,7 @@ impl BridgeService {
             .wait_for_ahp_command_terminal(
                 &wizard.wizard_id,
                 command_id,
-                Duration::from_secs(60),
+                Duration::from_secs(AHP_MANAGED_COMMAND_TIMEOUT_SECONDS),
                 false,
             )
             .await?;
@@ -3576,10 +3596,14 @@ impl BridgeService {
     }
 
     async fn try_deliver_ahp_event_projection(&self, event_id: &str, kind: &str, content: &str) {
-        if let Err(error) = self.database.ahp_queue_projection(event_id, kind, content) {
-            tracing::error!(event_id, error = %error, "failed to queue AHP projection");
-            return;
-        }
+        match self.database.ahp_queue_projection(event_id, kind, content) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::error!(event_id, error = %error, "failed to queue AHP projection");
+                return;
+            }
+        };
         match self
             .send_if_owner(
                 kind,
@@ -3611,54 +3635,117 @@ impl BridgeService {
         }
     }
 
-    fn pending_ahp_replay(&self, existing_chars: usize) -> (Option<String>, Vec<String>) {
-        let pending = match self.database.ahp_pending_projections(20) {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::error!(error = %error, "failed to load pending AHP projections");
-                return (None, Vec::new());
-            }
-        };
+    fn claim_pending_ahp_replay(&self) -> Result<Option<OfflineReplayBatch>> {
+        let pending = self.database.ahp_pending_projections(20)?;
         if pending.is_empty() {
-            return (None, Vec::new());
+            return Ok(None);
         }
-        let mut selected = Vec::new();
+        if let Some(replay_key) = pending[0].replay_key.clone() {
+            if pending
+                .iter()
+                .any(|projection| projection.replay_key.as_deref() != Some(&replay_key))
+            {
+                bail!("claimed AHP projection batch has inconsistent replay keys");
+            }
+            let mut content = format_offline_replay_content(&pending);
+            if content.chars().count() > self.config.bridge.message_total_chars {
+                content = truncate_for_qq(&content, self.config.bridge.message_total_chars);
+            }
+            return Ok(Some(OfflineReplayBatch {
+                delivery_key: replay_key,
+                content,
+                event_ids: pending
+                    .into_iter()
+                    .map(|projection| projection.event_id)
+                    .collect(),
+            }));
+        }
+
+        let mut selected: Vec<AhpProjectionRecord> = Vec::new();
         let mut content = String::from("[QQ 离线期间未实时送达]\n");
         for projection in pending {
             let section = format!("\n[{}]\n{}", projection.kind, projection.content.trim());
-            if existing_chars + content.chars().count() + section.chars().count()
+            if content.chars().count() + section.chars().count()
                 > self.config.bridge.message_total_chars
             {
                 break;
             }
             content.push_str(&section);
-            selected.push(projection.event_id);
+            selected.push(projection);
         }
         if selected.is_empty() {
-            let projection = match self.database.ahp_pending_projections(1) {
-                Ok(mut pending) => pending.pop(),
-                Err(_) => None,
-            };
+            let projection = self.database.ahp_pending_projections(1)?.pop();
             let Some(projection) = projection else {
-                return (None, Vec::new());
+                return Ok(None);
             };
-            let available = self
-                .config
-                .bridge
-                .message_total_chars
-                .saturating_sub(existing_chars)
-                .saturating_sub(80);
+            let available = self.config.bridge.message_total_chars.saturating_sub(80);
             if available == 0 {
-                return (None, Vec::new());
+                return Ok(None);
             }
             content = format!(
                 "[QQ 离线期间未实时送达]\n[{}]\n{}",
                 projection.kind,
                 truncate_for_qq(&projection.content, available)
             );
-            selected.push(projection.event_id);
+            selected.push(projection);
         }
-        (Some(content), selected)
+        let delivery_key = offline_replay_delivery_key(&selected);
+        if !self
+            .database
+            .ahp_claim_projection_replay(&selected, &delivery_key)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(OfflineReplayBatch {
+            delivery_key,
+            content,
+            event_ids: selected
+                .into_iter()
+                .map(|projection| projection.event_id)
+                .collect(),
+        }))
+    }
+
+    async fn replay_pending_ahp_projections(&self) -> Result<()> {
+        let _guard = self.offline_replay_lock.lock().await;
+        let Some(batch) = self.claim_pending_ahp_replay()? else {
+            return Ok(());
+        };
+        match self
+            .send_if_owner(
+                "ahp_offline_replay",
+                None,
+                &batch.delivery_key,
+                &batch.content,
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.database
+                    .ahp_mark_projections_delivered(&batch.event_ids)?;
+                Ok(())
+            }
+            Err(error) => {
+                let terminal = self
+                    .database
+                    .delivery_by_idempotency_key(&batch.delivery_key)?
+                    .is_some_and(|delivery| offline_replay_delivery_is_terminal(&delivery.status));
+                if terminal {
+                    self.database
+                        .ahp_mark_projections_delivered(&batch.event_ids)?;
+                    tracing::warn!(
+                        replay_key = %batch.delivery_key,
+                        error = %error,
+                        "offline AHP replay outcome is terminal; refusing to resend"
+                    );
+                    return Ok(());
+                }
+                self.database
+                    .ahp_release_projection_replay(&batch.delivery_key, "offline_replay_failed")?;
+                Err(error)
+            }
+        }
     }
 
     async fn send_ahp_approval_notification(
@@ -4688,6 +4775,34 @@ fn should_notify_tool(mode: AhpToolNotificationMode, status: &str) -> bool {
     }
 }
 
+fn format_offline_replay_content(projections: &[AhpProjectionRecord]) -> String {
+    let mut content = String::from("[QQ 离线期间未实时送达]\n");
+    for projection in projections {
+        content.push_str(&format!(
+            "\n[{}]\n{}",
+            projection.kind,
+            projection.content.trim()
+        ));
+    }
+    content
+}
+
+fn offline_replay_delivery_key(projections: &[AhpProjectionRecord]) -> String {
+    let mut identities: Vec<_> = projections
+        .iter()
+        .map(|projection| format!("{}:{}", projection.event_id, projection.replay_generation))
+        .collect();
+    identities.sort_unstable();
+    format!(
+        "ahp-offline-replay:{}",
+        sha256_hex(identities.join("\0").as_bytes())
+    )
+}
+
+fn offline_replay_delivery_is_terminal(status: &str) -> bool {
+    matches!(status, "pending" | "sent" | "in_doubt")
+}
+
 fn deny(reason: &str) -> PermissionResult {
     PermissionResult {
         decision: PermissionDecision::Deny,
@@ -4897,13 +5012,19 @@ fn escape_qq_markdown(value: &str) -> String {
 }
 
 fn truncate_for_qq(value: &str, maximum: usize) -> String {
-    let mut characters = value.chars();
-    let truncated: String = characters.by_ref().take(maximum).collect();
-    if characters.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
+    if value.chars().count() <= maximum {
+        return value.to_owned();
     }
+    if maximum <= 3 {
+        return ".".repeat(maximum);
+    }
+    format!(
+        "{}...",
+        value
+            .chars()
+            .take(maximum.saturating_sub(3))
+            .collect::<String>()
+    )
 }
 
 fn format_ahp_input(input: &AhpInputRecord, session_label: &str) -> String {
@@ -5312,6 +5433,24 @@ mod tests {
         let chunks = split_message(content, 4);
         assert_eq!(chunks.concat(), content);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 4));
+    }
+
+    #[test]
+    fn qq_truncation_includes_ellipsis_in_the_limit() {
+        assert_eq!(truncate_for_qq("abcdef", 6), "abcdef");
+        assert_eq!(truncate_for_qq("abcdef", 5), "ab...");
+        assert_eq!(truncate_for_qq("abcdef", 3), "...");
+        assert_eq!(truncate_for_qq("abcdef", 2), "..");
+        assert_eq!(truncate_for_qq("abcdef", 0), "");
+        assert!(truncate_for_qq("你好世界", 3).chars().count() <= 3);
+    }
+
+    #[test]
+    fn pending_replay_delivery_is_terminal_for_at_most_once_delivery() {
+        assert!(offline_replay_delivery_is_terminal("pending"));
+        assert!(offline_replay_delivery_is_terminal("sent"));
+        assert!(offline_replay_delivery_is_terminal("in_doubt"));
+        assert!(!offline_replay_delivery_is_terminal("failed"));
     }
 
     #[test]
@@ -6520,6 +6659,279 @@ mod tests {
             .expect("replay delivery");
         assert!(last.content.contains("missed response"));
         assert!(last.content.contains("离线期间未实时送达"));
+        assert_eq!(last.reply_to_message_id, None);
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            0
+        );
+        fixture
+            .service
+            .handle_inbound_message("owner-sync-message-2", "owner-openid", "/status")
+            .await
+            .expect("trigger second owner response");
+        let replay_count = fixture
+            .qq
+            .messages()
+            .await
+            .iter()
+            .filter(|message| message.content.contains("离线期间未实时送达"))
+            .count();
+        assert_eq!(replay_count, 1);
+        let before_duplicate = fixture.qq.messages().await.len();
+        fixture
+            .service
+            .try_deliver_ahp_event_projection(
+                &sha256_hex(b"offline-assistant-event"),
+                "ahp_assistant_message",
+                "missed response",
+            )
+            .await;
+        assert_eq!(fixture.qq.messages().await.len(), before_duplicate);
+    }
+
+    #[tokio::test]
+    async fn concurrent_owner_messages_send_one_offline_replay() {
+        let fixture = Fixture::new_ahp();
+        queue_failed_assistant_projection(
+            &fixture,
+            b"concurrent-offline-event",
+            "concurrent missed response",
+            3,
+        )
+        .await;
+        fixture.qq.set_send_failure(false);
+
+        let first = fixture.service.task_clone();
+        let second = fixture.service.task_clone();
+        let (first_result, second_result) = tokio::join!(
+            first.handle_inbound_message("concurrent-sync-1", "owner-openid", "/status"),
+            second.handle_inbound_message("concurrent-sync-2", "owner-openid", "/status")
+        );
+        first_result.expect("first concurrent response");
+        second_result.expect("second concurrent response");
+
+        let messages = fixture.qq.messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.contains("离线期间未实时送达"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sent_offline_replay_is_not_resent_after_restart_window() {
+        let fixture = Fixture::new_ahp();
+        queue_failed_assistant_projection(
+            &fixture,
+            b"restart-window-offline-event",
+            "restart window missed response",
+            4,
+        )
+        .await;
+        fixture.qq.set_send_failure(false);
+
+        let replay = fixture
+            .service
+            .claim_pending_ahp_replay()
+            .expect("claim replay")
+            .expect("pending replay");
+        fixture
+            .service
+            .send_if_owner(
+                "ahp_offline_replay",
+                None,
+                &replay.delivery_key,
+                &replay.content,
+                None,
+            )
+            .await
+            .expect("simulate replay sent before projection update");
+        queue_failed_assistant_projection(
+            &fixture,
+            b"new-event-after-replay-send",
+            "newer missed response",
+            5,
+        )
+        .await;
+        fixture.qq.set_send_failure(false);
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            2
+        );
+
+        fixture
+            .service
+            .handle_inbound_message("restart-window-sync", "owner-openid", "/status")
+            .await
+            .expect("recover sent replay");
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            1
+        );
+        fixture
+            .service
+            .handle_inbound_message("restart-window-sync-2", "owner-openid", "/status")
+            .await
+            .expect("replay newer batch");
+        let messages = fixture.qq.messages().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.contains("离线期间未实时送达"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.contains("restart window missed response"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_offline_replay_is_not_retried() {
+        let fixture = Fixture::new_ahp();
+        queue_failed_assistant_projection(
+            &fixture,
+            b"uncertain-offline-replay",
+            "uncertain missed response",
+            5,
+        )
+        .await;
+
+        fixture
+            .service
+            .replay_pending_ahp_projections()
+            .await
+            .expect("uncertain replay is terminal");
+        assert_eq!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections,
+            0
+        );
+
+        fixture.qq.set_send_failure(false);
+        fixture
+            .service
+            .handle_inbound_message("uncertain-sync", "owner-openid", "/status")
+            .await
+            .expect("subsequent owner response");
+        assert_eq!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .iter()
+                .filter(|message| message.content.contains("离线期间未实时送达"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn definitively_failed_replay_uses_a_new_generation() {
+        let fixture = Fixture::new_ahp();
+        queue_failed_assistant_projection(
+            &fixture,
+            b"retryable-offline-replay",
+            "retryable missed response",
+            6,
+        )
+        .await;
+        fixture.qq.set_send_failure(false);
+        let first = fixture
+            .service
+            .claim_pending_ahp_replay()
+            .expect("claim first replay")
+            .expect("first replay");
+        let failed = fixture
+            .service
+            .database()
+            .begin_delivery(NewDelivery {
+                delivery_id: Uuid::new_v4(),
+                idempotency_key: first.delivery_key.clone(),
+                kind: "ahp_offline_replay".to_owned(),
+                session_id: None,
+            })
+            .expect("begin failed replay");
+        fixture
+            .service
+            .database()
+            .finish_delivery(
+                failed.record.delivery_id,
+                "failed",
+                None,
+                Some("rate_limited"),
+            )
+            .expect("finish failed replay");
+
+        fixture
+            .service
+            .replay_pending_ahp_projections()
+            .await
+            .expect_err("definitive failure should be retryable");
+        let second = fixture
+            .service
+            .claim_pending_ahp_replay()
+            .expect("claim second replay")
+            .expect("second replay");
+        assert_ne!(first.delivery_key, second.delivery_key);
+        fixture
+            .service
+            .replay_pending_ahp_projections()
+            .await
+            .expect("second generation replay");
+        assert_eq!(
+            fixture
+                .qq
+                .messages()
+                .await
+                .iter()
+                .filter(|message| message.content.contains("离线期间未实时送达"))
+                .count(),
+            1
+        );
         assert_eq!(
             fixture
                 .service
@@ -7522,6 +7934,7 @@ mod tests {
             .and_then(Value::as_str)
             .expect("create session URI")
             .to_owned();
+        assert!(session_uri.starts_with("ahp-session:/"));
         let created_session = AhpSessionDescriptor {
             short_code: None,
             endpoint_id: "endpoint-1".to_owned(),
@@ -7699,6 +8112,51 @@ mod tests {
         other_workspace: Option<PathBuf>,
         service: Arc<BridgeService>,
         qq: Arc<MockQqMessenger>,
+    }
+
+    async fn queue_failed_assistant_projection(
+        fixture: &Fixture,
+        event_seed: &[u8],
+        content: &str,
+        server_sequence: u64,
+    ) {
+        fixture.qq.set_send_failure(true);
+        fixture
+            .service
+            .dispatch(BridgeRequest::AhpPublishEvents {
+                adapter_id: "adapter-stable".to_owned(),
+                adapter_instance_id: "adapter-run-1".to_owned(),
+                binding_id: fixture.ahp_binding_id(),
+                binding_generation: 1,
+                events: vec![AhpPublishedEvent {
+                    event_id: sha256_hex(event_seed),
+                    host_instance_id: "host-1".to_owned(),
+                    server_sequence: Some(server_sequence),
+                    session_uri: "copilot:/session-1".to_owned(),
+                    chat_uri: Some("ahp-chat://default/session-1".to_owned()),
+                    turn_id: Some(format!("turn-{server_sequence}")),
+                    kind: AhpEventKind::AssistantMessage,
+                    origin_client_id: None,
+                    occurred_at: "2026-08-27T00:00:01Z".to_owned(),
+                    data: json!({
+                        "message_id": format!("assistant-{server_sequence}"),
+                        "content": content,
+                        "complete": true,
+                        "historical": false
+                    }),
+                }],
+            })
+            .await
+            .expect("publish offline event");
+        assert!(
+            fixture
+                .service
+                .database()
+                .ahp_status(60)
+                .expect("status")
+                .pending_projections
+                >= 1
+        );
     }
 
     impl Fixture {

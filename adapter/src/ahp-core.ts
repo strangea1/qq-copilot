@@ -526,6 +526,18 @@ export class AhpCore {
     return this.catalogue;
   }
 
+  rememberSession(endpointId: string, summary: SessionSummary): void {
+    const record = this.#records.get(endpointId);
+    if (!record || !record.present || !record.connection || record.connection.closed) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "The managed Agent Host endpoint is not connected",
+      );
+    }
+    record.sessions.set(summary.resource, structuredClone(summary));
+    this.#emitCatalogue();
+  }
+
   async bindSession(
     endpointId: string,
     sessionUri: URI,
@@ -749,7 +761,9 @@ export class AhpCore {
 
   async #connectOnce(record: EndpointRecord): Promise<void> {
     const entry = record.entry;
-    if (!NEGOTIATED_PROTOCOL_VERSIONS.includes(entry.protocolVersion)) {
+    const wireProtocolVersion =
+      entry.wireProtocolVersion ?? entry.protocolVersion;
+    if (!NEGOTIATED_PROTOCOL_VERSIONS.includes(wireProtocolVersion)) {
       record.status = "incompatible";
       record.selectedProtocol = undefined;
       this.#emitConnection(record);
@@ -790,7 +804,7 @@ export class AhpCore {
         initializeParams,
       );
       if (
-        initialized.protocolVersion !== entry.protocolVersion ||
+        initialized.protocolVersion !== wireProtocolVersion ||
         !NEGOTIATED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)
       ) {
         throw new ProtocolGateError(initialized.protocolVersion);
@@ -1656,7 +1670,10 @@ class SessionBinding implements AhpSessionBinding {
           if (result === "applied") {
             this.#updateTurnObservation();
             const state = this.#mirror.chat;
-            if (state) {
+            if (
+              state &&
+              envelope.action.type !== ActionType.ChatDelta
+            ) {
               this.#runtime.emitChat(state, this.#mirror.chatSeq);
             }
           }
@@ -1975,6 +1992,7 @@ function sameRegistryEntry(
     left.pid !== right.pid ||
     left.instanceId !== right.instanceId ||
     left.protocolVersion !== right.protocolVersion ||
+    left.wireProtocolVersion !== right.wireProtocolVersion ||
     left.connectionToken !== right.connectionToken ||
     left.endpoint.type !== right.endpoint.type
   ) {

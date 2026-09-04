@@ -23,8 +23,8 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter
 
 - Windows 10/11，推荐使用非管理员标准用户。
 - VS Code 1.136，或已完成兼容测试的后续版本。
-- Local Standalone/Remote SSH 还要求 `code agent host` 宣告当前 vendored 客户端支持的
-  协议版本；未知版本会 fail-closed。
+- Local Standalone/Remote SSH 还要求 `code agent host` 匹配当前 vendored 客户端已
+  审计的 registry-to-wire 版本组合；未知组合会 fail-closed。
 - GitHub Copilot 已登录。
 - Rust 1.89 或更高版本。
 - Node.js 24.18 或更高版本。
@@ -53,7 +53,19 @@ VS Code 1.136 实际使用的 AHP 类型/reducer revision 是：
 a0bc67f840788f816c9b44bb1325181cb4c4661d
 ```
 
-该版本在 endpoint 和握手中宣告 `0.9.0`。仓库的
+Editor endpoint 在注册表和握手中均使用 `0.9.0`。VS Code 1.136 的
+`code-tunnel agent host` 则在 standalone 注册表中使用 `0.1.0`，但握手服务器明确
+宣告 `0.9.0` 并接受 `^0.9.0`。Adapter 保留原始 advertised 值，只对该已验证组合设置
+`wireProtocolVersion = 0.9.0`，不会向 Host 提供 `0.1.0` wire。
+本地 Host 使用 `agent host --new-instance --foreground`，由 Adapter 持有精确进程生命周期；
+默认 detach/reuse 模式不能用于受管目标。Standalone 同时宣告 `copilotcli` 与 `claude`，
+移动端 Copilot 创建固定选择 `copilotcli`。新 Session 在首条消息前采用 deferred backing，
+可能暂不出现在 `listSessions`，Adapter 会订阅客户端选定的 `ahp-session:/<uuid>` 完成确认，
+并在创建 ACK 前建立 provisional Binding，直到正式 Binding 接管或 ACK 后 90 秒期限到达。同一目标
+的后续操作复用 retained Host，避免替换 instance 使其他 Session 断线；本地 owned Host
+通过精确 instance ID 清理，Remote SSH 只关闭本地 tunnel。
+
+仓库的
 `vendor/ahp-vscode-1.136.patch` 复现 VS Code stable 的 registry overlay，
 并包含生成后的固定 tarball。需要重新生成时运行：
 
@@ -432,7 +444,8 @@ pending projection 数量。
 
 - 检查 `qq_gateway.state`。
 - 检查状态栏的“待补发”数量。
-- Owner 下一次发送 QQ 消息时，Bridge 会把遗漏内容合并进被动回复。
+- Owner 下一次发送 QQ 消息时，Bridge 会单独补发遗漏内容。每个事件批次最多进行一次
+  QQ 投递；成功或结果不确定后即终止补发，后续消息和 Bridge 重启不会重复发送。
 
 ### VS Code 关闭后 QQ 无法继续
 

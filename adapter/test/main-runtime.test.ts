@@ -178,6 +178,11 @@ class FakeCore implements AhpCoreLike {
 
   readonly bindCalls: URI[] = [];
 
+  readonly rememberedSessions: Array<{
+    readonly endpointId: string;
+    readonly summary: SessionSummary;
+  }> = [];
+
   startCount = 0;
 
   stopCount = 0;
@@ -205,6 +210,13 @@ class FakeCore implements AhpCoreLike {
 
   async refreshEndpoints(): Promise<CatalogueSnapshot> {
     return this.catalogue;
+  }
+
+  rememberSession(endpointId: string, session: SessionSummary): void {
+    this.rememberedSessions.push({
+      endpointId,
+      summary: structuredClone(session),
+    });
   }
 
   async bindSession(
@@ -398,6 +410,79 @@ test("runtime serializes catalogue snapshots in observation order", async () => 
   assert.equal(
     secondSession.session_uri,
     "copilot:/second",
+  );
+
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await runTask;
+});
+
+test("runtime publishes each Session from one stable connected endpoint", async () => {
+  const bridge = new FakeBridgeClient({ bindings: [] });
+  let core: FakeCore | undefined;
+  const runtime = new AdapterRuntime(config, {
+    createBridgeClient: () => bridge,
+    createCore: (options) => {
+      core = new FakeCore(options, catalogue([]), []);
+      return core;
+    },
+  });
+  const abort = new AbortController();
+  const runTask = runtime.run(abort.signal);
+  await waitFor(
+    () => bridge.pendingPollCount === 1,
+    "expected command polling",
+  );
+
+  const duplicate = summary("copilot:/shared", "Shared");
+  core?.emitCatalogue({
+    revision: 2,
+    endpoints: [
+      {
+        endpoint: {
+          id: "endpoint-z",
+          pid: 3,
+          instanceId: "host-z",
+          advertisedProtocol: "0.9.0",
+        },
+        connection: "connected",
+        selectedProtocol: "0.9.0",
+        sessions: [duplicate],
+      },
+      {
+        endpoint: {
+          id: "endpoint-0",
+          pid: 1,
+          instanceId: "host-0",
+          advertisedProtocol: "0.9.0",
+        },
+        connection: "disconnected",
+        sessions: [duplicate],
+      },
+      {
+        endpoint: {
+          id: "endpoint-a",
+          pid: 2,
+          instanceId: "host-a",
+          advertisedProtocol: "0.9.0",
+        },
+        connection: "connected",
+        selectedProtocol: "0.9.0",
+        sessions: [duplicate],
+      },
+    ],
+  });
+  await waitFor(
+    () => requestsFor(bridge, "ahp_catalog_replace").length >= 2,
+    "expected duplicate catalogue publication",
+  );
+  const published = requestsFor(bridge, "ahp_catalog_replace").at(-1);
+  assert.ok(published);
+  assert.ok(Array.isArray(published.sessions));
+  assert.equal(published.sessions.length, 1);
+  assert.equal(
+    (published.sessions[0] as Record<string, unknown>).endpoint_id,
+    "endpoint-a",
   );
 
   abort.abort();
@@ -969,7 +1054,7 @@ test("runtime applies a duplicate bind command idempotently during an active tur
   assert.equal(sessionBinding.closeCount, 1);
 });
 
-test("runtime flushes every buffered event before unbinding", async () => {
+test("runtime coalesces buffered snapshots and flushes the latest before unbinding", async () => {
   const record = bindingRecord(
     "binding-1",
     1,
@@ -1015,6 +1100,7 @@ test("runtime flushes every buffered event before unbinding", async () => {
     "expected the first event batch to begin publishing",
   );
   core?.emitChatSnapshot(chatSnapshot(record.session_uri, chatUriOf(record), 11));
+  core?.emitChatSnapshot(chatSnapshot(record.session_uri, chatUriOf(record), 12));
   bridge.resolvePoll({
     commands: [
       {
@@ -1041,6 +1127,12 @@ test("runtime flushes every buffered event before unbinding", async () => {
   );
   assert.equal(sessionBinding.closeCount, 1);
   assert.equal(requestsFor(bridge, "ahp_ack_command")[0]?.outcome, "applied");
+  assert.deepEqual(
+    requestsFor(bridge, "ahp_publish_events").flatMap((request) =>
+      publishedEvents(request).map((event) => event.server_sequence),
+    ),
+    [10, 12],
+  );
 
   abort.abort();
   bridge.resolvePoll({ commands: [] });

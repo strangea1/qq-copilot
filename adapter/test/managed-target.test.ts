@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   connectManagedTarget,
+  defaultManagedProvider,
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
+  standaloneWireProtocolVersion,
 } from "../src/managed-target.js";
 
 test("managed target reports executable spawn failures without crashing", async () => {
@@ -26,6 +28,47 @@ test("managed target reports executable spawn failures without crashing", async 
       },
     ),
     /ENOENT|not found/iu,
+  );
+});
+
+test("standalone registry 0.1.0 is an audited alias for the 0.9.0 wire", () => {
+  assert.equal(standaloneWireProtocolVersion("0.1.0"), "0.9.0");
+  assert.equal(standaloneWireProtocolVersion("0.9.0"), "0.9.0");
+  assert.equal(standaloneWireProtocolVersion("1.0.0"), "1.0.0");
+  assert.equal(standaloneWireProtocolVersion("0.2.0"), undefined);
+});
+
+test("managed targets prefer the standalone Copilot provider", () => {
+  const agent = (provider: string) => ({
+    provider,
+    displayName: provider,
+    description: provider,
+    models: [],
+  });
+  assert.equal(
+    defaultManagedProvider({
+      agents: [agent("claude"), agent("copilotcli")],
+    }),
+    "copilotcli",
+  );
+  assert.equal(
+    defaultManagedProvider({
+      agents: [agent("claude"), agent("copilot")],
+    }),
+    "copilot",
+  );
+  assert.equal(
+    defaultManagedProvider({
+      agents: [agent("custom")],
+    }),
+    "custom",
+  );
+  assert.throws(
+    () =>
+      defaultManagedProvider({
+        agents: [agent("custom-a"), agent("custom-b")],
+      }),
+    /provider-selection-required/u,
   );
 });
 
@@ -102,6 +145,25 @@ test("managed SSH targets match file and VS Code Remote workspace URIs", () => {
       target,
       "vscode-remote://ssh-remote+other/srv/hash%23query%3F/project",
     ),
+    false,
+  );
+});
+
+test("managed local targets match encoded drive-letter file URIs", () => {
+  const target = {
+    kind: "local" as const,
+    path: "C:\\test",
+  };
+  assert.equal(
+    managedTargetMatchesWorkspaceUri(target, "file:///c%3A/test"),
+    true,
+  );
+  assert.equal(
+    managedTargetMatchesWorkspaceUri(target, "file:///C:/test/"),
+    true,
+  );
+  assert.equal(
+    managedTargetMatchesWorkspaceUri(target, "file:///C:/other"),
     false,
   );
 });
