@@ -31,6 +31,16 @@ import type {
 } from "../src/ahp-core.js";
 import type { BridgeRequest } from "../src/bridge-client.js";
 import type { AdapterConfig } from "../src/config.js";
+import {
+  endpointPublicId,
+  type EndpointRegistryEntry,
+} from "../src/endpoint-registry.js";
+import {
+  managedTargetWorkspaceUri,
+  type ConnectedManagedTarget,
+  type ManagedTarget,
+  type PreparedTarget,
+} from "../src/managed-target.js";
 
 interface LoggedRequest extends Record<string, unknown> {
   readonly operation: string;
@@ -168,7 +178,9 @@ class FakeSessionBinding implements AhpSessionBinding {
 }
 
 class FakeCore implements AhpCoreLike {
-  readonly catalogue: CatalogueSnapshot;
+  catalogue: CatalogueSnapshot;
+
+  beforeRefresh: (() => Promise<void>) | undefined;
 
   readonly #callbacks: NonNullable<AhpCoreOptions["callbacks"]>;
 
@@ -209,6 +221,7 @@ class FakeCore implements AhpCoreLike {
   }
 
   async refreshEndpoints(): Promise<CatalogueSnapshot> {
+    await this.beforeRefresh?.();
     return this.catalogue;
   }
 
@@ -1139,6 +1152,569 @@ test("runtime coalesces buffered snapshots and flushes the latest before unbindi
   await runTask;
   assert.equal(sessionBinding.closeCount, 1);
 });
+
+test("runtime discovers SSH catalogues without /new, shares aliases and matches every exact folder", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = sshTarget("remote", "/project-a");
+  const second = sshTarget("remote", "/project-b");
+  const harness = managedHarness([first, second, { kind: "local", path: "C:\\local" }]);
+  const sessions = [
+    workspaceSession("a", "file:///project-a"),
+    workspaceSession("b", "vscode-remote://ssh-remote%2Bremote/project-b"),
+    workspaceSession("outside", "file:///project-a/child"),
+    workspaceSession("wrong-alias", "vscode-remote://ssh-remote+other/project-b"),
+    workspaceSession("missing-workspace"),
+  ];
+  harness.sessions.set("remote", sessions);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => harness.core.catalogue.endpoints.length === 2);
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 2);
+    assert.deepEqual(harness.connectCalls, [first]);
+    assert.deepEqual(
+      latestFullSessions(harness.bridge).map((session) => [
+        session.session_uri, session.target_kind, session.target_path, session.ssh_alias,
+      ]),
+      [
+        ["ahp-session:/a", "ssh", "/project-a", "remote"],
+        ["ahp-session:/b", "ssh", "/project-b", "remote"],
+      ],
+    );
+    assert.deepEqual(harness.core.bindCalls, []);
+    assert.equal(requestsFor(harness.bridge, "ahp_binding_ready").length, 0);
+    assert.deepEqual(harness.clientRequests, []);
+
+    t.mock.timers.tick(120_000);
+    await spinUntil(() => harness.bridge.pendingPollCount === 1);
+    assert.equal(harness.stopped.length, 0, "idle discovery tunnel must be retained");
+    assert.equal(harness.connectCalls.length, 1);
+
+    harness.sessions.set("remote", [...sessions, workspaceSession("pc-created", "file:///project-b")]);
+    await harness.core.refreshEndpoints();
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 3);
+    assert.equal(latestFullSessions(harness.bridge)[2]?.target_path, "/project-b");
+    assert.equal(harness.connectCalls.length, 1, "root updates reuse the Core connection");
+    const catalogues = requestsFor(harness.bridge, "ahp_catalog_replace");
+    assert.ok(catalogues.some((request) => request.full_snapshot === false));
+    const allowed = new Map([
+      ["ahp-session:/a", "/project-a"],
+      ["ahp-session:/b", "/project-b"],
+      ["ahp-session:/pc-created", "/project-b"],
+    ]);
+    for (const request of catalogues) {
+      for (const session of request.sessions as Array<Record<string, unknown>>) {
+        assert.ok(allowed.has(String(session.session_uri)), "non-target Sessions must never be published");
+        assert.equal(session.target_kind, "ssh");
+        assert.equal(session.target_path, allowed.get(String(session.session_uri)));
+        assert.equal(session.ssh_alias, "remote");
+      }
+    }
+    harness.sessions.set("remote", [
+      workspaceSession("a", "file:///project-a/child"),
+      workspaceSession("b", "vscode-remote://ssh-remote+other/project-b"),
+      workspaceSession("pc-created", "file:///project-b"),
+    ]);
+    await harness.core.refreshEndpoints();
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 1);
+    assert.equal(latestFullSessions(harness.bridge)[0]?.session_uri, "ahp-session:/pc-created");
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1);
+  assert.equal(harness.closed.length, 0);
+});
+
+test("slow SSH restore/discovery does not block local bindings, polls, commands or another remote", async () => {
+  const slow = sshTarget("slow", "/slow");
+  const healthy = sshTarget("healthy", "/healthy");
+  const local = bindingRecord("local", 1, "copilot:/local", "ahp-chat://local/default");
+  const slowPrepared = preparedTarget(slow);
+  const remote: BridgeBinding = {
+    ...bindingRecord("remote", 2, "ahp-session:/slow", "ahp-chat://slow/default"),
+    endpoint_id: slowPrepared.endpointId,
+    host_instance_id: slowPrepared.entry.instanceId,
+    target_kind: "ssh", target_path: slow.path, ssh_alias: slow.alias,
+  };
+  const localBinding = new FakeSessionBinding(boundSnapshot(local.session_uri, chatUriOf(local)));
+  let releaseSlow!: () => void;
+  const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+  const harness = managedHarness([slow, healthy], [local, remote], [localBinding]);
+  harness.beforeConnect = async (target) => {
+    if (target.kind === "ssh" && target.alias === "slow") {
+      await slowGate;
+    }
+  };
+  harness.sessions.set("healthy", [workspaceSession("healthy", "file:///healthy")]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.bridge.pendingPollCount === 1, "local poll should start");
+    await waitFor(
+      () => requestsFor(harness.bridge, "ahp_binding_ready").length === 1 &&
+        latestFullSessions(harness.bridge).some((session) => session.target_path === "/healthy"),
+      "local restore and healthy remote should not wait for slow discovery",
+    );
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 1, command_key: "send-local", binding_id: local.binding_id,
+      binding_generation: local.generation, kind: "send_message", data: { content: "hello" },
+    }] });
+    await waitFor(() => localBinding.queueUserTextCalls.length === 1, "local command should execute");
+    await waitFor(() => harness.bridge.pendingPollCount === 1, "polling should continue");
+    harness.abort.abort();
+    releaseSlow();
+    harness.bridge.resolvePoll({ commands: [] });
+    await runTask;
+    assert.deepEqual(harness.core.bindCalls, [local.session_uri]);
+    assert.equal(harness.closed.filter((entry) => entry.target === slow).length, 1);
+    assert.equal(harness.stopped.length, 1, "only the retained healthy tunnel needs final cleanup");
+    assert.equal(latestFullSessions(harness.bridge).some((session) => session.target_path === "/slow"), false);
+  } finally {
+    releaseSlow();
+    await stopManagedHarness(harness, runTask);
+  }
+});
+
+test("SSH discovery retries independently with capped backoff and reconnects lost idle tunnels", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const target = sshTarget("retry", "/retry");
+  const harness = managedHarness([target]);
+  let failing = true;
+  harness.beforeConnect = async () => {
+    if (failing) {
+      throw Object.assign(new Error("must not log credentials or remote output"), { code: "ssh-identity-changed" });
+    }
+  };
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => harness.connectCalls.length === 1);
+    await spinUntil(() => harness.bridge.pendingPollCount === 1);
+    for (const delay of [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]) {
+      const attempts = harness.connectCalls.length;
+      await spinUntil(() => true);
+      t.mock.timers.tick(delay - 1);
+      await flushMicrotasks();
+      assert.equal(harness.connectCalls.length, attempts);
+      t.mock.timers.tick(1);
+      await spinUntil(() => harness.connectCalls.length === attempts + 1);
+      await flushMicrotasks();
+    }
+    failing = false;
+    harness.sessions.set("retry", [workspaceSession("recovered", "file:///retry")]);
+    t.mock.timers.tick(60_000);
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 1);
+    const attempts = harness.connectCalls.length;
+    harness.offline.add("retry");
+    await harness.core.refreshEndpoints();
+    harness.offline.delete("retry");
+    t.mock.timers.tick(30_000);
+    await spinUntil(() => harness.connectCalls.length === attempts + 1);
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 1);
+    assert.equal(harness.stopped.length, 1, "failed idle tunnel should be released once");
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 2);
+});
+
+test("prepare reuses discovery ownership for another folder and rejects unauthorized target changes", async () => {
+  const first = sshTarget("shared", "/first");
+  const second = sshTarget("shared", "/second");
+  const harness = managedHarness([first, second]);
+  harness.sessions.set("shared", [workspaceSession("second", "file:///second")]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => latestFullSessions(harness.bridge).length === 1, "expected discovery");
+    await waitFor(() => harness.disconnected.length === 1, "discovery releases the control client");
+    const commands = [
+      second,
+      { ...second, path: "/unregistered" },
+      { ...second, alias: "changed" },
+      { ...second, user: "changed" },
+      { ...second, hostKeyFingerprints: ["changed"] },
+    ].map((target, index): AdapterCommand => ({
+      command_id: index + 1, command_key: `prepare-${index}`, binding_id: "new",
+      binding_generation: 0, kind: "prepare_target",
+      data: { target: wireTarget(target), retain_connection: true },
+    }));
+    harness.bridge.resolvePoll({ commands });
+    await waitFor(() => requestsFor(harness.bridge, "ahp_ack_command").length === commands.length, "expected prepare acknowledgements");
+    assert.deepEqual(requestsFor(harness.bridge, "ahp_ack_command").map((request) => request.outcome),
+      ["applied", "rejected", "rejected", "rejected", "rejected"]);
+    assert.equal(harness.connectCalls.length, 1);
+    assert.equal(harness.reconnectCalls.length, 1);
+    assert.equal(harness.reconnectCalls[0]?.workspaceUri, "file:///second");
+    assert.equal(harness.reconnectCalls[0]?.entry, harness.connected[0]?.entry);
+    assert.equal(harness.stopped.length, 0);
+    assert.equal(latestFullSessions(harness.bridge)[0]?.target_path, "/second");
+    assert.deepEqual(harness.clientRequests, ["resolveSessionConfig"]);
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1, "shared prepared ownership is stopped only once");
+});
+
+test("discovery and prepare reserve one shared Host while connection is pending", async () => {
+  const first = sshTarget("shared", "/first");
+  const second = sshTarget("shared", "/second");
+  const harness = managedHarness([first, second]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  harness.beforeConnect = () => gate;
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.bridge.pendingPollCount === 1, "expected polling during discovery");
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 1, command_key: "prepare", binding_id: "new", binding_generation: 0,
+      kind: "prepare_target", data: { target: wireTarget(second), retain_connection: true },
+    }] });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(harness.connectCalls.length, 1);
+    release();
+    await waitFor(() => requestsFor(harness.bridge, "ahp_ack_command").length === 1, "prepare should reuse discovery");
+    assert.equal(requestsFor(harness.bridge, "ahp_ack_command")[0]?.outcome, "applied");
+    assert.equal(harness.connectCalls.length, 1);
+    assert.equal(harness.reconnectCalls.length, 1);
+  } finally {
+    release();
+    await stopManagedHarness(harness, runTask);
+  }
+});
+
+test("conflicting pinned identities for one alias fail closed without connecting", async () => {
+  const first = sshTarget("conflict", "/first");
+  const harness = managedHarness([first, { ...first, path: "/second", user: "different" }]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.bridge.pendingPollCount === 1, "local polling should still start");
+    assert.equal(harness.connectCalls.length, 0);
+    assert.deepEqual(harness.core.bindCalls, []);
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+});
+
+test("SSH restore reuses discovery across folders and preserves bound Hosts during outages", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = sshTarget("restored", "/first");
+  const second = sshTarget("restored", "/second");
+  const prepared = preparedTarget(second);
+  const record: BridgeBinding = {
+    ...bindingRecord("remote", 1, "ahp-session:/restored", "ahp-chat://restored/default"),
+    endpoint_id: prepared.endpointId,
+    host_instance_id: prepared.entry.instanceId,
+    target_kind: "ssh", target_path: second.path, ssh_alias: second.alias,
+  };
+  const binding = new FakeSessionBinding(boundSnapshot(record.session_uri, chatUriOf(record), "active"));
+  const harness = managedHarness([first, second], [record], [binding]);
+  harness.sessions.set("restored", [workspaceSession("restored", "file:///second")]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => requestsFor(harness.bridge, "ahp_binding_ready").length === 1);
+    assert.equal(harness.connectCalls.length, 1);
+    assert.equal(harness.reconnectCalls.length, 0);
+    assert.deepEqual(harness.core.bindCalls, [record.session_uri]);
+    harness.offline.add("restored");
+    await harness.core.refreshEndpoints();
+    t.mock.timers.tick(120_000);
+    await flushMicrotasks();
+    assert.equal(harness.stopped.length, 0, "discovery cannot replace a bound Host");
+    assert.equal(harness.connectCalls.length, 1);
+    assert.equal(binding.closeCount, 0);
+    assert.equal(requestsFor(harness.bridge, "ahp_binding_ready").length, 1);
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(binding.closeCount, 1);
+  assert.equal(harness.stopped.length, 1);
+});
+
+test("discovery tries another authorized folder when the first folder on a shared Host is unavailable", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = sshTarget("folders", "/removed");
+  const second = sshTarget("folders", "/existing");
+  const harness = managedHarness([first, second]);
+  harness.beforeConnect = async (target) => {
+    if (target.path === first.path) {
+      throw new Error("target-directory-unavailable");
+    }
+  };
+  harness.sessions.set("folders", [workspaceSession("existing", "file:///existing")]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => harness.bridge.pendingPollCount === 1);
+    assert.deepEqual(harness.connectCalls, [first]);
+    t.mock.timers.tick(1_000);
+    await spinUntil(() => latestFullSessions(harness.bridge).length === 1);
+    assert.deepEqual(harness.connectCalls, [first, second]);
+    assert.equal(latestFullSessions(harness.bridge)[0]?.target_path, "/existing");
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1);
+});
+
+test("discovery fails closed if another alias resolves to an already retained endpoint", async () => {
+  const first = sshTarget("original", "/first");
+  const other = sshTarget("other", "/second");
+  const harness = managedHarness([first, other]);
+  const original = preparedTarget(first);
+  harness.prepareTarget = (target) => ({
+    ...preparedTarget(target),
+    entry: original.entry,
+    endpointId: original.endpointId,
+  });
+  harness.sessions.set("original", [workspaceSession("first", "file:///first")]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.closed.length === 1, "duplicate endpoint tunnel should close");
+    await waitFor(() => latestFullSessions(harness.bridge).length === 1, "original endpoint should remain visible");
+    assert.equal(harness.closed[0]?.target, other);
+    assert.equal(harness.core.catalogue.endpoints.length, 2, "Core receives only one managed endpoint");
+    assert.equal(latestFullSessions(harness.bridge)[0]?.ssh_alias, "original");
+    assert.ok(requestsFor(harness.bridge, "ahp_catalog_replace").every((request) =>
+      (request.hosts as Array<Record<string, unknown>>).every((host) => host.ssh_alias !== "other"),
+    ));
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1);
+});
+
+test("discovery does not retire a Host while a sibling-folder prepare operation is active", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = sshTarget("active", "/first");
+  const second = sshTarget("active", "/second");
+  const harness = managedHarness([first, second]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  harness.beforeRequest = async () => {
+    await gate;
+    return { schema: { type: "object", properties: {} }, values: {} };
+  };
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => harness.disconnected.length === 1);
+    t.mock.timers.tick(15_000);
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 1, command_key: "prepare", binding_id: "new", binding_generation: 0,
+      kind: "prepare_target", data: { target: wireTarget(second), retain_connection: true },
+    }] });
+    await spinUntil(() => harness.clientRequests.length === 1);
+    harness.offline.add("active");
+    await harness.core.refreshEndpoints();
+    t.mock.timers.tick(15_000);
+    await flushMicrotasks();
+    assert.equal(harness.stopped.length, 0);
+    assert.equal(harness.connectCalls.length, 1);
+    release();
+    await spinUntil(() => requestsFor(harness.bridge, "ahp_ack_command").length === 1);
+    harness.offline.delete("active");
+    t.mock.timers.tick(30_000);
+    await spinUntil(() => harness.connectCalls.length === 2);
+    await spinUntil(() => harness.disconnected.length === 3);
+    assert.equal(harness.stopped.length, 1, "operation count should release the original shared prepared entry");
+  } finally {
+    release();
+    await stopManagedHarness(harness, runTask);
+  }
+});
+
+test("create and dispose retain the shared discovery Host and exact sibling-folder identity", async () => {
+  const first = sshTarget("lifecycle", "/first");
+  const second = sshTarget("lifecycle", "/second");
+  const created = { ...workspaceSession("created", "file:///second"), provider: "copilotcli" };
+  const binding = new FakeSessionBinding(boundSnapshot(created.resource, "ahp-chat://created/default"));
+  const harness = managedHarness([first, second], [], [binding]);
+  harness.beforeRequest = async (method, params) => {
+    if (method === "resolveSessionConfig") {
+      assert.equal(params.workingDirectory, "file:///second");
+      return { schema: { type: "object", properties: {} }, values: {} };
+    }
+    if (method === "listSessions") {
+      return { items: harness.sessions.get("lifecycle") ?? [] };
+    }
+    if (method === "createSession") {
+      assert.deepEqual(params.workingDirectories, ["file:///second"]);
+      harness.sessions.set("lifecycle", [created]);
+      return {};
+    }
+    assert.equal(method, "disposeSession");
+    assert.equal(params.channel, created.resource);
+    harness.sessions.set("lifecycle", []);
+    return {};
+  };
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.disconnected.length === 1, "discovery should retain the Host");
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 1, command_key: "create", binding_id: "new", binding_generation: 0,
+      kind: "create_session", data: {
+        target: wireTarget(second), provider: "copilotcli", session_uri: created.resource,
+        workspace_uri: "file:///second", resolved_values: {}, overrides: {},
+      },
+    }] });
+    await waitFor(() => requestsFor(harness.bridge, "ahp_ack_command").length === 1, "creation should finish");
+    assert.equal(requestsFor(harness.bridge, "ahp_ack_command")[0]?.outcome, "applied");
+    assert.equal(latestFullSessions(harness.bridge)[0]?.target_path, "/second");
+    assert.deepEqual(harness.core.bindCalls, [created.resource], "creation retains a provisional binding");
+    assert.equal(binding.closeCount, 0);
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 2, command_key: "dispose", binding_id: "new", binding_generation: 0,
+      kind: "dispose_session", data: { target: wireTarget(second), session_uri: created.resource },
+    }] });
+    await waitFor(() => requestsFor(harness.bridge, "ahp_ack_command").length === 2, "disposal should finish");
+    assert.equal(requestsFor(harness.bridge, "ahp_ack_command")[1]?.outcome, "applied");
+    assert.equal(binding.closeCount, 1);
+    assert.equal(harness.connectCalls.length, 1);
+    assert.equal(harness.reconnectCalls.length, 2);
+    assert.equal(harness.stopped.length, 0);
+    assert.ok(harness.reconnectCalls.every((entry) => entry.workspaceUri === "file:///second"));
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1);
+});
+
+function sshTarget(alias: string, path: string): Extract<ManagedTarget, { kind: "ssh" }> {
+  return { kind: "ssh", alias, path, user: "root", host: alias, port: 22, hostKeyFingerprints: ["SHA256:pinned"] };
+}
+
+function wireTarget(target: Extract<ManagedTarget, { kind: "ssh" }>): unknown {
+  const { hostKeyFingerprints, ...fields } = target;
+  return { ...fields, host_key_fingerprints: hostKeyFingerprints };
+}
+
+function workspaceSession(id: string, uri?: string): SessionSummary {
+  return { ...summary(`ahp-session:/${id}`, id), ...(uri ? { workingDirectories: [uri] } : {}) };
+}
+
+function preparedTarget(target: ManagedTarget): PreparedTarget {
+  const alias = target.kind === "ssh" ? target.alias : "local";
+  const entry: EndpointRegistryEntry = {
+    schemaVersion: 2, type: "standalone", pid: 1234, instanceId: `host-${alias}`,
+    protocolVersion: "0.1.0", wireProtocolVersion: "0.9.0", connectionToken: "not-logged",
+    endpoint: { type: "tcp", host: "127.0.0.1", port: 9999 },
+    sourceFile: `C:\\registry\\${alias}.json`,
+  };
+  return { target, entry, endpointId: endpointPublicId(entry), hostLabel: `ssh:${alias}`,
+    workspaceUri: managedTargetWorkspaceUri(target), editorClientToolsAvailable: false };
+}
+
+function managedHarness(
+  targets: readonly ManagedTarget[],
+  registration: readonly BridgeBinding[] = [],
+  bindings: readonly FakeSessionBinding[] = [],
+) {
+  const bridge = new FakeBridgeClient({ bindings: registration });
+  let core!: FakeCore;
+  const state = {
+    bridge, abort: new AbortController(),
+    sessions: new Map<string, readonly SessionSummary[]>(),
+    offline: new Set<string>(),
+    connectCalls: [] as ManagedTarget[],
+    reconnectCalls: [] as PreparedTarget[],
+    connected: [] as PreparedTarget[],
+    disconnected: [] as PreparedTarget[],
+    closed: [] as PreparedTarget[],
+    stopped: [] as PreparedTarget[],
+    clientRequests: [] as string[],
+    prepareTarget: preparedTarget,
+    beforeConnect: undefined as ((target: ManagedTarget) => Promise<void>) | undefined,
+    beforeRequest: undefined as ((method: string, params: Record<string, unknown>) => Promise<unknown>) | undefined,
+  };
+  const connection = (prepared: PreparedTarget): ConnectedManagedTarget => {
+    state.connected.push(prepared);
+    const alias = prepared.target.kind === "ssh" ? prepared.target.alias : "local";
+    return {
+      prepared,
+      client: {
+        request: async (method: string, params: Record<string, unknown>) => {
+          state.clientRequests.push(method);
+          if (state.beforeRequest) {
+            return state.beforeRequest(method, params);
+          }
+          assert.equal(method, "resolveSessionConfig");
+          return { schema: { type: "object", properties: {} }, values: {} };
+        },
+      } as unknown as ConnectedManagedTarget["client"],
+      rootState: { agents: [{ provider: "copilotcli", displayName: "Copilot", description: "", models: [] }] },
+      sessions: state.sessions.get(alias) ?? [],
+      setProgressToken() {},
+      releasePreparedOwnership() {},
+      async disconnect() { state.disconnected.push(prepared); },
+      async close() { state.closed.push(prepared); },
+    };
+  };
+  const runtime = new AdapterRuntime({ ...config, authorizedTargets: targets }, {
+    createBridgeClient: () => bridge,
+    createCore: (options) => {
+      core = new FakeCore(options, catalogue([]), bindings);
+      core.beforeRefresh = async () => {
+        const entries = await options.dependencies!.discoverEndpoints!(config.userDataDirectory);
+        core.catalogue = {
+          revision: core.catalogue.revision + 1,
+          endpoints: [
+            ...catalogue([]).endpoints,
+            ...entries.map((entry): CatalogueSnapshot["endpoints"][number] => {
+              const id = endpointPublicId(entry);
+              return {
+                endpoint: { id, instanceId: entry.instanceId, pid: entry.pid, advertisedProtocol: entry.protocolVersion },
+                connection: state.offline.has(id) ? "disconnected" : "connected",
+                selectedProtocol: entry.wireProtocolVersion ?? entry.protocolVersion,
+                sessions: state.sessions.get(id) ?? [],
+              };
+            }),
+          ],
+        };
+        core.emitCatalogue(core.catalogue);
+        for (const endpoint of core.catalogue.endpoints) {
+          core.emitConnection({ endpoint: endpoint.endpoint, status: endpoint.connection,
+            ...(endpoint.selectedProtocol ? { selectedProtocol: endpoint.selectedProtocol } : {}) });
+        }
+      };
+      return core;
+    },
+    connectManagedTarget: async (_config, target) => {
+      state.connectCalls.push(target);
+      await state.beforeConnect?.(target);
+      return connection(state.prepareTarget(target));
+    },
+    connectPreparedManagedTarget: async (prepared) => {
+      state.reconnectCalls.push(prepared);
+      return connection(prepared);
+    },
+    stopManagedTargetProcesses: async (prepared) => { state.stopped.push(prepared as PreparedTarget); },
+  });
+  return Object.assign(state, { runtime, core });
+}
+
+async function stopManagedHarness(harness: ReturnType<typeof managedHarness>, runTask: Promise<void>): Promise<void> {
+  harness.abort.abort();
+  if (harness.bridge.pendingPollCount > 0) {
+    harness.bridge.resolvePoll({ commands: [] });
+  }
+  await runTask;
+}
+
+function latestFullSessions(bridge: FakeBridgeClient): Array<Record<string, unknown>> {
+  return (requestsFor(bridge, "ahp_catalog_replace").filter((request) => request.full_snapshot).at(-1)?.sessions ?? []) as Array<Record<string, unknown>>;
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let count = 0; count < 20; count += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+async function spinUntil(predicate: () => boolean): Promise<void> {
+  for (let count = 0; count < 2_000; count += 1) {
+    if (predicate()) {
+      await flushMicrotasks();
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.fail("runtime did not reach the expected state");
+}
 
 function bindingRecord(
   bindingId: string,

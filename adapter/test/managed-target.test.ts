@@ -140,6 +140,16 @@ test("managed SSH targets match file and VS Code Remote workspace URIs", () => {
     ),
     true,
   );
+  for (const authority of ["ssh-remote%2Bdevbox", "SSH-REMOTE%2bDEVBOX"]) {
+    assert.equal(
+      managedTargetMatchesWorkspaceUri(
+        target,
+        `vscode-remote://${authority}/srv/hash%23query%3F/project`,
+      ),
+      true,
+      authority,
+    );
+  }
   assert.equal(
     managedTargetMatchesWorkspaceUri(
       target,
@@ -147,6 +157,36 @@ test("managed SSH targets match file and VS Code Remote workspace URIs", () => {
     ),
     false,
   );
+});
+
+test("managed SSH target matching rejects invalid authorities and non-target URIs", () => {
+  const target = {
+    kind: "ssh" as const,
+    alias: "devbox",
+    path: "/srv/project",
+    user: "tester",
+    host: "devbox.internal",
+    port: 22,
+    hostKeyFingerprints: ["SHA256:test"],
+  };
+  for (const uri of [
+    "vscode-remote://ssh-remote%2Bother/srv/project",
+    "vscode-remote://ssh-remote%252Bdevbox/srv/project",
+    "vscode-remote://ssh-remote%2Bdevbox.evil/srv/project",
+    "vscode-remote://ssh-remote%2Bdevbox%2Fother/srv/project",
+    "vscode-remote://ssh-remote%GGdevbox/srv/project",
+    "vscode-remote://user@ssh-remote+devbox/srv/project",
+    "vscode-remote://user@ssh-remote%2Bdevbox/srv/project",
+    "vscode-remote://ssh-remote%2Bdevbox:22/srv/project",
+    "vscode-remote://ssh-remote%2Bdevbox/srv/project/child",
+    "vscode-remote://ssh-remote%2Bdevbox/srv/Project",
+    "vscode-remote://ssh-remote%2Bdevbox/srv/project?query",
+    "vscode-remote://ssh-remote%2Bdevbox/srv/project#fragment",
+    "vscode-remote://ssh-remote%2Bdevbox/srv/%GG",
+    "file://devbox/srv/project",
+  ]) {
+    assert.equal(managedTargetMatchesWorkspaceUri(target, uri), false, uri);
+  }
 });
 
 test("managed local targets match encoded drive-letter file URIs", () => {

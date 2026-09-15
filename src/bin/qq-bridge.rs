@@ -68,7 +68,13 @@ enum Command {
     RegisterLocalTarget {
         #[arg(long = "workspace")]
         workspace: PathBuf,
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = true
+        )]
         open_vscode: bool,
         #[arg(long, default_value_t = 300)]
         trust_timeout_seconds: u64,
@@ -78,7 +84,13 @@ enum Command {
         ssh_alias: String,
         #[arg(long = "workspace")]
         workspace: String,
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value_t = true
+        )]
         open_vscode: bool,
         #[arg(long, default_value_t = 300)]
         trust_timeout_seconds: u64,
@@ -138,7 +150,9 @@ struct ValidatedRemoteTarget {
     host_key_fingerprints: Vec<String>,
 }
 
-const SUPPORTED_AHP_PROTOCOLS: &[&str] = &["1.0.0", "0.8.0", "0.7.0", "0.6.0", "0.5.2", "0.5.1"];
+const SUPPORTED_AHP_PROTOCOLS: &[&str] = &[
+    "1.0.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.2", "0.5.1",
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1023,11 +1037,14 @@ fn validate_endpoints_json(raw: &str) -> Result<()> {
     let document: CodeAgentEndpointsDocument =
         serde_json::from_str(raw).context("agent endpoints output was not valid JSON")?;
     let compatible = document.endpoints.iter().any(|endpoint| {
+        // VS Code 1.136 standalone metadata uses 0.1.0 for the audited 0.9.0 wire.
+        let wire_protocol = match endpoint.protocol_version.as_str() {
+            "0.1.0" => "0.9.0",
+            protocol => protocol,
+        };
         endpoint.schema_version == 2
             && endpoint.kind == "standalone"
-            && SUPPORTED_AHP_PROTOCOLS
-                .iter()
-                .any(|supported| *supported == endpoint.protocol_version)
+            && SUPPORTED_AHP_PROTOCOLS.contains(&wire_protocol)
     });
     if !compatible {
         bail!(
@@ -1303,6 +1320,78 @@ fn restrict_config_permissions(_config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_preflight_accepts_supported_and_audited_standalone_versions() {
+        for protocol in ["0.1.0", "0.9.0"]
+            .into_iter()
+            .chain(SUPPORTED_AHP_PROTOCOLS.iter().copied())
+        {
+            let document = serde_json::json!({
+                "endpoints": [{
+                    "schemaVersion": 2,
+                    "protocolVersion": protocol,
+                    "type": "standalone"
+                }]
+            });
+            assert!(
+                validate_endpoints_json(&document.to_string()).is_ok(),
+                "expected compatible standalone metadata: {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_preflight_rejects_unknown_versions_schemas_and_editor_entries() {
+        for (schema, protocol, kind) in [
+            (2, "0.2.0", "standalone"),
+            (2, "0.9.1", "standalone"),
+            (2, "2.0.0", "standalone"),
+            (1, "0.1.0", "standalone"),
+            (3, "0.9.0", "standalone"),
+            (2, "0.1.0", "editor"),
+            (2, "0.9.0", "editor"),
+        ] {
+            let document = serde_json::json!({
+                "endpoints": [{
+                    "schemaVersion": schema,
+                    "protocolVersion": protocol,
+                    "type": kind
+                }]
+            });
+            assert!(
+                validate_endpoints_json(&document.to_string()).is_err(),
+                "unexpected compatible metadata: {schema} {protocol} {kind}"
+            );
+        }
+        assert!(validate_endpoints_json(r#"{"endpoints":[]}"#).is_err());
+        assert!(validate_endpoints_json("invalid JSON").is_err());
+    }
+
+    #[test]
+    fn registration_cli_accepts_managed_script_open_vscode_values() {
+        for command in ["register-local-target", "register-remote-target"] {
+            for (options, expected) in [
+                (vec![], true),
+                (vec!["--open-vscode"], true),
+                (vec!["--open-vscode", "true"], true),
+                (vec!["--open-vscode", "false"], false),
+            ] {
+                let mut args = vec!["qq-bridge", command, "--workspace", "/srv/project"];
+                if command == "register-remote-target" {
+                    args.extend(["--ssh-alias", "devbox"]);
+                }
+                args.extend(options);
+                let cli = Cli::try_parse_from(args).expect("registration arguments");
+                let open_vscode = match cli.command.expect("registration command") {
+                    Command::RegisterLocalTarget { open_vscode, .. }
+                    | Command::RegisterRemoteTarget { open_vscode, .. } => open_vscode,
+                    _ => panic!("unexpected registration command"),
+                };
+                assert_eq!(open_vscode, expected);
+            }
+        }
+    }
 
     #[test]
     fn add_workspaces_authorizes_targets_and_deduplicates_paths() {

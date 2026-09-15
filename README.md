@@ -54,7 +54,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
   待执行命令、审批或澄清输入的 Session。
 - Session 编号由 Bridge 稳定分配，目录刷新不会改变。
 - 本地默认 Standalone Host 按需启动/复用；Linux Remote SSH 目标通过 Windows OpenSSH
-  `ssh.exe` 按需启动/复用远端默认 Host。
+  `ssh.exe` 在 Adapter 启动后后台发现并复用远端默认 Host，无需先执行 `/new`。
 - 本地与远端目标都必须先在电脑上注册并通过 VS Code Workspace Trust 确认后才能被 QQ 选择。
 - Turn 运行期间 QQ 显示官方 `msg_type=6`“正在输入”状态，每 45 秒续期，
   完成、取消、失败或等待审批/澄清时停止。
@@ -270,6 +270,14 @@ Quick mode 只使用 Host 默认值；Advanced 只暴露 Host `resolveSessionCon
 `/sessions` 会列出所有预授权目标内的 Session，并标明所在 `local` 或 `ssh:<alias>`、完整
 路径以及在线/离线缓存状态。对缓存的远端 Session，`/switch` / `/switch <编号>` 会先自动
 重连、刷新并校验精确目标，再执行切换。
+
+Adapter 会在后台连接所有已注册的 SSH 目标并持续订阅 Host Session 目录，因此电脑端创建的
+Session 也会出现在列表中。相同 SSH alias 的多个授权目录共享 Host/本地隧道，每个 Session
+按其精确目录匹配授权目标；不会自动授权子目录、创建 Session 或切换 QQ 前台。空闲 SSH
+目录连接会保留，失败按 1 秒起步、最多 60 秒的退避独立重试，不阻塞本地启动、QQ 命令轮询
+或其他远端。每 30 秒检查连接状态；正在使用的 Host 不会被发现任务替换。Adapter 停止时
+停止重试，等待已有受超时限制的连接操作清理，仅关闭本地 SSH 隧道，不终止远端 Host。
+SSH 身份、公钥指纹与已审计协议版本检查保持不变；本地 Standalone Host 仍仅按需启动。
 
 电脑端 `ahp-sessions` / `ahp-bind` 仍可用于调试或手工恢复：
 

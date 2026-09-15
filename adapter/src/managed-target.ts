@@ -1185,13 +1185,6 @@ export function managedTargetMatchesWorkspaceUri(
     return false;
   }
   if (
-    candidate.protocol === "vscode-remote:" &&
-    candidate.host.toLocaleLowerCase("en-US") !==
-      `ssh-remote+${target.alias}`.toLocaleLowerCase("en-US")
-  ) {
-    return false;
-  }
-  if (
     candidate.protocol !== "file:" &&
     candidate.protocol !== "vscode-remote:"
   ) {
@@ -1200,10 +1193,22 @@ export function managedTargetMatchesWorkspaceUri(
   if (candidate.protocol === "file:" && candidate.host !== "") {
     return false;
   }
-  if (candidate.search !== "" || candidate.hash !== "") {
+  if (
+    candidate.username !== "" ||
+    candidate.password !== "" ||
+    candidate.search !== "" ||
+    candidate.hash !== ""
+  ) {
     return false;
   }
   try {
+    if (
+      candidate.protocol === "vscode-remote:" &&
+      decodeURIComponent(candidate.host).toLocaleLowerCase("en-US") !==
+        `ssh-remote+${target.alias}`.toLocaleLowerCase("en-US")
+    ) {
+      return false;
+    }
     return normalizePosixPath(decodeURIComponent(candidate.pathname)) ===
       normalizePosixPath(target.path);
   } catch {

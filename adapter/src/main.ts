@@ -34,6 +34,7 @@ import {
   createManagedSession,
   disposeManagedSession,
   managedTargetMatchesWorkspaceUri,
+  managedTargetWorkspaceUri,
   prepareTargetResult,
   refreshManagedSessions,
   stopManagedTargetProcesses,
@@ -59,6 +60,8 @@ const EVENT_BATCH_SIZE = 64;
 const RETRY_DELAY_MS = 1_000;
 const ACK_RETRY_DELAY_MS = 1_000;
 const MANAGED_BIND_GRACE_MS = 90_000;
+const MANAGED_DISCOVERY_INTERVAL_MS = 30_000;
+const MANAGED_DISCOVERY_MAX_RETRY_MS = 60_000;
 const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 
 export interface BridgeBinding {
@@ -143,6 +146,9 @@ export interface AhpCoreLike {
 export interface RuntimeDependencies {
   readonly createBridgeClient?: (config: AdapterConfig) => BridgeClientLike;
   readonly createCore?: (options: AhpCoreOptions) => AhpCoreLike;
+  readonly connectManagedTarget?: typeof connectManagedTarget;
+  readonly connectPreparedManagedTarget?: typeof connectPreparedManagedTarget;
+  readonly stopManagedTargetProcesses?: typeof stopManagedTargetProcesses;
 }
 
 interface ManagedEntryState {
@@ -214,6 +220,16 @@ export class AdapterRuntime {
 
   readonly #managedTargetReservations = new Map<string, Promise<void>>();
 
+  readonly #managedDiscoveryAbort = new AbortController();
+
+  readonly #managedDiscoveryTasks = new Set<Promise<void>>();
+
+  readonly #connectManagedTarget: typeof connectManagedTarget;
+
+  readonly #connectPreparedManagedTarget: typeof connectPreparedManagedTarget;
+
+  readonly #stopManagedTargetProcesses: typeof stopManagedTargetProcesses;
+
   readonly #retiringManagedEndpointIds = new Set<string>();
 
   readonly #bindings = new Map<string, ActiveBinding>();
@@ -253,6 +269,12 @@ export class AdapterRuntime {
   ) {
     const runtime = this;
     this.#config = config;
+    this.#connectManagedTarget =
+      dependencies.connectManagedTarget ?? connectManagedTarget;
+    this.#connectPreparedManagedTarget =
+      dependencies.connectPreparedManagedTarget ?? connectPreparedManagedTarget;
+    this.#stopManagedTargetProcesses =
+      dependencies.stopManagedTargetProcesses ?? stopManagedTargetProcesses;
     this.#bridge =
       dependencies.createBridgeClient?.(config) ??
       new BridgeClient(config.bridgePipePath, config.bridgeToken);
@@ -344,7 +366,10 @@ export class AdapterRuntime {
     }
     const preparedTargets = new Set<string>();
     for (const [bindingId, target] of this.#restoreManagedTargets) {
-      const targetKey = managedTargetKey(target);
+      if (target.kind === "ssh") {
+        continue;
+      }
+      const targetKey = managedHostKey(target);
       if (preparedTargets.has(targetKey)) {
         continue;
       }
@@ -360,6 +385,7 @@ export class AdapterRuntime {
     }
     await this.#core.start();
     await this.#publishCatalogue(this.#core.catalogue);
+    this.#startManagedDiscovery(signal);
     await this.#tryRestoreBindings();
 
     while (!signal.aborted) {
@@ -396,6 +422,7 @@ export class AdapterRuntime {
       return;
     }
     this.#stopping = true;
+    this.#managedDiscoveryAbort.abort();
     if (this.#restoreRetryTimer) {
       clearTimeout(this.#restoreRetryTimer);
       this.#restoreRetryTimer = undefined;
@@ -408,6 +435,7 @@ export class AdapterRuntime {
     await Promise.all(
       [...this.#commandQueues.values()].map((queue) => queue.drain()),
     );
+    await Promise.all(this.#managedDiscoveryTasks);
     this.#commandQueues.clear();
     this.#inFlightCommandIds.clear();
     await this.#callbackQueue.drain();
@@ -455,7 +483,7 @@ export class AdapterRuntime {
     try {
       await Promise.all(
         [...this.#managedEntries.values()].map((entry) =>
-          stopManagedTargetProcesses(entry.prepared),
+          this.#stopManagedTargetProcesses(entry.prepared),
         ),
       );
     } catch (error) {
@@ -865,7 +893,12 @@ export class AdapterRuntime {
       try {
         const target = this.#restoreManagedTargets.get(bindingId);
         if (target) {
-          if (!this.#managedEntries.has(managedTargetKey(target))) {
+          if (target.kind === "ssh") {
+            // Discovery and Core reconnects run independently of binding callbacks.
+            if (!this.#managedEntries.has(managedHostKey(target))) {
+              continue;
+            }
+          } else if (!this.#managedEntries.has(managedHostKey(target))) {
             await this.#prepareManagedBindingTarget(target);
           } else {
             await this.#core.refreshEndpoints();
@@ -894,6 +927,137 @@ export class AdapterRuntime {
       }
     }
     this.#scheduleRestoreRetry();
+  }
+
+  #startManagedDiscovery(signal: AbortSignal): void {
+    const abort = this.#managedDiscoveryAbort;
+    if (signal.aborted || this.#stopping) {
+      abort.abort();
+      return;
+    }
+    signal.addEventListener("abort", () => abort.abort(), {
+      once: true,
+      signal: abort.signal,
+    });
+    const hosts = new Map<string, ManagedTarget[]>();
+    for (const target of this.#config.authorizedTargets) {
+      if (target.kind !== "ssh") {
+        continue;
+      }
+      const key = managedHostKey(target);
+      const targets = hosts.get(key) ?? [];
+      targets.push(target);
+      hosts.set(key, targets);
+    }
+    for (const targets of hosts.values()) {
+      const task = this.#discoverManagedHost(targets, abort.signal);
+      this.#managedDiscoveryTasks.add(task);
+      void task.finally(() => this.#managedDiscoveryTasks.delete(task));
+    }
+  }
+
+  async #discoverManagedHost(
+    targets: readonly ManagedTarget[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    let target = targets[0];
+    if (!target) {
+      return;
+    }
+    let retryDelay = RETRY_DELAY_MS;
+    while (!signal.aborted && !this.#stopping) {
+      let nextDelay = MANAGED_DISCOVERY_INTERVAL_MS;
+      try {
+        this.#requireAuthorizedTarget(target);
+        const key = managedHostKey(target);
+        const retained = this.#managedEntries.get(key);
+        const endpointId = retained && endpointPublicId(retained.entry);
+        const connected = this.#core.catalogue.endpoints.some(
+          (endpoint) =>
+            endpoint.endpoint.id === endpointId &&
+            endpoint.connection === "connected",
+        );
+        if (
+          retained &&
+          endpointId &&
+          !connected &&
+          !this.#managedHostInUse(retained)
+        ) {
+          retained.pruning = true;
+          this.#retiringManagedEndpointIds.add(endpointId);
+          try {
+            await this.#stopManagedTargetProcesses(retained.prepared);
+            this.#managedEntries.delete(key);
+            await this.#core.refreshEndpoints();
+          } finally {
+            retained.pruning = false;
+            this.#retiringManagedEndpointIds.delete(endpointId);
+          }
+        }
+        if (!this.#managedEntries.has(key) && !signal.aborted && !this.#stopping) {
+          await this.#prepareManagedBindingTarget(target);
+          if (!signal.aborted && !this.#stopping) {
+            safeLog("info", "Authorized SSH catalogue discovery connected", {
+              sshAlias: target.kind === "ssh" ? target.alias : undefined,
+              endpointId: this.#managedEntries.get(key)?.prepared.endpointId,
+            });
+          }
+        }
+        retryDelay = RETRY_DELAY_MS;
+      } catch (error) {
+        if (signal.aborted || this.#stopping) {
+          break;
+        }
+        nextDelay = retryDelay;
+        retryDelay = Math.min(retryDelay * 2, MANAGED_DISCOVERY_MAX_RETRY_MS);
+        safeLog(
+          "warn",
+          "Authorized SSH catalogue discovery failed; retry scheduled",
+          {
+            sshAlias: target.kind === "ssh" ? target.alias : undefined,
+            code: errorCode(error),
+            retryDelayMs: nextDelay,
+          },
+        );
+        target = targets[(targets.indexOf(target) + 1) % targets.length] ?? target;
+      }
+      await delay(nextDelay, signal);
+    }
+  }
+
+  #managedHostInUse(entry: ManagedEntryState): boolean {
+    const endpointId = endpointPublicId(entry.entry);
+    return (
+      entry.activeOperations > 0 ||
+      entry.pruning ||
+      this.#managedTargetReservations.has(entry.key) ||
+      [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
+        (binding) => binding.endpointId === endpointId,
+      ) ||
+      [...this.#provisionalBindings.values()].some(
+        (binding) => binding.endpointId === endpointId,
+      )
+    );
+  }
+
+  #requireAuthorizedTarget(target: ManagedTarget): void {
+    if (
+      !this.#config.authorizedTargets.some(
+        (authorized) =>
+          managedTargetKey(authorized) === managedTargetKey(target) &&
+          sameManagedHost(authorized, target),
+      ) ||
+      this.#config.authorizedTargets.some(
+        (authorized) =>
+          managedHostKey(authorized) === managedHostKey(target) &&
+          !sameManagedHost(authorized, target),
+      )
+    ) {
+      throw new AhpOperationError(
+        "invalid-command",
+        "Managed target is not authorized",
+      );
+    }
   }
 
   #scheduleRestoreRetry(): void {
@@ -933,7 +1097,7 @@ export class AdapterRuntime {
     const currentConfig =
       "config" in data ? requireRecord(data.config, "config") : {};
     const connection = await this.#connectTarget(target);
-    const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
+    const alreadyRetained = this.#managedEntries.has(managedHostKey(target));
     let retained = false;
     try {
       const result = await prepareTargetResult(
@@ -942,10 +1106,10 @@ export class AdapterRuntime {
         currentConfig,
       );
       if (retainConnection) {
-        await this.#publishManagedCatalogue(connection);
         await this.#retainManagedPrepared(target, connection.prepared);
         connection.releasePreparedOwnership();
         retained = true;
+        await this.#publishManagedCatalogue(connection);
       }
       return result;
     } finally {
@@ -967,9 +1131,12 @@ export class AdapterRuntime {
   async #prepareManagedBindingTarget(target: ManagedTarget): Promise<void> {
     const connection = await this.#connectTarget(target);
     try {
-      await this.#publishManagedCatalogue(connection);
+      if (this.#stopping || this.#managedDiscoveryAbort.signal.aborted) {
+        throw new AhpOperationError("binding-unavailable", "Adapter is stopping");
+      }
       await this.#retainManagedPrepared(target, connection.prepared);
       connection.releasePreparedOwnership();
+      await this.#publishManagedCatalogue(connection);
       await connection.disconnect();
     } catch (error) {
       try {
@@ -1096,7 +1263,7 @@ export class AdapterRuntime {
             await this.#publishManagedCatalogue(
               connection,
               sessions,
-              this.#managedEntries.has(managedTargetKey(target))
+              this.#managedEntries.has(managedHostKey(target))
                 ? "connected"
                 : "unreachable",
               [createdSessionUri],
@@ -1130,7 +1297,7 @@ export class AdapterRuntime {
     const data = requireRecord(command.data);
     const target = parseManagedTarget(data.target);
     const sessionUri = requireString(data.session_uri, "session_uri");
-    const alreadyRetained = this.#managedEntries.has(managedTargetKey(target));
+    const alreadyRetained = this.#managedEntries.has(managedHostKey(target));
     const connection = await this.#connectTarget(target);
     let operationFailed = false;
     let operationError: unknown;
@@ -1244,7 +1411,8 @@ export class AdapterRuntime {
     target: ManagedTarget,
     onProgress?: Parameters<typeof connectManagedTarget>[2],
   ): Promise<ConnectedManagedTarget> {
-    const key = managedTargetKey(target);
+    this.#requireAuthorizedTarget(target);
+    const key = managedHostKey(target);
     const reservation = this.#managedTargetReservations.get(key);
     if (reservation) {
       await reservation;
@@ -1264,7 +1432,7 @@ export class AdapterRuntime {
         releaseReservation?.();
       };
       try {
-        const connection = await connectManagedTarget(
+        const connection = await this.#connectManagedTarget(
           this.#config,
           target,
           onProgress,
@@ -1284,8 +1452,14 @@ export class AdapterRuntime {
     retained.activeOperations += 1;
     let connection: ConnectedManagedTarget;
     try {
-      connection = await connectPreparedManagedTarget(
-        retained.prepared,
+      connection = await this.#connectPreparedManagedTarget(
+        managedTargetKey(retained.prepared.target) === managedTargetKey(target)
+          ? retained.prepared
+          : {
+              ...retained.prepared,
+              target,
+              workspaceUri: managedTargetWorkspaceUri(target),
+            },
         onProgress,
       );
     } catch (error) {
@@ -1352,8 +1526,19 @@ export class AdapterRuntime {
     target: ManagedTarget,
     prepared: ConnectedManagedTarget["prepared"],
   ): Promise<void> {
-    const key = managedTargetKey(target);
+    const key = managedHostKey(target);
     const previous = this.#managedEntries.get(key);
+    const endpointOwner = this.#managedEntryByEndpointId(prepared.endpointId);
+    if (endpointOwner && endpointOwner.key !== key) {
+      throw new AhpOperationError(
+        "binding-unavailable",
+        "Managed endpoint is already retained for another target identity",
+      );
+    }
+    if (previous?.entry === prepared.entry) {
+      // Per-folder views share the canonical tunnel ownership and operation count.
+      prepared = previous.prepared;
+    }
     const replacing = previous !== undefined && previous.prepared !== prepared;
     const previousEndpointId = previous
       ? endpointPublicId(previous.entry)
@@ -1381,7 +1566,7 @@ export class AdapterRuntime {
       previous.pruning = true;
       this.#retiringManagedEndpointIds.add(previousEndpointId);
       try {
-        await stopManagedTargetProcesses(previous.prepared);
+        await this.#stopManagedTargetProcesses(previous.prepared);
       } catch (error) {
         previous.pruning = false;
         this.#retiringManagedEndpointIds.delete(previousEndpointId);
@@ -1393,7 +1578,7 @@ export class AdapterRuntime {
     }
     this.#managedEntries.set(key, {
       key,
-      target,
+      target: prepared.target,
       entry: prepared.entry,
       prepared,
       protectedUntil: Date.now() + MANAGED_BIND_GRACE_MS,
@@ -1413,7 +1598,7 @@ export class AdapterRuntime {
       }
       const cleanupErrors: unknown[] = [error];
       try {
-        await stopManagedTargetProcesses(prepared);
+        await this.#stopManagedTargetProcesses(prepared);
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
       }
@@ -1544,6 +1729,10 @@ export class AdapterRuntime {
     }
     for (const [key, entry] of [...this.#managedEntries.entries()]) {
       const endpointId = endpointPublicId(entry.entry);
+      if (entry.target.kind === "ssh") {
+        // Authorized SSH catalogues stay subscribed even without QQ bindings.
+        continue;
+      }
       if (entry.activeOperations > 0) {
         nextPruneDelay =
           nextPruneDelay === undefined
@@ -1574,7 +1763,7 @@ export class AdapterRuntime {
       entry.pruning = true;
       this.#retiringManagedEndpointIds.add(endpointId);
       try {
-        await stopManagedTargetProcesses(entry.prepared);
+        await this.#stopManagedTargetProcesses(entry.prepared);
         if (this.#managedEntries.get(key) === entry) {
           this.#managedEntries.delete(key);
         }
@@ -1715,7 +1904,9 @@ export class AdapterRuntime {
         ],
         sessions: sessions
           .filter((session) => !removals.includes(session.resource))
-          .map((session) => toBridgeSession(prepared, target, session)),
+          .flatMap(
+            (session) => this.#managedCatalogueSession(prepared, session) ?? [],
+          ),
         removed_session_uris: removals,
         full_snapshot: false,
       });
@@ -2039,8 +2230,11 @@ export class AdapterRuntime {
           continue;
         }
         const candidate = managed
-          ? toBridgeSession(managed.prepared, managed.target, session)
+          ? this.#managedCatalogueSession(managed.prepared, session)
           : toEditorBridgeSession(entry, session);
+        if (!candidate) {
+          continue;
+        }
         const current = sessionsByUri.get(session.resource);
         const preferredEndpoint =
           this.#preferredEndpointForSession(session.resource);
@@ -2087,6 +2281,23 @@ export class AdapterRuntime {
     return [...this.#managedEntries.values()].find(
       (entry) => endpointPublicId(entry.entry) === endpointId,
     );
+  }
+
+  #managedCatalogueSession(
+    prepared: ConnectedManagedTarget["prepared"],
+    session: SessionSummary,
+  ): BridgeCatalogueSession | undefined {
+    const target = this.#config.authorizedTargets.find(
+      (candidate) =>
+        sameManagedHost(candidate, prepared.target) &&
+        session.workingDirectories?.some((uri) =>
+          managedTargetMatchesWorkspaceUri(candidate, uri),
+        ),
+    );
+    if (!target && prepared.target.kind === "ssh") {
+      return undefined;
+    }
+    return toBridgeSession(prepared, target ?? prepared.target, session);
   }
 
   async #ackWithRetry(
@@ -2264,6 +2475,24 @@ function managedTargetKey(target: ManagedTarget): string {
   return target.kind === "local"
     ? `local:${target.path.toLowerCase()}`
     : `ssh:${target.alias}\0${target.path}`;
+}
+
+function managedHostKey(target: ManagedTarget): string {
+  return target.kind === "ssh" ? `ssh:${target.alias}` : managedTargetKey(target);
+}
+
+function sameManagedHost(left: ManagedTarget, right: ManagedTarget): boolean {
+  if (left.kind === "local" || right.kind === "local") {
+    return managedTargetKey(left) === managedTargetKey(right);
+  }
+  return (
+    left.alias === right.alias &&
+    left.user === right.user &&
+    left.host === right.host &&
+    left.port === right.port &&
+    JSON.stringify([...left.hostKeyFingerprints].sort()) ===
+      JSON.stringify([...right.hostKeyFingerprints].sort())
+  );
 }
 
 function toBridgeSession(
@@ -2478,15 +2707,13 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, milliseconds);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
