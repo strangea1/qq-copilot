@@ -51,8 +51,12 @@ flowchart LR
   标题、完整目录、`local` / `ssh:<alias>`、在线/离线缓存，以及前台、后台、运行中和
   未监控状态。`/switch` 返回一次性回调按钮，`/switch <code>` 作为文本兜底，两者都只
   改变前台指针，不停止旧 Session。
-- `/new advanced` 只暴露 Host `resolveSessionConfig` 中可安全映射的模型与审批模式；
-  若还需要其他无默认字段，则显式拒绝并要求回到 PC 创建。
+- 受管 Host 在 `initialize` 后由 Adapter 根据 `AgentInfo.protectedResources` 通过 VS Code
+  状态扩展的显式授权 Broker 获取 GitHub token，并发送 AHP `authenticate`。token 不经过
+  QQ、Bridge command、SQLite、TOML 或日志；未知 resource/server/scopes fail-closed。
+- `/new advanced` 的模型来自认证后刷新的 `AgentInfo.models`，以首条 `Message.model`
+  提交；审批模式来自 `resolveSessionConfig`。必填模型配置只有 Host 提供 JSON primitive
+  默认值时才允许自动填充，否则要求回到 PC 创建。
 - 最近活跃 Session 自动加入监控。达到 5 个时，LRU 只能选择非前台、无 active Turn、
   queued message、Pending Adapter command、审批或澄清的 Binding；所有槽位受保护时
   新建、切换或定向发送明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。

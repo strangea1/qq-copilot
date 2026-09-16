@@ -18,6 +18,7 @@ import {
   type ChatToolCallResultConfirmedAction,
   type InitializeParams,
   type Message,
+  type ModelSelection,
   type SessionChatInputRequest,
   type SessionInputRequest,
   type SessionState,
@@ -215,7 +216,8 @@ export type AhpOperationErrorCode =
   | "no-active-turn"
   | "pending-input-not-found"
   | "pending-tool-not-found"
-  | "session-not-found";
+  | "session-not-found"
+  | "stale-command";
 
 export class AhpOperationError extends Error {
   readonly code: AhpOperationErrorCode;
@@ -286,8 +288,12 @@ export interface AhpSessionBinding {
   queueUserText(
     text: string,
     clientSeq?: number,
+    model?: ModelSelection,
   ): Promise<QueueUserTextResult>;
-  cancelActiveTurn(clientSeq?: number): Promise<CancelTurnResult>;
+  cancelActiveTurn(
+    clientSeq?: number,
+    expectedTurnId?: string,
+  ): Promise<CancelTurnResult>;
   reviewToolParameters(
     command: ReviewToolParametersCommand,
     clientSeq?: number,
@@ -1361,6 +1367,7 @@ class SessionBinding implements AhpSessionBinding {
   queueUserText(
     text: string,
     clientSeq?: number,
+    model?: ModelSelection,
   ): Promise<QueueUserTextResult> {
     return this.#queue.run(() => {
       this.#assertOpen();
@@ -1374,6 +1381,7 @@ class SessionBinding implements AhpSessionBinding {
       const message: Message = {
         text,
         origin: { kind: MessageKind.User },
+        ...(model ? { model } : {}),
       };
       if (
         chat.activeTurn === undefined &&
@@ -1419,24 +1427,34 @@ class SessionBinding implements AhpSessionBinding {
     });
   }
 
-  cancelActiveTurn(clientSeq?: number): Promise<CancelTurnResult> {
+  cancelActiveTurn(
+    clientSeq?: number,
+    expectedTurnId?: string,
+  ): Promise<CancelTurnResult> {
     return this.#queue.run(() => {
       this.#assertOpen();
       const { connection, chat } = this.#requireChat();
       const activeTurn = chat.activeTurn;
-      if (!activeTurn) {
+      if (activeTurn && expectedTurnId && activeTurn.id !== expectedTurnId) {
+        throw new AhpOperationError(
+          "stale-command",
+          "The active turn differs from the requested turn",
+        );
+      }
+      const turnId = expectedTurnId ?? activeTurn?.id;
+      if (!turnId) {
         throw new AhpOperationError(
           "no-active-turn",
           "There is no active turn to cancel",
         );
       }
       const observedDuration =
-        this.#observedTurnId === activeTurn.id
+        activeTurn && this.#observedTurnId === activeTurn.id
           ? this.#runtime.monotonicNow() - this.#observedTurnAt
           : 0;
       const action: StateAction = {
         type: ActionType.ChatTurnCancelled,
-        turnId: activeTurn.id,
+        turnId,
         duration: Math.max(0, Math.floor(observedDuration)),
       };
       const dispatched = connection.client.dispatch(
@@ -1445,7 +1463,7 @@ class SessionBinding implements AhpSessionBinding {
         clientSeq,
       );
       return {
-        turnId: activeTurn.id,
+        turnId,
         clientSeq: dispatched.clientSeq,
       };
     });

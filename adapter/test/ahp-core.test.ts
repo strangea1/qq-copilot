@@ -635,8 +635,19 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
     await waitFor(() => errors.length > 0);
     assert.equal(actions.length, actionCount);
 
-    const firstPromise = binding.queueUserText("start now");
-    const secondPromise = binding.queueUserText("queue next");
+    const pendingCancellation = await binding.cancelActiveTurn(
+      undefined,
+      "pending-turn",
+    );
+    assert.equal(pendingCancellation.turnId, "pending-turn");
+
+    const firstPromise = binding.queueUserText("start now", undefined, {
+      id: "model-started",
+      config: { thinking: "medium" },
+    });
+    const secondPromise = binding.queueUserText("queue next", undefined, {
+      id: "model-queued",
+    });
     const [first, second] = await Promise.all([
       firstPromise,
       secondPromise,
@@ -726,34 +737,42 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
       },
     });
 
-    await waitFor(() => server.dispatches.length >= 7);
+    await waitFor(() => server.dispatches.length >= 8);
     const dispatched = server.dispatches.map(dispatchDetails);
     assert.equal(
       dispatched[0]?.actionType,
+      ActionType.ChatTurnCancelled,
+    );
+    assert.equal(dispatched[0]?.turnId, "pending-turn");
+    assert.equal(dispatched[0]?.duration, 0);
+    assert.equal(
+      dispatched[1]?.actionType,
       ActionType.ChatTurnStarted,
     );
     assert.equal(
-      dispatched[1]?.actionType,
+      dispatched[2]?.actionType,
       ActionType.ChatPendingMessageSet,
     );
-    assert.equal(
-      dispatched[2]?.actionType,
-      ActionType.ChatTurnCancelled,
-    );
-    assert.equal(dispatched[2]?.duration, 75);
-    assert.equal(dispatched[3]?.channel, secondaryChat);
+    assert.equal(dispatched[1]?.modelId, "model-started");
+    assert.equal(dispatched[2]?.modelId, "model-queued");
     assert.equal(
       dispatched[3]?.actionType,
-      ActionType.ChatToolCallConfirmed,
+      ActionType.ChatTurnCancelled,
     );
+    assert.equal(dispatched[3]?.duration, 75);
     assert.equal(dispatched[4]?.channel, secondaryChat);
     assert.equal(
-      dispatched[5]?.actionType,
-      ActionType.ChatToolCallResultConfirmed,
+      dispatched[4]?.actionType,
+      ActionType.ChatToolCallConfirmed,
     );
-    assert.equal(dispatched[6]?.channel, chatB);
+    assert.equal(dispatched[5]?.channel, secondaryChat);
     assert.equal(
       dispatched[6]?.actionType,
+      ActionType.ChatToolCallResultConfirmed,
+    );
+    assert.equal(dispatched[7]?.channel, chatB);
+    assert.equal(
+      dispatched[7]?.actionType,
       ActionType.ChatInputCompleted,
     );
     assert.ok(sessionSnapshots.length >= 2);
@@ -860,7 +879,9 @@ function stringArrayProperty(
 interface DispatchDetails {
   readonly channel?: string;
   readonly actionType?: string;
+  readonly turnId?: string;
   readonly duration?: number;
+  readonly modelId?: string;
 }
 
 function dispatchDetails(value: unknown): DispatchDetails {
@@ -870,11 +891,17 @@ function dispatchDetails(value: unknown): DispatchDetails {
   const action = isRecord(value.action) ? value.action : {};
   const channel = stringProperty(value, "channel");
   const actionType = stringProperty(action, "type");
+  const turnId = stringProperty(action, "turnId");
   const duration = numberProperty(action, "duration");
+  const message = isRecord(action.message) ? action.message : {};
+  const model = isRecord(message.model) ? message.model : {};
+  const modelId = stringProperty(model, "id");
   return {
     ...(channel ? { channel } : {}),
     ...(actionType ? { actionType } : {}),
+    ...(turnId ? { turnId } : {}),
     ...(duration !== undefined ? { duration } : {}),
+    ...(modelId ? { modelId } : {}),
   };
 }
 

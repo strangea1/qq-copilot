@@ -1,6 +1,6 @@
 # Mobile Session Creation Handoff
 
-- Status: unresolved
+- Status: implemented in source; deployment and real QQ verification pending
 - Observed: 2026-09-04, VS Code 1.136.0
 - Scope: QQ `/new advanced` against the authorized local target `C:\test`
 
@@ -196,6 +196,29 @@ verify the Session is absent from both `ahp-sessions` and
 
 ## 7. Work that is already complete
 
+The source implementation now also covers the four defects recorded above:
+
+- the VS Code status extension hosts an opt-in, in-memory GitHub credential
+  Broker whose capability is derived from the Bridge IPC token;
+- the Adapter authenticates advertised required resources after `initialize`,
+  waits for refreshed `AgentInfo.models`, and fails closed for unsupported
+  resources or model configuration without primitive defaults;
+- the selected `ModelSelection` is carried on the first AHP `Message.model`,
+  never in `createSession.config`;
+- unrelated active Turns no longer block `/new`; only actual Binding capacity
+  protection does;
+- the first message is routed to the newly created Session explicitly, and an
+  immediate first-Turn failure triggers foreground restoration, unbind,
+  `dispose_session`, and authoritative Catalog removal.
+
+Unit and integration-style regression tests cover model mapping, direct Broker
+wire exchange, AHP authentication, targeted first-message routing, Binding
+capacity, terminal Turn observation, command fencing, and rollback. The managed
+production deployment completed successfully on 2026-09-04 with two restored
+Bindings and no pending commands or interactions. `A8U26` was no longer present
+in the authoritative Catalog before deployment, so no unsupported database
+cleanup was performed. The real QQ test in section 8 remains outstanding.
+
 The working tree also contains validated fixes that should be preserved:
 
 - delta processing no longer deep-clones full Chat history for every token;
@@ -210,15 +233,18 @@ The working tree also contains validated fixes that should be preserved:
   real QQ two-trigger test;
 - the integration switch script can start from a stopped Bridge.
 
-Validation completed before this handoff:
+Final validation completed for the implementation:
 
-- 99 Rust tests;
+- 115 Rust library tests and 4 `qq-bridge` tests;
 - strict Clippy with warnings denied;
 - Rust release build;
-- 41 Adapter tests;
+- 48 Adapter tests;
 - Adapter typecheck and build;
-- real Editor and standalone protocol probes;
-- production Gateway, Adapter, Host, and Binding health checks.
+- 7 VS Code status extension tests;
+- status extension typecheck and build;
+- final blocker-only review with no findings;
+- production Gateway, Adapter, two restored Bindings, deployed hashes, and all
+  pending counters verified healthy.
 
 ## 8. Recommended implementation order
 

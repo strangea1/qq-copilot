@@ -6,17 +6,24 @@ import { pathToFileURL } from "node:url";
 
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
+  type AgentInfo,
   type ConfigPropertySchema,
   type ConfigSchema,
+  type ModelSelection,
+  type ProtectedResourceMetadata,
   type RootState,
+  type SessionModelInfo,
   type SessionState,
   type SessionSummary,
+  type Snapshot,
   type URI,
 } from "@microsoft/agent-host-protocol";
 import {
   AhpClient,
+  AhpStateMirror,
   ClientClosedError,
   RpcError,
+  type Subscription,
   type JsonRpcMessage,
   TransportError,
   type AhpTransport,
@@ -25,6 +32,10 @@ import {
 
 import { openEndpointTransport } from "./named-pipe-transport.js";
 import type { AdapterConfig } from "./config.js";
+import {
+  requestBrokeredCredential,
+  type ProtectedResourceRequest,
+} from "./credential-broker.js";
 import type {
   EndpointRegistryEntry,
   SocketEndpoint,
@@ -101,6 +112,18 @@ export interface SupportedSessionField {
   readonly selected: unknown;
 }
 
+export interface SupportedModelSelection {
+  readonly options: readonly SessionConfigOption[];
+  readonly selected: ModelSelection;
+}
+
+export interface ManagedAuthBroker {
+  resolve(
+    request: ProtectedResourceRequest,
+    signal?: AbortSignal,
+  ): Promise<{ readonly token: string }>;
+}
+
 export interface PrepareTargetResult {
   readonly endpoint_id: string;
   readonly host_instance_id: string;
@@ -109,7 +132,7 @@ export interface PrepareTargetResult {
   readonly host_label: string;
   readonly editor_client_tools_available: boolean;
   readonly resolved_values: unknown;
-  readonly model?: SupportedSessionField;
+  readonly model?: SupportedModelSelection;
   readonly approval?: SupportedSessionField;
 }
 
@@ -144,12 +167,13 @@ export async function prepareTargetResult(
     connection.prepared.workspaceUri,
     config,
   );
+  const model = advanced
+    ? supportedModelSelection(managedAgent(connection.rootState, provider))
+    : undefined;
   if (
     !advanced &&
-    ((resolved.model &&
-      fieldNeedsExplicitSelection(resolved.model, resolved.values)) ||
-      (resolved.approval &&
-        fieldNeedsExplicitSelection(resolved.approval, resolved.values)))
+    resolved.approval &&
+    fieldNeedsExplicitSelection(resolved.approval, resolved.values)
   ) {
     throw codedError(
       "requires-new-advanced",
@@ -165,7 +189,7 @@ export async function prepareTargetResult(
     editor_client_tools_available:
       connection.prepared.editorClientToolsAvailable,
     resolved_values: resolved.values,
-    ...(advanced && resolved.model ? { model: resolved.model } : {}),
+    ...(model ? { model } : {}),
     ...(advanced && resolved.approval ? { approval: resolved.approval } : {}),
   };
 }
@@ -188,12 +212,9 @@ export async function createManagedSession(
     mergedConfig,
   );
   if (
-    (resolved.model &&
-      fieldNeedsExplicitSelection(resolved.model, mergedConfig) &&
-      fieldNeedsExplicitSelection(resolved.model, resolved.values)) ||
-    (resolved.approval &&
+    resolved.approval &&
       fieldNeedsExplicitSelection(resolved.approval, mergedConfig) &&
-      fieldNeedsExplicitSelection(resolved.approval, resolved.values))
+      fieldNeedsExplicitSelection(resolved.approval, resolved.values)
   ) {
     throw codedError(
       "requires-explicit-selection",
@@ -651,20 +672,232 @@ export interface ConnectedManagedTarget {
   close(): Promise<void>;
 }
 
+class ManagedRootTracker {
+  readonly #mirror = new AhpStateMirror();
+
+  readonly #subscription: Subscription;
+
+  readonly #waiters = new Set<() => void>();
+
+  readonly #closeController = new AbortController();
+
+  #pump: Promise<void> | undefined;
+
+  #error: unknown;
+
+  #closed = false;
+
+  constructor(snapshots: readonly Snapshot[], subscription: Subscription) {
+    for (const snapshot of snapshots) {
+      this.#mirror.applySnapshot(snapshot);
+    }
+    this.#subscription = subscription;
+  }
+
+  get root(): RootState {
+    if (this.#error !== undefined) {
+      throw this.#error;
+    }
+    return this.#mirror.root;
+  }
+
+  get signal(): AbortSignal {
+    return this.#closeController.signal;
+  }
+
+  start(
+    onAuthRequired: (resource: ProtectedResourceMetadata) => Promise<void>,
+  ): void {
+    if (this.#pump) {
+      return;
+    }
+    this.#pump = this.#run(onAuthRequired).catch((error) => {
+      this.#error = error;
+      this.#signal();
+    });
+  }
+
+  async waitFor(
+    predicate: (state: RootState) => boolean,
+    deadline: number,
+    timeoutCode: string,
+  ): Promise<RootState> {
+    while (!predicate(this.root)) {
+      let resolveChange: (() => void) | undefined;
+      const change = new Promise<void>((resolve) => {
+        resolveChange = resolve;
+        this.#waiters.add(resolve);
+      });
+      try {
+        await beforeDeadline(() => change, deadline, timeoutCode);
+      } finally {
+        if (resolveChange) {
+          this.#waiters.delete(resolveChange);
+        }
+      }
+    }
+    return this.root;
+  }
+
+  beginClose(): void {
+    this.#closeController.abort();
+    this.#closed = true;
+    this.#signal();
+  }
+
+  async close(): Promise<void> {
+    this.beginClose();
+    await this.#subscription.close();
+    await this.#pump;
+  }
+
+  async #run(
+    onAuthRequired: (resource: ProtectedResourceMetadata) => Promise<void>,
+  ): Promise<void> {
+    for await (const event of this.#subscription) {
+      if (event.type === "action") {
+        this.#mirror.apply(event.params);
+      } else if (event.type === "authRequired") {
+        await onAuthRequired(event.params.resource);
+      }
+      this.#signal();
+    }
+    if (!this.#closed) {
+      throw codedError("managed-root-subscription-ended");
+    }
+  }
+
+  #signal(): void {
+    const waiters = [...this.#waiters];
+    this.#waiters.clear();
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+}
+
+export class ManagedAuthenticator {
+  readonly #client: AhpClient;
+
+  readonly #rootState: () => RootState;
+
+  readonly #broker: ManagedAuthBroker;
+
+  readonly #signal: AbortSignal | undefined;
+
+  readonly #pending = new Map<string, Promise<void>>();
+
+  constructor(
+    client: AhpClient,
+    rootState: () => RootState,
+    broker: ManagedAuthBroker,
+    signal?: AbortSignal,
+  ) {
+    this.#client = client;
+    this.#rootState = rootState;
+    this.#broker = broker;
+    this.#signal = signal;
+  }
+
+  async authenticateProvider(provider: string): Promise<boolean> {
+    const agent = managedAgent(this.#rootState(), provider);
+    const resources = (agent.protectedResources ?? []).filter(
+      (resource) => resource.required !== false,
+    );
+    for (const resource of resources) {
+      await this.authenticateResource(provider, resource);
+    }
+    return resources.length > 0;
+  }
+
+  authenticateRequiredResource(
+    resource: ProtectedResourceMetadata,
+  ): Promise<void> {
+    const agent = this.#rootState().agents.find((candidate) =>
+      candidate.protectedResources?.some(
+        (advertised) => advertised.resource === resource.resource,
+      ),
+    );
+    if (!agent) {
+      throw codedError("unadvertised-authentication-resource");
+    }
+    return this.authenticateResource(agent.provider, resource);
+  }
+
+  authenticateResource(
+    provider: string,
+    resource: ProtectedResourceMetadata,
+  ): Promise<void> {
+    const existing = this.#pending.get(resource.resource);
+    if (existing) {
+      return existing;
+    }
+    const pending = this.#authenticateResource(provider, resource).finally(() => {
+      if (this.#pending.get(resource.resource) === pending) {
+        this.#pending.delete(resource.resource);
+      }
+    });
+    this.#pending.set(resource.resource, pending);
+    return pending;
+  }
+
+  async #authenticateResource(
+    provider: string,
+    resource: ProtectedResourceMetadata,
+  ): Promise<void> {
+    const authorizationServers = resource.authorization_servers ?? [];
+    const scopes = resource.scopes_supported ?? [];
+    if (authorizationServers.length === 0 || scopes.length === 0) {
+      throw codedError("invalid-authentication-metadata");
+    }
+    const credential = await this.#broker.resolve(
+      {
+        provider,
+        resource: resource.resource,
+        authorizationServers,
+        scopes,
+      },
+      this.#signal,
+    );
+    await beforeDeadline(
+      () =>
+        this.#client.request("authenticate", {
+          channel: "ahp-root://",
+          resource: resource.resource,
+          token: credential.token,
+          scopes: [...scopes],
+        }),
+      Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
+      "managed-authentication-timeout",
+    );
+  }
+}
+
+export function managedAuthBrokerForConfig(
+  config: AdapterConfig,
+): ManagedAuthBroker {
+  return {
+    resolve: (request, signal) =>
+      requestBrokeredCredential(config.bridgeToken, request, undefined, signal),
+  };
+}
+
 export async function connectManagedTarget(
   config: AdapterConfig,
   target: ManagedTarget,
   onProgress?: (progress: ProgressNotification) => Promise<void> | void,
+  authBroker: ManagedAuthBroker = managedAuthBrokerForConfig(config),
 ): Promise<ConnectedManagedTarget> {
   const prepared = await prepareManagedTarget(config, target);
-  return connectPreparedTarget(prepared, onProgress, true);
+  return connectPreparedTarget(prepared, onProgress, true, authBroker);
 }
 
 export async function connectPreparedManagedTarget(
   prepared: PreparedTarget,
   onProgress?: (progress: ProgressNotification) => Promise<void> | void,
+  authBroker?: ManagedAuthBroker,
 ): Promise<ConnectedManagedTarget> {
-  return connectPreparedTarget(prepared, onProgress, false);
+  return connectPreparedTarget(prepared, onProgress, false, authBroker);
 }
 
 async function connectPreparedTarget(
@@ -673,8 +906,10 @@ async function connectPreparedTarget(
     | ((progress: ProgressNotification) => Promise<void> | void)
     | undefined,
   stopPreparedOnClose: boolean,
+  authBroker?: ManagedAuthBroker,
 ): Promise<ConnectedManagedTarget> {
   let client: AhpClient | undefined;
+  let rootTracker: ManagedRootTracker | undefined;
   let ownsPrepared = stopPreparedOnClose;
   try {
     const transport = new ProgressTapTransport(
@@ -688,6 +923,7 @@ async function connectPreparedTarget(
       requestTimeoutMs: MANAGED_REQUEST_TIMEOUT_MS,
     });
     const managedClient = client;
+    const rootSubscription = managedClient.attachSubscription("ahp-root://");
     managedClient.connect();
     const initialized = await beforeDeadline(
       () =>
@@ -717,25 +953,59 @@ async function connectPreparedTarget(
         `incompatible-protocol:${prepared.entry.protocolVersion}->${initialized.protocolVersion}`,
       );
     }
-    const rootState = extractRootState(initialized.snapshots);
+    rootTracker = new ManagedRootTracker(
+      initialized.snapshots ?? [],
+      rootSubscription,
+    );
+    const activeRootTracker = rootTracker;
+    const provider = defaultManagedProvider(activeRootTracker.root);
+    const requiresAuthentication = (
+      managedAgent(activeRootTracker.root, provider).protectedResources ?? []
+    ).some((resource) => resource.required !== false);
+    if (requiresAuthentication && !authBroker) {
+      throw codedError("authentication-broker-unavailable");
+    }
+    const authenticator = authBroker
+      ? new ManagedAuthenticator(
+          managedClient,
+          () => activeRootTracker.root,
+          authBroker,
+          activeRootTracker.signal,
+        )
+      : undefined;
+    activeRootTracker.start(async (resource) => {
+      if (!authenticator) {
+        throw codedError("authentication-broker-unavailable");
+      }
+      await authenticator.authenticateRequiredResource(resource);
+    });
+    if (authenticator && (await authenticator.authenticateProvider(provider))) {
+      await activeRootTracker.waitFor(
+        (state) => managedAgent(state, provider).models.length > 0,
+        Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
+        "managed-model-refresh-timeout",
+      );
+    }
     const sessions = await listSessions(managedClient);
     const connectedClient = managedClient;
     return {
       prepared,
       client: connectedClient,
-      rootState,
+      get rootState(): RootState {
+        return activeRootTracker.root;
+      },
       sessions,
       setProgressToken: (token) => transport.setProgressToken(token),
       releasePreparedOwnership(): void {
         ownsPrepared = false;
       },
       async disconnect(): Promise<void> {
-        await shutdownManagedClient(connectedClient);
+        await shutdownManagedConnection(connectedClient, activeRootTracker);
       },
       async close(): Promise<void> {
         const errors: unknown[] = [];
         try {
-          await shutdownManagedClient(connectedClient);
+          await shutdownManagedConnection(connectedClient, activeRootTracker);
         } catch (error) {
           errors.push(error);
         }
@@ -753,7 +1023,11 @@ async function connectPreparedTarget(
     const errors: unknown[] = [error];
     if (client) {
       try {
-        await shutdownManagedClient(client);
+        if (rootTracker) {
+          await shutdownManagedConnection(client, rootTracker);
+        } else {
+          await shutdownManagedClient(client);
+        }
       } catch (shutdownError) {
         errors.push(shutdownError);
       }
@@ -780,6 +1054,25 @@ async function shutdownManagedClient(client: AhpClient): Promise<void> {
       throw error;
     }
   }
+}
+
+async function shutdownManagedConnection(
+  client: AhpClient,
+  rootTracker: ManagedRootTracker,
+): Promise<void> {
+  const errors: unknown[] = [];
+  rootTracker.beginClose();
+  try {
+    await shutdownManagedClient(client);
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await rootTracker.close();
+  } catch (error) {
+    errors.push(error);
+  }
+  throwCleanupErrors(errors, "managed-connection-shutdown-failed");
 }
 
 function throwCleanupErrors(errors: unknown[], message: string): void {
@@ -843,23 +1136,6 @@ export async function refreshManagedSessions(
   client: AhpClient,
 ): Promise<readonly SessionSummary[]> {
   return listSessions(client);
-}
-
-function extractRootState(snapshots: readonly unknown[] | undefined): RootState {
-  for (const snapshot of snapshots ?? []) {
-    if (
-      typeof snapshot === "object" &&
-      snapshot !== null &&
-      "resource" in snapshot &&
-      snapshot.resource === "ahp-root://" &&
-      "state" in snapshot &&
-      typeof snapshot.state === "object" &&
-      snapshot.state !== null
-    ) {
-      return snapshot.state as RootState;
-    }
-  }
-  return { agents: [] };
 }
 
 async function prepareManagedTarget(
@@ -1837,6 +2113,118 @@ export function defaultManagedProvider(
   throw codedError("provider-selection-required");
 }
 
+function managedAgent(rootState: RootState, provider: string): AgentInfo {
+  const agent = rootState.agents.find(
+    (candidate) => candidate.provider === provider,
+  );
+  if (!agent) {
+    throw codedError("managed-provider-unavailable");
+  }
+  return agent;
+}
+
+export function supportedModelSelection(
+  agent: AgentInfo,
+): SupportedModelSelection | undefined {
+  const seen = new Set<string>();
+  const options: SessionConfigOption[] = [];
+  let selected: ModelSelection | undefined;
+  for (const model of agent.models) {
+    if (
+      model.provider !== agent.provider ||
+      model.policyState === "disabled" ||
+      seen.has(model.id)
+    ) {
+      continue;
+    }
+    const selection = defaultModelSelection(model);
+    if (!selection) {
+      continue;
+    }
+    seen.add(model.id);
+    selected ??= selection;
+    const description = modelDescription(model);
+    options.push({
+      value: selection,
+      label: model.name,
+      ...(description ? { description } : {}),
+    });
+  }
+  if (agent.models.length > 0 && options.length === 0) {
+    throw codedError("managed-model-configuration-required");
+  }
+  if (!selected) {
+    return undefined;
+  }
+  return {
+    options,
+    selected,
+  };
+}
+
+function defaultModelSelection(
+  model: SessionModelInfo,
+): ModelSelection | undefined {
+  const schema = model.configSchema;
+  if (!schema) {
+    return { id: model.id };
+  }
+  const config: NonNullable<ModelSelection["config"]> = {};
+  const required = new Set(schema.required ?? []);
+  for (const [property, descriptor] of Object.entries(
+    schema.properties,
+  )) {
+    if (descriptor.default === undefined) {
+      if (required.has(property)) {
+        return undefined;
+      }
+      continue;
+    }
+    if (!isJsonPrimitive(descriptor.default)) {
+      if (required.has(property)) {
+        return undefined;
+      }
+      continue;
+    }
+    if (
+      descriptor.enum &&
+      !descriptor.enum.some((candidate) => candidate === descriptor.default)
+    ) {
+      return undefined;
+    }
+    config[property] = descriptor.default;
+  }
+  if (
+    [...required].some((property) => !(property in schema.properties))
+  ) {
+    return undefined;
+  }
+  return Object.keys(config).length > 0
+    ? { id: model.id, config }
+    : { id: model.id };
+}
+
+function modelDescription(model: SessionModelInfo): string | undefined {
+  const capabilities = [
+    model.supportsVision ? "vision" : undefined,
+    model.maxContextWindow
+      ? `context ${model.maxContextWindow.toLocaleString("en-US")}`
+      : undefined,
+  ].filter((value): value is string => value !== undefined);
+  return capabilities.length > 0 ? capabilities.join(", ") : undefined;
+}
+
+function isJsonPrimitive(
+  value: unknown,
+): value is string | number | boolean | null {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  );
+}
+
 async function resolveSessionConfig(
   client: AhpClient,
   provider: string,
@@ -1844,7 +2232,6 @@ async function resolveSessionConfig(
   config: Record<string, unknown>,
 ): Promise<{
   readonly values: Record<string, unknown>;
-  readonly model?: SupportedSessionField;
   readonly approval?: SupportedSessionField;
 }> {
   const deadline = Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS;
@@ -1861,15 +2248,6 @@ async function resolveSessionConfig(
   );
   const schema = asSchema(result.schema);
   const values = asRecord(result.values);
-  const model = await supportedField(
-    client,
-    provider,
-    workspaceUri,
-    schema,
-    values,
-    /model/iu,
-    deadline,
-  );
   const approval = await supportedField(
     client,
     provider,
@@ -1883,7 +2261,6 @@ async function resolveSessionConfig(
   for (const property of required) {
     if (
       !(property in values) &&
-      property !== model?.property &&
       property !== approval?.property
     ) {
       throw codedError(
@@ -1894,7 +2271,6 @@ async function resolveSessionConfig(
   }
   return {
     values,
-    ...(model ? { model } : {}),
     ...(approval ? { approval } : {}),
   };
 }

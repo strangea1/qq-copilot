@@ -1,12 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { PolicyState } from "@microsoft/agent-host-protocol";
 import {
+  AhpClient,
+  InMemoryTransport,
+  type TransportFrame,
+} from "@microsoft/agent-host-protocol/client";
+
+import type { ProtectedResourceRequest } from "../src/credential-broker.js";
+import {
+  ManagedAuthenticator,
   connectManagedTarget,
   defaultManagedProvider,
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
   standaloneWireProtocolVersion,
+  supportedModelSelection,
 } from "../src/managed-target.js";
 
 test("managed target reports executable spawn failures without crashing", async () => {
@@ -71,6 +81,219 @@ test("managed targets prefer the standalone Copilot provider", () => {
     /provider-selection-required/u,
   );
 });
+
+test("managed model picker uses AgentInfo models and defaultable model config", () => {
+  const selection = supportedModelSelection({
+    provider: "copilotcli",
+    displayName: "Copilot",
+    description: "Copilot",
+    models: [
+      {
+        id: "disabled",
+        provider: "copilotcli",
+        name: "Disabled",
+        policyState: PolicyState.Disabled,
+      },
+      {
+        id: "gpt-test",
+        provider: "copilotcli",
+        name: "GPT Test",
+        supportsVision: true,
+        maxContextWindow: 128_000,
+        configSchema: {
+          type: "object",
+          properties: {
+            thinking: {
+              type: "string",
+              title: "Thinking",
+              default: "medium",
+              enum: ["low", "medium", "high"],
+            },
+          },
+          required: ["thinking"],
+        },
+      },
+    ],
+  });
+  assert.deepEqual(selection, {
+    options: [
+      {
+        value: {
+          id: "gpt-test",
+          config: { thinking: "medium" },
+        },
+        label: "GPT Test",
+        description: "vision, context 128,000",
+      },
+    ],
+    selected: {
+      id: "gpt-test",
+      config: { thinking: "medium" },
+    },
+  });
+});
+
+test("managed model picker fails closed for required config without defaults", () => {
+  assert.throws(
+    () =>
+      supportedModelSelection({
+        provider: "copilotcli",
+        displayName: "Copilot",
+        description: "Copilot",
+        models: [
+          {
+            id: "gpt-test",
+            provider: "copilotcli",
+            name: "GPT Test",
+            configSchema: {
+              type: "object",
+              properties: {
+                thinking: {
+                  type: "string",
+                  title: "Thinking",
+                },
+              },
+              required: ["thinking"],
+            },
+          },
+        ],
+      }),
+    /managed-model-configuration-required/u,
+  );
+});
+
+test("managed authentication brokers an advertised resource into AHP authenticate", async () => {
+  const [clientTransport, serverTransport] = InMemoryTransport.pair();
+  const client = new AhpClient(clientTransport);
+  const brokerRequests: ProtectedResourceRequest[] = [];
+  const authenticator = new ManagedAuthenticator(
+    client,
+    () => ({
+      agents: [
+        {
+          provider: "copilotcli",
+          displayName: "Copilot",
+          description: "Copilot",
+          models: [],
+          protectedResources: [
+            {
+              resource: "https://api.github.com",
+              resource_name: "GitHub Copilot",
+              authorization_servers: ["https://github.com/login/oauth"],
+              scopes_supported: ["read:user", "user:email"],
+              required: true,
+            },
+          ],
+        },
+      ],
+    }),
+    {
+      resolve: async (request) => {
+        brokerRequests.push(request);
+        return { token: "managed-test-token" };
+      },
+    },
+  );
+  client.connect();
+  try {
+    const authentication = authenticator.authenticateProvider("copilotcli");
+    const frame = await serverTransport.recv();
+    if (frame === null) {
+      assert.fail("AHP client closed before sending authenticate");
+    }
+    const request = decodeFrame(frame);
+    assert.equal(request.method, "authenticate");
+    assert.deepEqual(request.params, {
+      channel: "ahp-root://",
+      resource: "https://api.github.com",
+      token: "managed-test-token",
+      scopes: ["read:user", "user:email"],
+    });
+    await serverTransport.send(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {},
+      }),
+    );
+    assert.equal(await authentication, true);
+    assert.deepEqual(brokerRequests, [
+      {
+        provider: "copilotcli",
+        resource: "https://api.github.com",
+        authorizationServers: ["https://github.com/login/oauth"],
+        scopes: ["read:user", "user:email"],
+      },
+    ]);
+  } finally {
+    await client.shutdown();
+  }
+});
+
+test("managed authentication propagates shutdown cancellation to the broker", async () => {
+  const [clientTransport] = InMemoryTransport.pair();
+  const client = new AhpClient(clientTransport);
+  const controller = new AbortController();
+  let brokerStarted = false;
+  const authenticator = new ManagedAuthenticator(
+    client,
+    () => ({
+      agents: [
+        {
+          provider: "copilotcli",
+          displayName: "Copilot",
+          description: "Copilot",
+          models: [],
+          protectedResources: [
+            {
+              resource: "https://api.github.com",
+              resource_name: "GitHub Copilot",
+              authorization_servers: ["https://github.com/login/oauth"],
+              scopes_supported: ["read:user"],
+              required: true,
+            },
+          ],
+        },
+      ],
+    }),
+    {
+      resolve: async (_request, signal) =>
+        await new Promise((_resolve, reject) => {
+          brokerStarted = true;
+          assert.equal(signal, controller.signal);
+          signal?.addEventListener(
+            "abort",
+            () => reject(new Error("authentication cancelled")),
+            { once: true },
+          );
+        }),
+    },
+    controller.signal,
+  );
+  client.connect();
+  try {
+    const authentication = authenticator.authenticateProvider("copilotcli");
+    await Promise.resolve();
+    assert.equal(brokerStarted, true);
+    controller.abort();
+    await assert.rejects(authentication, /authentication cancelled/u);
+  } finally {
+    await client.shutdown();
+  }
+});
+
+function decodeFrame(frame: TransportFrame): Record<string, unknown> {
+  const value =
+    frame.kind === "parsed"
+      ? frame.message
+      : frame.kind === "text"
+        ? JSON.parse(frame.text)
+        : JSON.parse(new TextDecoder().decode(frame.data));
+  assert.equal(typeof value, "object");
+  assert.notEqual(value, null);
+  assert.equal(Array.isArray(value), false);
+  return value as Record<string, unknown>;
+}
 
 test("managed target workspace URIs preserve path delimiters as data", () => {
   const local = new URL(

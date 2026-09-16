@@ -7,8 +7,8 @@ Remote SSH 目标上创建、绑定和启动新的 Session。
 完整安装、升级、回滚和故障排查见 [部署指南](docs/deployment.md)；协议与安全设计见
 [远程交互设计](docs/qq-copilot-remote-design.md)。
 
-当前 VS Code 1.136 Local Standalone 手机创建的认证、模型选择和首任务失败回滚仍有
-已确认缺口；复现证据与后续实现边界见
+VS Code 1.136 Local Standalone 手机创建会通过状态扩展的显式授权 Broker 完成
+GitHub 认证，并使用 Host 实际发布的模型；原始故障证据与实现边界见
 [Mobile Session Creation Handoff](docs/mobile-session-creation-handoff.md)。
 
 ## 架构
@@ -28,7 +28,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 | `ahp-adapter` | 连接 VS Code Editor Host 或本地/Remote SSH Standalone Host，同时订阅并控制多个 Session/Chat |
 | VS Code Agent Host | 唯一权威会话、工具策略和执行状态 |
 | QQ Bot | 手机端共享对话、审批、澄清回答和取消 |
-| QQ Copilot AHP Status | VS Code 状态栏显示 Gateway、Adapter、绑定和待补发数量 |
+| QQ Copilot AHP Status | VS Code 状态栏显示运行状态，并在用户显式授权后直接向 Adapter 提供内存中的 GitHub token |
 
 旧的 `copilot-qq-hook.exe`、`qq-mcp.exe` 和 QQ Remote Supervisor Agent 仍随安装保留，
 但 AHP 模式会禁用其用户级入口，防止两套链路重复发送或审批。
@@ -37,6 +37,8 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 
 - PC 和 QQ 的用户消息进入同一个 AHP Chat。
 - QQ `/new`、`/new advanced` 可在预授权目标上创建新 Session、自动绑定并提交首条任务。
+- 手机创建使用 Host `AgentInfo.models` 的真实模型选择；首 Turn 立即失败时自动解除绑定、
+  销毁 Session 并恢复原前台。
 - 每个完整 Assistant 响应段形成后立即同步到 QQ；过程段不会在最终回复中重复，不转发隐藏 reasoning。
 - 工具调用只遵循 VS Code Agent Host 原生审批策略。
 - 工具执行前审批和工具结果复核同时显示在 PC 与 QQ。
@@ -76,6 +78,9 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
   Pending 交互保护，新建、切换或定向发送会明确拒绝，而不是强制中断现有任务。
 - Standalone Host 共享 Host 级工具与用户级自定义；无编辑器客户端附着时会明确提示
   editor-client tools 不可用。
+- 受管 Session 认证默认关闭，目前仅支持 GitHub.com Copilot。OAuth token 只在 VS Code
+  状态扩展、Adapter 和 AHP `authenticate` 的内存链路中传递，不进入 QQ、Bridge command、
+  SQLite、TOML 或日志。
 - 同一精确工作区允许多个 Turn 并发，但 Bridge 会发送冲突警告；有写操作的并发任务
   应使用独立 Git worktree，避免文件和 Git 索引互相覆盖。
 - AHP 直接连接针对 VS Code 1.136 的实际协议方言验证。当前 VS Code 1.136 宣告
@@ -243,6 +248,11 @@ QQ 端不能接受或绕过主机身份变化。
 
 ## 从 QQ 创建并绑定新 Session
 
+首次使用前，在 VS Code 命令面板运行
+`QQ Copilot: Enable Managed Session Authentication`，确认授权并完成 GitHub 登录。
+授权默认关闭，可随时运行 `QQ Copilot: Disable Managed Session Authentication` 撤销
+QQ Copilot Broker 使用权；该操作不会删除 VS Code 自己管理的 GitHub 登录。
+
 主流程：
 
 ```text
@@ -262,8 +272,10 @@ QQ 端不能接受或绕过主机身份变化。
   -> 发送首条任务文本
 ```
 
-Quick mode 只使用 Host 默认值；Advanced 只暴露 Host `resolveSessionConfig` 中可安全映射的
-模型与审批模式。若 Host 还要求其他无默认的字段，则 Bridge 会拒绝并要求回到 PC 创建。
+Quick mode 使用 Host 发布的默认模型和 Session 默认值；Advanced 的模型来自认证后刷新
+的 `AgentInfo.models`，审批模式来自 `resolveSessionConfig`。模型必填配置只有在 Host
+提供 JSON primitive 默认值时才会自动携带；若仍需额外 PC 输入，Bridge 会 fail-closed
+并要求回到 PC 创建。
 
 ## 继续查看或切换已有 Session
 

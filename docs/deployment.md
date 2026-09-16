@@ -136,6 +136,25 @@ shared_workspaces = [
 
 安装器会收紧安装目录和配置目录 ACL，并把 Node 与 Adapter 的绝对路径写入配置。
 
+受管 Session 的 GitHub 认证默认关闭。安装并重新加载 VS Code 后，首次从 QQ 使用
+`/new` 前在命令面板运行：
+
+```text
+QQ Copilot: Enable Managed Session Authentication
+```
+
+该命令会显示 modal 授权说明并通过 VS Code GitHub Authentication API 完成登录。
+OAuth token 仅由状态扩展通过受本机 Bridge IPC token 派生 capability 的 named pipe
+直接交给 Adapter，再用于 AHP `authenticate`；token 不经过 QQ、Bridge command、
+SQLite、TOML 或日志。当前 Broker 只接受 GitHub.com API 和 OAuth server，不支持
+GitHub Enterprise。撤销 Broker 使用权时运行：
+
+```text
+QQ Copilot: Disable Managed Session Authentication
+```
+
+撤销不会删除 VS Code 自己管理的 GitHub Authentication Session。
+
 ## 7. 配置 QQ
 
 编辑：
@@ -251,8 +270,15 @@ Host 公钥指纹。指纹变化后必须在电脑端重新注册：
   -> 自动创建 / 绑定 / 首发任务
 ```
 
-`/new advanced` 会在目标之后增加模型和审批模式选择，但只暴露 Host
-`resolveSessionConfig` 中可安全映射、且不需要额外 PC 输入的字段。
+`/new advanced` 会在目标之后增加模型和审批模式选择。模型来自认证后 Host 刷新的
+`AgentInfo.models`，并通过首条 AHP `Message.model` 提交；审批模式来自
+`resolveSessionConfig`。Quick mode 使用 Host 默认模型。无安全默认值的必填模型配置会
+明确拒绝并要求回到 PC 创建。
+
+其他 Session 的 active Turn、排队消息或待交互不会阻止 `/new`；只有 5 个 Binding
+槽位全部受保护时才会拒绝。首条任务 ACK 后 Bridge 会短暂观察对应 Turn：若立即失败或
+取消，会恢复旧前台、解除新 Binding、调用 `dispose_session` 并等待 Catalog removal
+tombstone；长任务一旦 materialize 或观察窗口结束则正常保留。
 
 QQ `/sessions` 的示例输出：
 

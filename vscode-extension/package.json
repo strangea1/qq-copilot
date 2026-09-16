@@ -22,7 +22,9 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:qqCopilot.refreshStatus",
-    "onCommand:qqCopilot.showStatus"
+    "onCommand:qqCopilot.showStatus",
+    "onCommand:qqCopilot.enableManagedSessionAuthentication",
+    "onCommand:qqCopilot.disableManagedSessionAuthentication"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -34,6 +36,14 @@
       {
         "command": "qqCopilot.showStatus",
         "title": "QQ Copilot: Show Status"
+      },
+      {
+        "command": "qqCopilot.enableManagedSessionAuthentication",
+        "title": "QQ Copilot: Enable Managed Session Authentication"
+      },
+      {
+        "command": "qqCopilot.disableManagedSessionAuthentication",
+        "title": "QQ Copilot: Disable Managed Session Authentication"
       }
     ],
     "configuration": {
@@ -57,6 +67,12 @@
           "minimum": 2,
           "maximum": 60,
           "description": "Status refresh interval."
+        },
+        "qqCopilot.managedSessionAuthentication": {
+          "type": "boolean",
+          "scope": "machine",
+          "default": false,
+          "description": "Allow the local AHP Adapter to request an in-memory GitHub authentication token from VS Code for managed Session creation."
         }
       }
     }
@@ -64,7 +80,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/trust-helpers.test.cjs"
+    "test": "npm run build && node --test test/trust-helpers.test.cjs test/auth-broker.test.cjs"
   },
   "devDependencies": {
     "@types/node": "24.12.4",

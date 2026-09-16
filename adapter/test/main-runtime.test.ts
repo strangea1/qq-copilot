@@ -6,6 +6,7 @@ import {
   SessionLifecycle,
   SessionStatus,
   type ChatState,
+  type ModelSelection,
   type SessionState,
   type SessionSummary,
   type URI,
@@ -126,6 +127,12 @@ class FakeSessionBinding implements AhpSessionBinding {
   readonly queueUserTextCalls: Array<{
     readonly text: string;
     readonly clientSeq: number | undefined;
+    readonly model: ModelSelection | undefined;
+  }> = [];
+
+  readonly cancelActiveTurnCalls: Array<{
+    readonly clientSeq: number | undefined;
+    readonly expectedTurnId: string | undefined;
   }> = [];
 
   beforeQueueUserText: (() => Promise<void>) | undefined;
@@ -144,9 +151,10 @@ class FakeSessionBinding implements AhpSessionBinding {
   async queueUserText(
     text: string,
     clientSeq?: number,
+    model?: ModelSelection,
   ): Promise<{ readonly disposition: "queued"; readonly id: string; readonly clientSeq: number }> {
     await this.beforeQueueUserText?.();
-    this.queueUserTextCalls.push({ text, clientSeq });
+    this.queueUserTextCalls.push({ text, clientSeq, model });
     return {
       disposition: "queued",
       id: `message-${this.queueUserTextCalls.length}`,
@@ -156,8 +164,10 @@ class FakeSessionBinding implements AhpSessionBinding {
 
   async cancelActiveTurn(
     clientSeq?: number,
+    expectedTurnId?: string,
   ): Promise<{ readonly turnId: string; readonly clientSeq: number }> {
-    return { turnId: "turn-1", clientSeq: clientSeq ?? 0 };
+    this.cancelActiveTurnCalls.push({ clientSeq, expectedTurnId });
+    return { turnId: expectedTurnId ?? "turn-1", clientSeq: clientSeq ?? 0 };
   }
 
   async reviewToolParameters(): Promise<{ readonly clientSeq: number }> {
@@ -580,10 +590,24 @@ test("runtime routes pending and active bindings by binding id and generation", 
         kind: "send_message",
         data: {
           content: "hello from binding 1",
+          model_selection: {
+            id: "gpt-test",
+            config: {
+              thinking: "medium",
+            },
+          },
         },
       },
       {
         command_id: 3,
+        command_key: "cancel:binding-1",
+        binding_id: first.binding_id,
+        binding_generation: first.generation,
+        kind: "cancel_turn",
+        data: { turn_id: "turn-from-send-ack" },
+      },
+      {
+        command_id: 4,
         command_key: "unbind:binding-1",
         binding_id: first.binding_id,
         binding_generation: first.generation,
@@ -595,7 +619,7 @@ test("runtime routes pending and active bindings by binding id and generation", 
 
   await waitFor(
     () =>
-      requestsFor(bridge, "ahp_ack_command").length === 3 &&
+      requestsFor(bridge, "ahp_ack_command").length === 4 &&
       requestsFor(bridge, "ahp_binding_ready").length === 2,
     "expected all commands to be acked",
   );
@@ -607,12 +631,27 @@ test("runtime routes pending and active bindings by binding id and generation", 
   assert.equal(secondReady.last_server_sequence, 22);
 
   assert.deepEqual(firstBinding.queueUserTextCalls, [
-    { text: "hello from binding 1", clientSeq: 2 },
+    {
+      text: "hello from binding 1",
+      clientSeq: 2,
+      model: {
+        id: "gpt-test",
+        config: {
+          thinking: "medium",
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(firstBinding.cancelActiveTurnCalls, [
+    {
+      clientSeq: 3,
+      expectedTurnId: "turn-from-send-ack",
+    },
   ]);
   assert.deepEqual(secondBinding.queueUserTextCalls, []);
   assert.deepEqual(
     requestsFor(bridge, "ahp_ack_command").map((request) => request.outcome),
-    ["applied", "applied", "applied"],
+    ["applied", "applied", "applied", "applied"],
   );
   assert.ok(
     requestsFor(bridge, "ahp_publish_events").some(

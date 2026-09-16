@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
+  type ModelSelection,
   type SessionSummary,
 } from "@microsoft/agent-host-protocol";
 
@@ -33,12 +34,14 @@ import {
   connectPreparedManagedTarget,
   createManagedSession,
   disposeManagedSession,
+  managedAuthBrokerForConfig,
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
   prepareTargetResult,
   refreshManagedSessions,
   stopManagedTargetProcesses,
   type ConnectedManagedTarget,
+  type ManagedAuthBroker,
   type ManagedTarget,
   type PrepareTargetResult,
 } from "./managed-target.js";
@@ -149,6 +152,9 @@ export interface RuntimeDependencies {
   readonly connectManagedTarget?: typeof connectManagedTarget;
   readonly connectPreparedManagedTarget?: typeof connectPreparedManagedTarget;
   readonly stopManagedTargetProcesses?: typeof stopManagedTargetProcesses;
+  readonly createManagedAuthBroker?: (
+    config: AdapterConfig,
+  ) => ManagedAuthBroker;
 }
 
 interface ManagedEntryState {
@@ -198,6 +204,8 @@ export class AdapterRuntime {
   readonly #adapterInstanceId = randomUUID();
 
   readonly #core: AhpCoreLike;
+
+  readonly #managedAuthBroker: ManagedAuthBroker;
 
   readonly #callbackQueue = new SerialQueue();
 
@@ -278,6 +286,9 @@ export class AdapterRuntime {
     this.#bridge =
       dependencies.createBridgeClient?.(config) ??
       new BridgeClient(config.bridgePipePath, config.bridgeToken);
+    this.#managedAuthBroker =
+      dependencies.createManagedAuthBroker?.(config) ??
+      managedAuthBrokerForConfig(config);
     const coreOptions: AhpCoreOptions = {
       userDataDirectory: config.userDataDirectory,
       clientId: config.adapterId,
@@ -572,14 +583,22 @@ export class AdapterRuntime {
           result = await this.#requireBinding(command).binding.queueUserText(
             content,
             command.command_id,
+            requireModelSelection(data.model_selection),
           );
           break;
         }
-        case "cancel_turn":
+        case "cancel_turn": {
+          const data = requireRecord(command.data);
+          const expectedTurnId =
+            data.turn_id === undefined
+              ? undefined
+              : requireString(data.turn_id, "turn_id");
           await this.#requireBinding(command).binding.cancelActiveTurn(
             command.command_id,
+            expectedTurnId,
           );
           break;
+        }
         case "approve_tool": {
           const data = requireRecord(command.data);
           await this.#requireBinding(command).binding.reviewToolParameters(
@@ -1436,6 +1455,7 @@ export class AdapterRuntime {
           this.#config,
           target,
           onProgress,
+          this.#managedAuthBroker,
         );
         return this.#wrapManagedConnection(connection, release);
       } catch (error) {
@@ -1461,6 +1481,7 @@ export class AdapterRuntime {
               workspaceUri: managedTargetWorkspaceUri(target),
             },
         onProgress,
+        this.#managedAuthBroker,
       );
     } catch (error) {
       this.#releaseManagedOperation(key, retained.prepared);
@@ -2668,6 +2689,34 @@ function requireInteger(value: unknown, name: string): number {
     );
   }
   return value;
+}
+
+function requireModelSelection(value: unknown): ModelSelection | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const record = requireRecord(value, "model_selection");
+  const id = requireString(record.id, "model_selection.id");
+  if (record.config === undefined) {
+    return { id };
+  }
+  const source = requireRecord(record.config, "model_selection.config");
+  const config: Record<string, string | number | boolean | null> = {};
+  for (const [key, item] of Object.entries(source)) {
+    if (
+      item !== null &&
+      typeof item !== "string" &&
+      typeof item !== "number" &&
+      typeof item !== "boolean"
+    ) {
+      throw new AhpOperationError(
+        "invalid-command",
+        `model_selection.config.${key} must be a JSON primitive`,
+      );
+    }
+    config[key] = item;
+  }
+  return { id, config };
 }
 
 function errorCode(error: unknown): string {

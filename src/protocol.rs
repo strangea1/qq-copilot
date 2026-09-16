@@ -240,6 +240,12 @@ pub struct AhpSupportedSessionField {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpSupportedModelSelection {
+    pub options: Vec<AhpSessionConfigOption>,
+    pub selected: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpPrepareTargetCommand {
     pub target: AhpManagedTarget,
     pub advanced: bool,
@@ -259,7 +265,7 @@ pub struct AhpPrepareTargetResult {
     pub editor_client_tools_available: bool,
     pub resolved_values: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<AhpSupportedSessionField>,
+    pub model: Option<AhpSupportedModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<AhpSupportedSessionField>,
 }
@@ -282,6 +288,12 @@ pub struct AhpCreateSessionResult {
     pub host_label: String,
     pub editor_client_tools_available: bool,
     pub session: AhpSessionDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpSendMessageResult {
+    pub disposition: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
