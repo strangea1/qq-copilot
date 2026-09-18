@@ -94,6 +94,8 @@ pub struct AhpConfig {
     pub shared_workspaces: Vec<PathBuf>,
     #[serde(default)]
     pub authorized_targets: Vec<AhpAuthorizedTarget>,
+    #[serde(default = "default_ahp_session_list_limit")]
+    pub session_list_limit: usize,
     #[serde(default = "default_ahp_event_retention_days")]
     pub event_retention_days: u32,
     #[serde(default = "default_ahp_command_lease_seconds")]
@@ -179,6 +181,7 @@ impl Default for AhpConfig {
             enabled: false,
             shared_workspaces: Vec::new(),
             authorized_targets: Vec::new(),
+            session_list_limit: default_ahp_session_list_limit(),
             event_retention_days: default_ahp_event_retention_days(),
             command_lease_seconds: default_ahp_command_lease_seconds(),
             poll_seconds: default_ahp_poll_seconds(),
@@ -504,6 +507,9 @@ impl AppConfig {
         {
             bail!("message length limits are invalid");
         }
+        if !(1..=100).contains(&self.ahp.session_list_limit) {
+            bail!("ahp.session_list_limit must be between 1 and 100");
+        }
         if self.qq.intents & (1_u64 << 25) == 0 {
             bail!("qq.intents must include GROUP_AND_C2C_EVENT (1 << 25)");
         }
@@ -812,6 +818,10 @@ fn default_ahp_event_retention_days() -> u32 {
     30
 }
 
+fn default_ahp_session_list_limit() -> usize {
+    10
+}
+
 fn deserialize_path_or_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<PathBuf>, D::Error>
 where
     D: Deserializer<'de>,
@@ -927,6 +937,39 @@ mod tests {
     use rand::{RngCore, rngs::OsRng};
 
     use super::*;
+
+    #[test]
+    fn qq_session_menu_limit_defaults_validates_and_persists() {
+        let defaults: AhpConfig = toml::from_str("").expect("legacy AHP config");
+        assert_eq!(defaults.session_list_limit, 10);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        let mut config =
+            AppConfig::write_new(&path, vec![directory.path().to_path_buf()]).expect("config");
+        for limit in [0, 101] {
+            config.ahp.session_list_limit = limit;
+            assert!(
+                config
+                    .validate()
+                    .expect_err("invalid limit")
+                    .to_string()
+                    .contains("ahp.session_list_limit")
+            );
+        }
+        for limit in [1, 10, 100] {
+            config.ahp.session_list_limit = limit;
+            config.validate().expect("valid limit");
+        }
+        config.ahp.session_list_limit = 7;
+        config.save(&path).expect("save config");
+        assert_eq!(
+            AppConfig::load(&path)
+                .expect("reload")
+                .ahp
+                .session_list_limit,
+            7
+        );
+    }
 
     #[test]
     fn generated_config_has_strong_local_token() {

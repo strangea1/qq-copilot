@@ -43,9 +43,10 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - PC 或 QQ 首个有效审批/回答生效；QQ 提交后的 Host 确认不重复提示，PC 端处理仍通知 QQ。
 - Agent 运行中收到的新消息通过 AHP queued message 串行执行。
 - PC 或 QQ 均可取消当前 Turn。
-- `/sessions` 同时列出所有预授权目标的前台、后台和未监控 Session，并标注完整目录、
-  `local` / `ssh:<alias>` 与在线/离线缓存状态；`/switch` 只改变 QQ 普通消息的前台路由，
-  不会停止其他 Session。
+- `/sessions` 和 `/switch` 共用最近候选列表，默认按 LRU 保留 10 个；前台、运行中、
+  排队或待处理会话始终保留。列表分行显示标题、状态、完整目录、`local` / `ssh:<alias>`、
+  在线/离线缓存和最近使用时间。精简只影响 QQ 展示，不删除历史或停止监控；
+  `/switch` 只改变 QQ 普通消息的前台路由，不会停止其他 Session。
 - `/send <编号> <文本>` 可在不改变前台的情况下定向发送；`/cancel <编号>` 可取消
   指定后台 Turn；`/detach <编号>` 可安全停止监控空闲后台 Session。
 - Bridge 自动监控最近活跃的 5 个 Session。LRU 只淘汰非前台且无活动 Turn、排队消息、
@@ -267,8 +268,19 @@ Bridge 在 Adapter 命令轮询时检查配置变化，仅接受授权目标与�
 先在电脑端创建并登录 Session，再从 QQ 使用 `/sessions` 和 `/switch <编号>`。
 `/new`（包括 advanced）已移除；旧命令和创建按钮会被拒绝，不会作为任务发送到前台。
 
-`/sessions` 会列出所有预授权目标内的 Session，并标明所在 `local` 或 `ssh:<alias>`、完整
-路径以及在线/离线缓存状态。对缓存的远端 Session，`/switch` / `/switch <编号>` 会先自动
+`/sessions` 和 `/switch` 每次都从全部预授权目标中选取同一批最近候选，默认保留 10 个。
+LRU 同时考虑 PC 端的 Session 修改时间，以及 QQ 切换、发消息、取消和处理交互等实际
+使用记录；浏览列表、自动发现和重连快照不会刷新使用顺序，记录跨重启保存。
+前台、运行中、排队、待执行命令、审批或澄清会话始终保留，其余按最近使用补足到 10 个；
+受保护会话本身超过 10 个时全部保留。前台置顶，其余按最近使用排序。
+
+较旧会话仅从 QQ 候选列表收起，不删除 Agent Host Session、聊天历史、稳定短码或 Binding。
+仍可通过 `/switch <原编号>`、`/send <原编号> <文本>` 使用，或在 PC 上继续该会话，之后会
+重新进入最近候选。电脑端 `qq-bridge ahp-sessions` 仍返回完整目录。
+
+候选数量可通过 `[ahp]` 中的 `session_list_limit = 10` 配置（1–100）；修改此项需要在空闲时
+重启 Bridge/Adapter，不属于授权目标追加热更新。10 个候选和 5 个监控槽位是不同的限制。
+列表保留完整路径、主机和在线/离线缓存状态。对缓存的远端 Session，切换时会先自动
 重连、刷新并校验精确目标，再执行切换。
 
 Adapter 会在后台连接所有已注册的 SSH 目标并持续订阅 Host Session 目录，因此电脑端创建的
@@ -293,8 +305,8 @@ qq-bridge ahp-bind --endpoint <endpoint-id> --session <session-uri>
 QQ 语音                  使用内置 ASR 发送到前台 Session
 /ask <文本>              即使 Agent 正等待澄清，也排队为新消息
 /send <编号> <文本>      定向发送到指定 Session，不改变前台
-/sessions                列出前台、后台和未监控 Session
-/switch                  显示全部 Session 的前台切换按钮
+/sessions                显示最近候选，保留前台、活动和待处理 Session
+/switch                  显示同一批候选的“编号 + 标题”切换按钮
 /switch <编号>           切换 QQ 前台；其他 Session 继续运行
 /detach <编号>           安全停止监控空闲后台 Session
 /allow <审批码>          单次批准
@@ -320,6 +332,7 @@ Bridge 不下载或长期保存语音文件。
 目录变化会 fail-closed。前台切换本身不要求当前或目标 Session 空闲；如果目标尚未被
 监控，Bridge 会先安全分配 Binding。只有 5 个槽位全部受保护时才拒绝加入。
 单个 Keyboard 最多 25 个 Session；最多使用 4 条被动回复展示 100 个 Session。
+受保护候选超过这一 QQ 按钮上限时会明确提示使用原编号切换，不会为满足限制删除会话或中断任务。
 
 Assistant 过程段、审批、澄清和最终回复均带 `[短码 · 标题]` 来源标签。通知不会自动抢占
 QQ 前台；仅当来源不是当前 QQ 前台 Session 时，审批、澄清和最终回复才附加独立的

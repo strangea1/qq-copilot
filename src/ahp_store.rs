@@ -42,6 +42,15 @@ pub struct AhpStatus {
     pub pending_projections: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct AhpSessionMenuCandidate {
+    pub session: AhpSessionDescriptor,
+    pub last_used_at: i64,
+    pub pending_commands: bool,
+    pub pending_approvals: bool,
+    pub pending_inputs: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AhpRegisterResult {
     pub bindings: Vec<AhpBindingRecord>,
@@ -248,6 +257,7 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
                 editor_client_tools_available INTEGER
                     NOT NULL DEFAULT 1 CHECK (editor_client_tools_available IN (0, 1)),
                 available INTEGER NOT NULL DEFAULT 1 CHECK (available IN (0, 1)),
+                qq_last_used_at INTEGER NOT NULL DEFAULT 0,
                 last_seen_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ahp_sessions_endpoint
@@ -538,6 +548,12 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
         "ahp_session_catalog",
         "short_code",
         "ALTER TABLE ahp_session_catalog ADD COLUMN short_code TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "ahp_session_catalog",
+        "qq_last_used_at",
+        "ALTER TABLE ahp_session_catalog ADD COLUMN qq_last_used_at INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
         connection,
@@ -1228,6 +1244,43 @@ impl Database {
             .context("failed to query AHP Session code")
     }
 
+    pub fn ahp_session_menu_candidates(&self) -> Result<Vec<AhpSessionMenuCandidate>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT s.endpoint_id, s.host_instance_id, s.session_uri, s.provider, s.title,
+                    s.status, s.workspace_uris_json, s.created_at, s.modified_at, s.short_code,
+                    s.host_label, s.ssh_alias, s.target_kind, s.target_path,
+                    s.editor_client_tools_available, NULL, NULL, s.qq_last_used_at,
+                    EXISTS (
+                        SELECT 1 FROM ahp_commands c
+                        JOIN ahp_bindings b ON b.binding_id = c.binding_id
+                        WHERE b.session_uri = s.session_uri AND c.state IN ('pending', 'leased')
+                    ),
+                    EXISTS (
+                        SELECT 1 FROM ahp_approvals a
+                        WHERE a.session_uri = s.session_uri AND a.state IN ('pending', 'submitted')
+                    ),
+                    EXISTS (
+                        SELECT 1 FROM ahp_inputs i
+                        WHERE i.session_uri = s.session_uri AND i.state IN ('pending', 'submitted')
+                    )
+             FROM ahp_session_catalog s
+             WHERE s.available = 1 OR s.target_kind IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(AhpSessionMenuCandidate {
+                    session: map_session_descriptor(row)?,
+                    last_used_at: row.get(17)?,
+                    pending_commands: row.get(18)?,
+                    pending_approvals: row.get(19)?,
+                    pending_inputs: row.get(20)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query QQ Session menu candidates")
+    }
+
     pub fn ahp_session_by_uri(&self, session_uri: &str) -> Result<Option<AhpSessionDescriptor>> {
         let connection = self.connection()?;
         session_by_uri(&connection, session_uri)
@@ -1491,7 +1544,6 @@ impl Database {
             endpoint_id,
             session_uri,
             MAX_TRACKED_AHP_SESSIONS,
-            false,
             now,
         )?;
         ensure_foreground_binding(&transaction, &binding.binding_id, now)?;
@@ -1728,6 +1780,22 @@ impl Database {
                     )?;
                 }
                 _ => {}
+            }
+            if changed == 1
+                && event.data.get("historical").and_then(Value::as_bool) != Some(true)
+                && matches!(
+                    event.kind,
+                    crate::protocol::AhpEventKind::TurnStarted
+                        | crate::protocol::AhpEventKind::TurnCompleted
+                        | crate::protocol::AhpEventKind::TurnCancelled
+                        | crate::protocol::AhpEventKind::TurnFailed
+                )
+            {
+                touch_session_usage(
+                    &transaction,
+                    &event.session_uri,
+                    chrono::Utc::now().timestamp_millis(),
+                )?;
             }
         }
         if let Some(sequence) = events
@@ -3149,6 +3217,32 @@ fn touch_binding(connection: &Connection, binding_id: &str, now: i64) -> Result<
     if changed != 1 {
         bail!("AHP binding disappeared while updating activity");
     }
+    let session_uri: String = connection.query_row(
+        "SELECT session_uri FROM ahp_bindings WHERE binding_id = ?1",
+        [binding_id],
+        |row| row.get(0),
+    )?;
+    touch_session_usage(
+        connection,
+        &session_uri,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    Ok(())
+}
+
+fn touch_session_usage(connection: &Connection, session_uri: &str, used_at: i64) -> Result<()> {
+    // Keep explicit uses ordered even when several arrive in the same clock tick.
+    let changed = connection.execute(
+        "UPDATE ahp_session_catalog
+         SET qq_last_used_at = MAX(
+             ?1, (SELECT COALESCE(MAX(qq_last_used_at), 0) + 1 FROM ahp_session_catalog)
+         )
+         WHERE session_uri = ?2",
+        params![used_at, session_uri],
+    )?;
+    if changed != 1 {
+        bail!("AHP Session disappeared while updating QQ usage");
+    }
     Ok(())
 }
 
@@ -3588,14 +3682,8 @@ fn focus_session_transaction(
     max_bindings: usize,
     now: i64,
 ) -> Result<AhpBindingRecord> {
-    let binding = ensure_session_binding(
-        connection,
-        endpoint_id,
-        session_uri,
-        max_bindings,
-        true,
-        now,
-    )?;
+    let binding = ensure_session_binding(connection, endpoint_id, session_uri, max_bindings, now)?;
+    touch_binding(connection, &binding.binding_id, now)?;
     connection.execute(
         "INSERT INTO ahp_foreground_binding(singleton, binding_id, updated_at)
          VALUES (1, ?1, ?2)
@@ -3611,7 +3699,6 @@ fn ensure_session_binding(
     endpoint_id: &str,
     session_uri: &str,
     max_bindings: usize,
-    touch_existing: bool,
     now: i64,
 ) -> Result<AhpBindingRecord> {
     let disposal_exists: i64 = connection.query_row(
@@ -3656,9 +3743,6 @@ fn ensure_session_binding(
             && existing.host_instance_id.as_deref() == Some(host_instance_id.as_str())
             && matches!(existing.state.as_str(), "binding" | "bound")
         {
-            if touch_existing {
-                touch_binding(connection, &existing.binding_id, now)?;
-            }
             return binding_by_id(connection, &existing.binding_id)?
                 .context("tracked AHP binding disappeared");
         }
@@ -5735,6 +5819,208 @@ mod tests {
                 .to_string(),
             "AHP Session has already been queued for disposal"
         );
+    }
+
+    #[test]
+    fn qq_session_menu_usage_survives_refresh_tracking_and_restart() {
+        let (_directory, database, first) = bound_database();
+        let original_usage = menu_last_used_at(&database, &first.session_uri);
+        let sessions = [session("host-1"), numbered_session(2, 1)];
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &sessions,
+            )
+            .expect("catalogue");
+        let second = database
+            .ahp_track_session("endpoint-1", &sessions[1].session_uri)
+            .expect("automatic tracking");
+        acknowledge_and_ready_binding(&database, &second, "ahp-chat://default/second");
+        for _ in 0..2 {
+            database.ahp_session_menu_candidates().expect("menu");
+            database
+                .ahp_replace_catalog(
+                    "adapter-stable",
+                    "adapter-run-1",
+                    &[host("host-1")],
+                    &sessions,
+                )
+                .expect("refresh");
+            database
+                .ahp_track_session("endpoint-1", &second.session_uri)
+                .expect("retain automatic tracking");
+        }
+        assert_eq!(
+            menu_last_used_at(&database, &first.session_uri),
+            original_usage
+        );
+        assert_eq!(menu_last_used_at(&database, &second.session_uri), 0);
+
+        database
+            .ahp_bind_session("endpoint-1", &second.session_uri)
+            .expect("explicit switch");
+        let switched_at = menu_last_used_at(&database, &second.session_uri);
+        assert!(switched_at > original_usage);
+        database
+            .ahp_enqueue_message_to_session("menu-message", &second.session_uri, "continue")
+            .expect("explicit message");
+        assert!(menu_last_used_at(&database, &second.session_uri) > switched_at);
+
+        let connection = database.connection().expect("connection");
+        touch_session_usage(&connection, &first.session_uri, 42).expect("first use");
+        touch_session_usage(&connection, &second.session_uri, 42).expect("second use");
+        touch_session_usage(&connection, &first.session_uri, 42).expect("reuse first");
+        let path = std::path::PathBuf::from(connection.path().expect("database path"));
+        drop(connection);
+        let first_usage = menu_last_used_at(&database, &first.session_uri);
+        let second_usage = menu_last_used_at(&database, &second.session_uri);
+        assert!(
+            first_usage > second_usage,
+            "same-tick uses must retain LRU order"
+        );
+        let code = database
+            .ahp_session_by_uri(&first.session_uri)
+            .expect("session")
+            .expect("exists")
+            .short_code;
+        drop(database);
+
+        let reopened = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            menu_last_used_at(&reopened, &first.session_uri),
+            first_usage
+        );
+        assert_eq!(
+            menu_last_used_at(&reopened, &second.session_uri),
+            second_usage
+        );
+        assert_eq!(
+            reopened.ahp_list_sessions().expect("full catalogue").len(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .ahp_session_by_uri(&first.session_uri)
+                .expect("session")
+                .expect("exists")
+                .short_code,
+            code
+        );
+    }
+
+    #[test]
+    fn qq_session_menu_usage_ignores_snapshots_history_and_duplicate_events() {
+        let (_directory, database, binding) = bound_database();
+        let original = menu_last_used_at(&database, &binding.session_uri);
+        let mut event = AhpPublishedEvent {
+            event_id: "menu-snapshot".to_owned(),
+            host_instance_id: "host-1".to_owned(),
+            server_sequence: Some(11),
+            session_uri: binding.session_uri.clone(),
+            chat_uri: binding.chat_uri.clone(),
+            turn_id: None,
+            kind: crate::protocol::AhpEventKind::ChatSnapshot,
+            origin_client_id: None,
+            occurred_at: "2026-09-18T00:00:00Z".to_owned(),
+            data: json!({"active_turn_id": null, "queued_message_count": 0}),
+        };
+        let publish = |event: &AhpPublishedEvent| {
+            database
+                .ahp_publish_events(
+                    "adapter-stable",
+                    "adapter-run-1",
+                    &binding.binding_id,
+                    binding.generation,
+                    std::slice::from_ref(event),
+                )
+                .expect("publish event");
+        };
+        publish(&event);
+        assert_eq!(menu_last_used_at(&database, &binding.session_uri), original);
+        event.event_id = "menu-history".to_owned();
+        event.kind = crate::protocol::AhpEventKind::TurnCompleted;
+        event.data = json!({"historical": true});
+        publish(&event);
+        assert_eq!(menu_last_used_at(&database, &binding.session_uri), original);
+        event.event_id = "menu-live".to_owned();
+        event.kind = crate::protocol::AhpEventKind::TurnStarted;
+        event.turn_id = Some("menu-turn".to_owned());
+        event.data = json!({});
+        publish(&event);
+        let live_usage = menu_last_used_at(&database, &binding.session_uri);
+        assert!(live_usage > original);
+        publish(&event);
+        assert_eq!(
+            menu_last_used_at(&database, &binding.session_uri),
+            live_usage
+        );
+    }
+
+    #[test]
+    fn qq_session_menu_queries_pending_work_and_migrates_legacy_catalogues() {
+        let (_directory, database, binding) = bound_database();
+        let connection = database.connection().expect("connection");
+        connection
+            .execute(
+                "ALTER TABLE ahp_session_catalog DROP COLUMN qq_last_used_at",
+                [],
+            )
+            .expect("legacy catalogue");
+        migrate_ahp_schema(&connection).expect("migrate");
+        migrate_ahp_schema(&connection).expect("idempotent migration");
+        drop(connection);
+        assert_eq!(menu_last_used_at(&database, &binding.session_uri), 0);
+        let before = database.ahp_session_menu_candidates().expect("candidates");
+        assert!(
+            !before[0].pending_commands
+                && !before[0].pending_approvals
+                && !before[0].pending_inputs
+        );
+
+        database
+            .ahp_begin_approval(&NewAhpApproval {
+                approval_key: "menu-approval".to_owned(),
+                stage: "parameter".to_owned(),
+                session_uri: binding.session_uri.clone(),
+                chat_uri: binding.chat_uri.clone().expect("chat"),
+                turn_id: "menu-turn".to_owned(),
+                tool_call_id: "menu-tool".to_owned(),
+                tool_name: "powershell".to_owned(),
+                summary: "approval".to_owned(),
+                expires_at: now() + 600,
+            })
+            .expect("pending approval");
+        database
+            .ahp_begin_input(&NewAhpInput {
+                input_key: "menu-input".to_owned(),
+                session_uri: binding.session_uri.clone(),
+                chat_uri: binding.chat_uri.clone().expect("chat"),
+                request_id: "menu-request".to_owned(),
+                prompt: "input".to_owned(),
+                choices: Vec::new(),
+                allow_freeform: true,
+                selection_mode: "none".to_owned(),
+                expires_at: now() + 600,
+            })
+            .expect("pending input");
+        database
+            .ahp_enqueue_message("menu-pending", "continue")
+            .expect("pending command");
+        let after = database.ahp_session_menu_candidates().expect("candidates");
+        assert!(after[0].pending_commands && after[0].pending_approvals && after[0].pending_inputs);
+        assert!(after[0].last_used_at > 0);
+    }
+
+    fn menu_last_used_at(database: &Database, session_uri: &str) -> i64 {
+        database
+            .ahp_session_menu_candidates()
+            .expect("menu candidates")
+            .into_iter()
+            .find(|candidate| candidate.session.session_uri == session_uri)
+            .expect("Session remains in catalogue")
+            .last_used_at
     }
 
     fn bound_database() -> (tempfile::TempDir, Database, AhpBindingRecord) {

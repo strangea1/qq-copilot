@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     ahp_store::{
-        AhpApprovalRecord, AhpInputRecord, AhpProjectionRecord, AhpStatus,
+        AhpApprovalRecord, AhpInputRecord, AhpProjectionRecord, AhpSessionMenuCandidate, AhpStatus,
         MAX_TRACKED_AHP_SESSIONS, NewAhpApproval, NewAhpInput,
     },
     config::{AhpAuthorizedTarget, AhpToolNotificationMode, AppConfig},
@@ -49,6 +49,25 @@ const AHP_NEW_REMOVED_MESSAGE: &str = "QQ 已移除 /new 和 /new advanced。请
 enum InboundMessage<'a> {
     Text(&'a str),
     Voice(Option<&'a str>),
+}
+
+struct AhpSessionMenuEntry {
+    session: AhpSessionDescriptor,
+    last_used_at: i64,
+    foreground: bool,
+    protected: bool,
+    state: String,
+    workspace: String,
+    host_label: String,
+    host_status: String,
+}
+
+struct AhpSessionMenu {
+    entries: Vec<AhpSessionMenuEntry>,
+    total_count: usize,
+    protected_count: usize,
+    tracked_count: usize,
+    limit: usize,
 }
 
 pub struct BridgeService {
@@ -1692,15 +1711,7 @@ impl BridgeService {
             "/sessions" if argument.is_empty() && remainder.is_empty() => {
                 self.database
                     .mark_inbound_kind(message_id, "ahp_sessions")?;
-                let status = self
-                    .database
-                    .ahp_status(self.config().ahp.adapter_stale_seconds)?;
-                Ok(Some(format_ahp_sessions(
-                    &self.config(),
-                    &status.bindings,
-                    &status.hosts,
-                    &status.sessions,
-                )))
+                Ok(Some(format_ahp_sessions(&self.ahp_session_menu()?)))
             }
             "/new" => {
                 self.database
@@ -2922,29 +2933,32 @@ impl BridgeService {
         }
     }
 
+    fn ahp_session_menu(&self) -> Result<AhpSessionMenu> {
+        let config = self.config();
+        let status = self.database.ahp_status(config.ahp.adapter_stale_seconds)?;
+        Ok(select_ahp_session_menu(
+            &config,
+            &status.bindings,
+            &status.hosts,
+            self.database.ahp_session_menu_candidates()?,
+        ))
+    }
+
     async fn send_ahp_session_switch_menu(&self, message_id: &str) -> Result<Option<String>> {
-        let status = self
-            .database
-            .ahp_status(self.config().ahp.adapter_stale_seconds)?;
-        let bindings = status.bindings.clone();
-        let hosts = status.hosts.clone();
-        let sessions: Vec<_> = status
-            .sessions
-            .into_iter()
-            .filter(|session| ahp_session_matches_workspace(&self.config(), session))
-            .collect();
-        if sessions.is_empty() {
+        let menu = self.ahp_session_menu()?;
+        if menu.entries.is_empty() {
             return Ok(Some("目标目录中没有可展示的 AHP Session。".to_owned()));
         }
-        if sessions.len() > 100 {
+        if menu.entries.len() > 100 {
             return Ok(Some(
-                "目标目录中超过 100 个 Session，QQ 单条命令最多被动回复 4 次，无法安全展示全部按钮；请先归档旧 Session。"
+                "受保护的 Session 超过 QQ 单条命令的 100 个按钮上限，不能隐藏活动会话。请等待部分任务结束，或使用 /switch <编号> 直接切换；不会停止任务或删除历史。"
                     .to_owned(),
             ));
         }
-        let session_uris: Vec<_> = sessions
+        let session_uris: Vec<_> = menu
+            .entries
             .iter()
-            .map(|session| session.session_uri.clone())
+            .map(|entry| entry.session.session_uri.clone())
             .collect();
         let buttons = self.database.ahp_create_session_switch_buttons(
             &session_uris,
@@ -2967,67 +2981,41 @@ impl BridgeService {
                 self.wait_for_existing_delivery(delivery).await?;
                 continue;
             }
-            let session_lines = page
+            let first_entry = page_index * 25;
+            let entries = &menu.entries[first_entry..first_entry + page.len()];
+            let session_lines = entries
                 .iter()
-                .map(|button| {
-                    let binding = bindings
-                        .iter()
-                        .find(|binding| binding.session_uri == button.session.session_uri);
-                    let current = binding.is_some_and(|binding| binding.foreground);
-                    let state = if current {
-                        "前台"
-                    } else if let Some(binding) = binding {
-                        if binding.active_turn_id.is_some() {
-                            "后台运行中"
-                        } else {
-                            "后台"
-                        }
-                    } else if ahp_session_is_idle(&button.session) {
-                        "空闲"
-                    } else {
-                        "忙碌·未监控"
-                    };
-                    let workspace = ahp_session_target_display(&self.config(), &button.session)
-                        .expect("filtered target workspace");
-                    let host_label = button
-                        .session
-                        .host_label
-                        .clone()
-                        .unwrap_or_else(|| infer_session_host_label(&button.session));
-                    let host_status = describe_session_host_status(&button.session, &hosts);
-                    format!(
-                        "{} `{}` {} · {} · {} · {}",
-                        state,
-                        escape_qq_markdown(
-                            button.session.short_code.as_deref().unwrap_or("[unknown]")
-                        ),
-                        escape_qq_markdown(&button.session.title),
-                        escape_qq_markdown(&workspace),
-                        escape_qq_markdown(&host_label),
-                        host_status
-                    )
-                })
+                .enumerate()
+                .map(|(index, entry)| format_ahp_session_entry(entry, first_entry + index, true))
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join("\n\n");
             let choices = page
                 .iter()
                 .map(|button| ChoiceButton {
-                    label: button
-                        .session
-                        .short_code
-                        .clone()
-                        .unwrap_or_else(|| "Session".to_owned()),
+                    label: format!(
+                        "{} {}",
+                        button.session.short_code.as_deref().unwrap_or("Session"),
+                        session_menu_text(&button.session.title)
+                            .chars()
+                            .take(4)
+                            .collect::<String>()
+                    ),
                     button_data: button.button_data.clone(),
                 })
                 .collect();
+            let page_label = if page_count > 1 {
+                format!("（{}/{page_count}）", page_index + 1)
+            } else {
+                String::new()
+            };
             let receipt = self
                 .qq
                 .send_choice_buttons(
                     &owner.user_openid,
                     &ChoiceButtons {
                         markdown: format!(
-                            "## 切换前台 AHP Session（{}/{page_count}）\n{session_lines}\n\n切换不会停止其他后台任务；按钮有效期 {} 秒。",
-                            page_index + 1,
+                            "## 切换会话{page_label}\n\n{}\n\n{session_lines}\n\n点击下方“编号 + 标题”按钮，或发送 `/switch <编号>`。  \n切换不会停止其他任务；按钮有效期 {} 秒。",
+                            format_ahp_session_menu_summary(&menu).replace('\n', "  \n"),
                             self.config().bridge.question_ttl_seconds
                         ),
                         button_id_prefix: "session".to_owned(),
@@ -3902,8 +3890,8 @@ QQ 语音：使用内置 ASR；不会执行控制命令
 
 【Session】
 在 PC 上创建 Session、登录并选择模型，再从 QQ 选择已有 Session
-/sessions：列出前台、后台和未监控 Session
-/switch：显示前台切换按钮
+/sessions：按最近使用显示候选 Session，前台和活动会话始终保留
+/switch：显示同一批候选的前台切换按钮
 /switch <编号>：切换前台，其他任务继续后台运行
 /detach <编号>：安全停止后台监控
 /cancel：取消前台 Session 的当前 Turn
@@ -3952,66 +3940,218 @@ fn notification_mode_description(mode: AhpToolNotificationMode) -> &'static str 
     }
 }
 
-fn format_ahp_sessions(
+fn select_ahp_session_menu(
     config: &AppConfig,
     bindings: &[crate::protocol::AhpBindingRecord],
     hosts: &[AhpHostDescriptor],
-    sessions: &[AhpSessionDescriptor],
-) -> String {
-    let visible: Vec<_> = sessions
-        .iter()
-        .filter(|session| ahp_session_matches_workspace(config, session))
-        .collect();
-    if visible.is_empty() {
-        return "目标目录中没有可绑定的 AHP Session。".to_owned();
-    }
-    let lines = visible
+    candidates: Vec<AhpSessionMenuCandidate>,
+) -> AhpSessionMenu {
+    const IN_PROGRESS: u32 = 1 << 3;
+    const INPUT_NEEDED: u32 = 1 << 4;
+    let mut entries: Vec<_> = candidates
         .into_iter()
-        .map(|session| {
+        .filter_map(|candidate| {
+            let session = candidate.session;
+            let workspace = ahp_session_target_display(config, &session)?;
             let binding = bindings
                 .iter()
                 .find(|binding| binding.session_uri == session.session_uri);
-            let current = binding.is_some_and(|binding| binding.foreground);
-            let state = if let Some(binding) = binding {
-                if current {
-                    if binding.active_turn_id.is_some() {
-                        "前台 · 运行中"
-                    } else {
-                        "前台"
-                    }
-                } else if binding.active_turn_id.is_some() {
-                    "后台 · 运行中"
-                } else {
-                    "后台"
-                }
-            } else if ahp_session_is_idle(session) {
-                "未监控 · 空闲"
+            let foreground = binding.is_some_and(|binding| binding.foreground);
+            let active = session.status & IN_PROGRESS != 0
+                || binding.is_some_and(|binding| binding.active_turn_id.is_some());
+            let queued = binding.map_or(0, |binding| binding.queued_message_count);
+            let waiting_input = candidate.pending_inputs || session.status & INPUT_NEEDED != 0;
+            let protected = foreground
+                || active
+                || queued != 0
+                || candidate.pending_commands
+                || candidate.pending_approvals
+                || waiting_input
+                || binding.is_some_and(|binding| binding.state == "binding");
+            let role = if foreground {
+                "前台"
+            } else if binding.is_some() {
+                "后台"
             } else {
-                "未监控 · 忙碌"
+                "未监控"
             };
-            let workspace =
-                ahp_session_target_display(config, session).expect("filtered target workspace");
-            let host_status = describe_session_host_status(session, hosts);
-            let host_label = session
-                .host_label
-                .clone()
-                .unwrap_or_else(|| infer_session_host_label(session));
-            format!(
-                "{} {} | {} | {} | {} | {} | {}",
-                if current { "*" } else { " " },
-                session.short_code.as_deref().unwrap_or("[unknown]"),
-                session.title,
+            let activity = if candidate.pending_approvals {
+                "待审批"
+            } else if waiting_input {
+                "待回答/确认"
+            } else if active {
+                if binding.is_some() {
+                    "运行中"
+                } else {
+                    "忙碌"
+                }
+            } else if binding.is_some_and(|binding| binding.state == "binding") {
+                "连接中"
+            } else if binding.is_some_and(|binding| binding.state != "bound") {
+                "待恢复"
+            } else if session.status & 2 != 0 {
+                "失败"
+            } else if ahp_session_is_idle(&session) {
+                "空闲"
+            } else {
+                "状态未知"
+            };
+            let mut state = format!("{role} · {activity}");
+            if queued != 0 {
+                state.push_str(&format!(" · 排队 {queued} 条"));
+            }
+            if candidate.pending_commands {
+                state.push_str(" · 命令待处理");
+            }
+            Some(AhpSessionMenuEntry {
+                last_used_at: candidate.last_used_at.max(session_modified_at(&session)),
+                foreground,
+                protected,
+                state,
                 workspace,
-                host_label,
-                host_status,
-                state
-            )
+                host_label: session
+                    .host_label
+                    .clone()
+                    .unwrap_or_else(|| infer_session_host_label(&session)),
+                host_status: describe_session_host_status(&session, hosts),
+                session,
+            })
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    entries.sort_by(|left, right| {
+        right
+            .last_used_at
+            .cmp(&left.last_used_at)
+            .then_with(|| left.session.session_uri.cmp(&right.session.session_uri))
+    });
+    let total_count = entries.len();
+    let protected_count = entries.iter().filter(|entry| entry.protected).count();
+    let limit = config.ahp.session_list_limit;
+    let mut idle_slots = limit.saturating_sub(protected_count);
+    entries.retain(|entry| {
+        if entry.protected {
+            true
+        } else if idle_slots > 0 {
+            idle_slots -= 1;
+            true
+        } else {
+            false
+        }
+    });
+    entries.sort_by_key(|entry| !entry.foreground);
+    AhpSessionMenu {
+        entries,
+        total_count,
+        protected_count,
+        tracked_count: bindings.len(),
+        limit,
+    }
+}
+
+fn session_modified_at(session: &AhpSessionDescriptor) -> i64 {
+    match chrono::DateTime::parse_from_rfc3339(&session.modified_at) {
+        Ok(modified_at) => modified_at.timestamp_millis(),
+        Err(error) => {
+            tracing::warn!(
+                session_code = session.short_code.as_deref().unwrap_or("[unknown]"),
+                error = %error,
+                "invalid Session modification time; using creation time for menu ordering"
+            );
+            chrono::DateTime::parse_from_rfc3339(&session.created_at)
+                .map(|created_at| created_at.timestamp_millis())
+                .unwrap_or_else(|error| {
+                    tracing::warn!(error = %error, "invalid Session creation time for menu ordering");
+                    0
+                })
+        }
+    }
+}
+
+fn session_menu_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn format_ahp_session_menu_summary(menu: &AhpSessionMenu) -> String {
+    let mut summary = format!(
+        "显示 {}/{} 个 · 常规保留 {} 个\n监控 {}/{} 个 · 前台置顶，其余按最近使用排序",
+        menu.entries.len(),
+        menu.total_count,
+        menu.limit,
+        menu.tracked_count,
+        MAX_TRACKED_AHP_SESSIONS,
+    );
+    let hidden = menu.total_count - menu.entries.len();
+    if hidden != 0 {
+        summary.push_str(&format!(
+            "\n已收起 {hidden} 个较旧会话，仅精简 QQ 列表，不删除历史；仍可按原编号切换。"
+        ));
+    }
+    if menu.entries.len() > menu.limit {
+        summary.push_str(&format!(
+            "\n前台、活动或待处理会话共 {} 个，已全部保留，不受列表上限影响。",
+            menu.protected_count,
+        ));
+    }
+    summary
+}
+
+fn format_ahp_session_entry(entry: &AhpSessionMenuEntry, index: usize, markdown: bool) -> String {
+    let code = entry.session.short_code.as_deref().unwrap_or("[unknown]");
+    let title = truncate_for_qq(&session_menu_text(&entry.session.title), 64);
+    let recent = chrono::DateTime::<Utc>::from_timestamp_millis(entry.last_used_at)
+        .filter(|_| entry.last_used_at > 0)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "未知".to_owned());
+    let text = |value: &str| {
+        let value = session_menu_text(value);
+        if markdown {
+            escape_qq_markdown(&value)
+        } else {
+            value
+        }
+    };
+    let heading = if markdown {
+        format!("{}. **{} · {}**", index + 1, text(code), text(&title))
+    } else {
+        format!("{}. [{}] {}", index + 1, code, title)
+    };
+    let line_break = if markdown { "  \n" } else { "\n" };
     format!(
-        "AHP Sessions（最多后台监控 {} 个）:\n{lines}\n\n/switch <编号> 切换前台；/send <编号> <文本> 定向发送。",
-        MAX_TRACKED_AHP_SESSIONS
+        "{heading}{line_break}{} · {}{line_break}位置：{} · {}{line_break}最近使用：{recent}",
+        entry.state,
+        entry.host_status,
+        text(&entry.host_label),
+        text(&entry.workspace),
+    )
+}
+
+fn format_ahp_sessions(menu: &AhpSessionMenu) -> String {
+    if menu.entries.is_empty() {
+        return "目标目录中没有可绑定的 AHP Session。".to_owned();
+    }
+    let lines = menu
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| format_ahp_session_entry(entry, index, false))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "【会话列表】\n{}\n\n{lines}\n\n/switch <编号> 切换前台\n/send <编号> <文本> 定向发送；切换不会停止其他任务。",
+        format_ahp_session_menu_summary(menu),
     )
 }
 
@@ -4229,6 +4369,261 @@ mod tests {
     };
 
     use super::*;
+
+    fn test_session_menu_candidate(number: usize, workspace: &Path) -> AhpSessionMenuCandidate {
+        let mut session = test_ahp_session(number, workspace, 1);
+        let time = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z").expect("time")
+            + chrono::Duration::minutes(i64::try_from(number).expect("number"));
+        session.created_at = time.to_rfc3339();
+        session.modified_at = time.to_rfc3339();
+        session.short_code = Some(format!("A{number:04}"));
+        AhpSessionMenuCandidate {
+            session,
+            last_used_at: 0,
+            pending_commands: false,
+            pending_approvals: false,
+            pending_inputs: false,
+        }
+    }
+
+    #[test]
+    fn qq_session_menu_applies_exact_lru_limit_before_rendering() {
+        let fixture = Fixture::new_ahp();
+        let mut config = fixture.service.config().as_ref().clone();
+        for count in [0, 1, 9, 10, 11, 150] {
+            let candidates = (1..=count)
+                .map(|number| test_session_menu_candidate(number, &fixture.workspace))
+                .collect();
+            let menu = select_ahp_session_menu(&config, &[], &[test_ahp_host()], candidates);
+            assert_eq!(menu.entries.len(), count.min(10));
+            assert_eq!(menu.total_count, count);
+            let codes: Vec<_> = menu
+                .entries
+                .iter()
+                .map(|entry| entry.session.short_code.clone().expect("code"))
+                .collect();
+            let expected: Vec<_> = (1..=count)
+                .rev()
+                .take(10)
+                .map(|number| format!("A{number:04}"))
+                .collect();
+            assert_eq!(codes, expected);
+        }
+        config.ahp.session_list_limit = 2;
+        let mut candidates: Vec<_> = (1..=5)
+            .map(|number| test_session_menu_candidate(number, &fixture.workspace))
+            .collect();
+        candidates[0].last_used_at = Utc::now().timestamp_millis();
+        let outside = fixture._directory.path().join("unauthorized");
+        candidates.push(test_session_menu_candidate(500, &outside));
+        let menu = select_ahp_session_menu(&config, &[], &[], candidates);
+        assert_eq!(
+            menu.total_count, 5,
+            "unauthorized entries must not consume the limit"
+        );
+        assert_eq!(menu.entries.len(), 2);
+        assert_eq!(menu.entries[0].session.short_code.as_deref(), Some("A0001"));
+        assert_eq!(menu.entries[1].session.short_code.as_deref(), Some("A0005"));
+    }
+
+    #[test]
+    fn qq_session_menu_compares_instants_and_preserves_all_protected_sessions() {
+        let fixture = Fixture::new_ahp();
+        let mut config = fixture.service.config().as_ref().clone();
+        config.ahp.session_list_limit = 1;
+        let mut earlier = test_session_menu_candidate(1, &fixture.workspace);
+        earlier.session.modified_at = "2026-09-18T01:00:00+08:00".to_owned();
+        let mut later = test_session_menu_candidate(2, &fixture.workspace);
+        later.session.modified_at = "2026-09-17T18:00:00Z".to_owned();
+        let menu = select_ahp_session_menu(&config, &[], &[], vec![earlier, later]);
+        assert_eq!(menu.entries[0].session.short_code.as_deref(), Some("A0002"));
+
+        config.ahp.session_list_limit = 10;
+        let foreground = fixture
+            .service
+            .database()
+            .ahp_binding()
+            .expect("query")
+            .expect("binding");
+        let mut queued = foreground.clone();
+        queued.session_uri = "copilot:/session-2".to_owned();
+        queued.foreground = false;
+        queued.queued_message_count = 1;
+        let mut active = queued.clone();
+        active.session_uri = "copilot:/session-3".to_owned();
+        active.queued_message_count = 0;
+        active.active_turn_id = Some("menu-turn".to_owned());
+        let mut candidates: Vec<_> = (1..=20)
+            .map(|number| test_session_menu_candidate(number, &fixture.workspace))
+            .collect();
+        candidates[3].session.status = 8;
+        candidates[4].session.status = 24;
+        candidates[5].pending_approvals = true;
+        candidates[6].pending_inputs = true;
+        candidates[7].pending_commands = true;
+        let menu = select_ahp_session_menu(&config, &[foreground, queued, active], &[], candidates);
+        assert_eq!(menu.protected_count, 8);
+        assert_eq!(menu.entries.len(), 10);
+        for number in [1, 2, 3, 4, 5, 6, 7, 8, 19, 20] {
+            assert!(
+                menu.entries
+                    .iter()
+                    .any(|entry| entry.session.short_code.as_deref()
+                        == Some(format!("A{number:04}").as_str()))
+            );
+        }
+        assert!(menu.entries[0].foreground);
+        let mut candidates: Vec<_> = (1..=15)
+            .map(|number| test_session_menu_candidate(number, &fixture.workspace))
+            .collect();
+        for candidate in candidates.iter_mut().take(12) {
+            candidate.session.status = 24;
+        }
+        let menu = select_ahp_session_menu(&config, &[], &[], candidates);
+        assert_eq!(menu.entries.len(), 12);
+        assert!(menu.entries.iter().all(|entry| entry.protected));
+        assert!(format_ahp_sessions(&menu).contains("已全部保留"));
+        assert!(format_ahp_sessions(&menu).contains("收起 3 个"));
+    }
+
+    #[test]
+    fn qq_session_menu_formats_readable_bounded_entries_and_escapes_markdown() {
+        let fixture = Fixture::new_ahp();
+        let config = fixture.service.config();
+        let mut candidates: Vec<_> = (1..=10)
+            .map(|number| test_session_menu_candidate(number, &fixture.workspace))
+            .collect();
+        for candidate in &mut candidates {
+            candidate.session.title = "长标题".repeat(100);
+        }
+        let mut host = test_ahp_host();
+        host.state = crate::protocol::AhpHostState::Unreachable;
+        let menu = select_ahp_session_menu(&config, &[], &[host], candidates);
+        let text = format_ahp_sessions(&menu);
+        assert!(text.starts_with("【会话列表】\n显示 10/10 个"));
+        assert!(text.contains("\n未监控 · 空闲 · 离线/缓存\n位置：local · "));
+        assert!(text.contains(&fixture.workspace.display().to_string()));
+        assert!(text.contains("最近使用："));
+        assert_eq!(text.matches("\n\n").count(), 11);
+        assert!(text.chars().count() < config.bridge.message_total_chars);
+        assert!(!text.contains(" | "));
+        let mut candidate = test_session_menu_candidate(1, &fixture.workspace);
+        candidate.session.title = "第一行\n**bold** [name](target)\t末尾".to_owned();
+        let menu = select_ahp_session_menu(&config, &[], &[], vec![candidate]);
+        let markdown = format_ahp_session_entry(&menu.entries[0], 0, true);
+        assert!(markdown.starts_with("1. **A0001 · 第一行 "));
+        assert!(markdown.contains(r"\*\*bold\*\* \[name\]\(target\)"));
+        assert_eq!(markdown.lines().count(), 4);
+        assert_eq!(markdown.matches("  \n").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn qq_session_menu_commands_share_candidates_without_deleting_or_touching_sessions() {
+        let fixture = Fixture::new_ahp();
+        let database = fixture.service.database();
+        let sessions: Vec<_> = (1..=12)
+            .map(|number| test_session_menu_candidate(number, &fixture.workspace).session)
+            .collect();
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &sessions,
+            )
+            .expect("catalogue");
+        let expected = fixture.service.ahp_session_menu().expect("menu");
+        assert_eq!(expected.entries.len(), 10);
+        assert!(
+            !expected
+                .entries
+                .iter()
+                .any(|entry| entry.session.session_uri == "copilot:/session-2")
+        );
+        let usage_before: HashMap<_, _> = database
+            .ahp_session_menu_candidates()
+            .expect("usage")
+            .into_iter()
+            .map(|candidate| (candidate.session.session_uri, candidate.last_used_at))
+            .collect();
+        let bindings_before = serde_json::to_value(database.ahp_bindings().expect("bindings"))
+            .expect("bindings JSON");
+        let listing = fixture
+            .service
+            .process_ahp_owner_message("menu-list", "/sessions")
+            .await
+            .expect("listing")
+            .expect("text");
+        assert!(listing.contains("显示 10/12 个"));
+        assert!(listing.contains("收起 2 个"));
+        assert!(
+            fixture
+                .service
+                .process_ahp_owner_message("menu-switch", "/switch")
+                .await
+                .expect("switch menu")
+                .is_none()
+        );
+        let menus = fixture.qq.choice_menus().await;
+        assert_eq!(menus.len(), 1);
+        assert_eq!(menus[0].choices.len(), 10);
+        for (entry, button) in expected.entries.iter().zip(&menus[0].choices) {
+            let code = entry.session.short_code.as_deref().expect("code");
+            assert!(listing.contains(&format!("[{code}]")));
+            assert!(menus[0].markdown.contains(&format!("**{code} · ")));
+            assert!(button.label.starts_with(&format!("{code} ")));
+            assert!(button.label.chars().count() <= 10);
+        }
+        assert_eq!(
+            database.ahp_list_sessions().expect("full catalogue").len(),
+            12
+        );
+        assert_eq!(
+            serde_json::to_value(database.ahp_bindings().expect("bindings"))
+                .expect("bindings JSON"),
+            bindings_before
+        );
+        let usage_after: HashMap<_, _> = database
+            .ahp_session_menu_candidates()
+            .expect("usage")
+            .into_iter()
+            .map(|candidate| (candidate.session.session_uri, candidate.last_used_at))
+            .collect();
+        assert_eq!(usage_before, usage_after);
+
+        let hidden = database
+            .ahp_session_by_uri("copilot:/session-2")
+            .expect("session")
+            .expect("retained");
+        let code = hidden.short_code.expect("stable code");
+        fixture
+            .service
+            .process_ahp_owner_message("menu-use-hidden", &format!("/switch {code}"))
+            .await
+            .expect("switch by hidden code");
+        let recent = fixture.service.ahp_session_menu().expect("updated LRU");
+        assert_eq!(recent.entries[0].session.session_uri, "copilot:/session-2");
+        assert!(recent.entries[0].foreground);
+        let mut updated = sessions;
+        updated[2].modified_at = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[test_ahp_host()],
+                &updated,
+            )
+            .expect("PC activity");
+        assert!(
+            fixture
+                .service
+                .ahp_session_menu()
+                .expect("PC LRU")
+                .entries
+                .iter()
+                .any(|entry| entry.session.session_uri == "copilot:/session-3")
+        );
+    }
 
     fn test_ssh_target(path: &str) -> AhpAuthorizedTarget {
         AhpAuthorizedTarget::Ssh {

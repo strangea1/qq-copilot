@@ -275,11 +275,35 @@ qq-bridge reload-targets --timeout-seconds 30
 QQ `/sessions` 的示例输出：
 
 ```text
-AHP Sessions（最多后台监控 5 个）:
-* APYZB | Clone and deploy qq-copilot | D:\work\vscode\qq-copilot | 前台
-  AZ49U | 接入 GitHub Copilot 功能实现 | D:\work\vscode\CodexPlusPlus | 后台 · 运行中
-  A7K2P | 新任务 | D:\work\vscode\project-c | 未监控 · 空闲
+【会话列表】
+显示 3/3 个 · 常规保留 10 个
+监控 2/5 个 · 前台置顶，其余按最近使用排序
+
+1. [APYZB] Clone and deploy qq-copilot
+前台 · 空闲 · 在线
+位置：local · D:\work\vscode\qq-copilot
+最近使用：09-18 16:00
+
+2. [AZ49U] 接入 GitHub Copilot 功能实现
+后台 · 运行中 · 在线
+位置：local · D:\work\vscode\CodexPlusPlus
+最近使用：09-18 15:58
+
+3. [A7K2P] 新任务
+未监控 · 空闲 · 离线/缓存
+位置：ssh:devbox · /home/user/project-c
+最近使用：09-17 10:30
 ```
+
+候选默认按 LRU 精简为最近使用的 10 个；前台、运行中、排队或待命令/审批/澄清的会话
+不被收起，受保护会话超过 10 个时全部保留。列表会说明收起数量。
+这只精简 QQ 展示，不删除 PC 会话、历史或监控绑定。原短码仍可用于切换、发送消息；
+PC 上继续旧会话后也会重新进入候选。浏览菜单、自动发现和重连快照不算使用。
+QQ 实际使用记录会持久化，并与 Host 的修改时间共同决定 LRU；最近使用时间按 PC 本地时区显示。
+
+可在现有 `[ahp]` 配置中设置 `session_list_limit = 10`（1–100），空闲时重启
+Bridge/Adapter 后生效。该项不属于授权追加热更新；它不改变最多 5 个监控 Binding 的限制。
+电脑端 `qq-bridge ahp-sessions` 不受候选数量限制。
 
 ## 12. 多 Session 路由与切换
 
@@ -289,8 +313,8 @@ QQ 中发送：
 /switch
 ```
 
-Bot 会同时展示所有目标目录内的 Session、完整所在目录、`local` / `ssh:<alias>` 和在线/
-离线缓存状态，以及前台、后台、运行中和未监控状态。`/switch` 只改变 QQ 普通文本和语音
+Bot 使用与 `/sessions` 一致的最近候选，分行展示标题、完整目录、`local` / `ssh:<alias>`、
+在线/离线缓存和运行状态；按钮同时显示稳定短码和简短标题。`/switch` 只改变 QQ 普通文本和语音
 的默认路由，不会停止旧 Session，当前或目标 Session 正在运行时也可以切换前台。对于尚未
 监控或仅缓存的远端 Session，Adapter 会先连接精确目标、刷新目录并安全分配 Binding。
 
@@ -309,7 +333,8 @@ Pending 审批和 Pending 澄清不会被 LRU 淘汰；若 5 个槽位全部受�
 或 `/send` 会明确失败。`/detach` 只对安全空闲的后台 Session 生效。
 
 短码会跨 Adapter 重启保持稳定。单页最多 25 个 Session，最多 4 页；非目标目录的
-Session 不会显示，也不能通过旧按钮切换。Assistant 过程段会在形成后立即显示来源短码
+Session 不会显示，也不能通过旧按钮切换。受保护候选超过 100 个按钮的 QQ 限制时，使用
+`/switch <原短码>`，不会强制清理活动会话。Assistant 过程段会在形成后立即显示来源短码
 与标题，且不会在最终回复中重复；仅当来源不是当前 QQ 前台 Session 时，审批、澄清和
 最终回复才会附加独立的前台切换按钮。这些通知都不会自动抢占当前前台。
 

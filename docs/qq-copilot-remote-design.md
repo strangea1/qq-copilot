@@ -48,8 +48,13 @@ flowchart LR
   共同父目录不会隐式包含子目录 Session。
 - Bridge 为所有目标目录中的 Session 分配稳定短码；QQ `/sessions` 同时显示短码、
   标题、完整目录、`local` / `ssh:<alias>`、在线/离线缓存，以及前台、后台、运行中和
-  未监控状态。`/switch` 返回一次性回调按钮，`/switch <code>` 作为文本兜底，两者都只
-  改变前台指针，不停止旧 Session。
+  未监控状态。它与 `/switch` 共用按 LRU 选出的候选，`ahp.session_list_limit` 默认 10；
+  前台、活动、排队、待命令/审批/输入会话始终保留，必要时超过该数量。候选精简不删除
+  Host Session、历史、短码或 Binding；原短码仍可使用，PC 活动也可使旧会话重新入选。
+  `ahp_session_catalog.qq_last_used_at` 保存实际使用时间，结合 Host `modified_at` 排序；
+  目录刷新、自动绑定和历史快照不计入使用。列表采用分行条目，前台置顶。
+  `/switch` 返回带短码和简短标题的一次性回调按钮，`/switch <code>` 作为文本兜底，
+  两者都只改变前台指针，不停止旧 Session。
 - Adapter 不获取 VS Code GitHub token，不提供 Session 创建或销毁命令。
 - 最近活跃 Session 自动加入监控。达到 5 个时，LRU 只能选择非前台、无 active Turn、
   queued message、Pending Adapter command、审批或澄清的 Binding；所有槽位受保护时

@@ -835,6 +835,7 @@ pub struct MockSentMessage {
 #[cfg(test)]
 pub struct MockQqMessenger {
     messages: Mutex<Vec<MockSentMessage>>,
+    choice_menus: Mutex<Vec<ChoiceButtons>>,
     acknowledgements: Mutex<Vec<(String, u8)>>,
     fail_sends: AtomicBool,
 }
@@ -844,6 +845,7 @@ impl MockQqMessenger {
     pub fn new() -> Self {
         Self {
             messages: Mutex::new(Vec::new()),
+            choice_menus: Mutex::new(Vec::new()),
             acknowledgements: Mutex::new(Vec::new()),
             fail_sends: AtomicBool::new(false),
         }
@@ -851,6 +853,10 @@ impl MockQqMessenger {
 
     pub async fn messages(&self) -> Vec<MockSentMessage> {
         self.messages.lock().await.clone()
+    }
+
+    pub async fn choice_menus(&self) -> Vec<ChoiceButtons> {
+        self.choice_menus.lock().await.clone()
     }
 
     pub async fn acknowledgements(&self) -> Vec<(String, u8)> {
@@ -926,6 +932,7 @@ impl QqMessenger for MockQqMessenger {
         if self.fail_sends.load(Ordering::SeqCst) {
             bail!("mock QQ choice delivery failure");
         }
+        self.choice_menus.lock().await.push(buttons.clone());
         let mut messages = self.messages.lock().await;
         messages.push(MockSentMessage {
             kind: "choice_buttons".to_owned(),
