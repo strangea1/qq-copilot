@@ -1385,6 +1385,82 @@ test("prepare reuses discovery ownership for another folder and rejects unauthor
   assert.equal(harness.stopped.length, 1, "shared prepared ownership is stopped only once");
 });
 
+test("fresh managed authentication failures close connections and release reservations", async () => {
+  const target: ManagedTarget = { kind: "local", path: "C:\\existing" };
+  const harness = managedHarness([target]);
+  harness.rootFailure = Object.assign(new Error("Sign in on the PC"), {
+    code: "authentication-required",
+  });
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await waitFor(() => harness.bridge.pendingPollCount === 1, "expected polling");
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      harness.bridge.resolvePoll({ commands: [{
+        command_id: attempt, command_key: `prepare-auth-${attempt}`, binding_id: "prepare",
+        binding_generation: 0, kind: "prepare_target",
+        data: { target: wireTarget(target), retain_connection: true },
+      }] });
+      await waitFor(
+        () => requestsFor(harness.bridge, "ahp_ack_command").length === attempt &&
+          harness.bridge.pendingPollCount === 1,
+        "authentication failure should finish without blocking retry",
+      );
+      assert.equal(requestsFor(harness.bridge, "ahp_ack_command").at(-1)?.error_code, "authentication-required");
+      assert.equal(harness.closed.length, attempt, "each failed control connection must close once");
+      assert.equal(harness.connectCalls.length, attempt);
+      assert.equal(harness.disconnected.length, 0);
+    }
+    harness.rootFailure = undefined;
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 3, command_key: "prepare-after-sign-in", binding_id: "prepare",
+      binding_generation: 0, kind: "prepare_target",
+      data: { target: wireTarget(target), retain_connection: true },
+    }] });
+    await waitFor(() => requestsFor(harness.bridge, "ahp_ack_command").length === 3, "retry after sign-in");
+    assert.equal(requestsFor(harness.bridge, "ahp_ack_command").at(-1)?.outcome, "applied");
+    assert.equal(harness.closed.length, 2);
+    assert.equal(harness.disconnected.length, 1);
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 1);
+});
+
+test("retained managed authentication failures release operations for tunnel recovery", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const target = sshTarget("auth-recovery", "/existing");
+  const harness = managedHarness([target]);
+  const runTask = harness.runtime.run(harness.abort.signal);
+  try {
+    await spinUntil(() => harness.disconnected.length === 1 && harness.bridge.pendingPollCount === 1);
+    harness.rootFailure = Object.assign(new Error("Sign in on the PC"), {
+      code: "authentication-required",
+    });
+    harness.bridge.resolvePoll({ commands: [{
+      command_id: 1, command_key: "prepare-retained-auth", binding_id: "prepare",
+      binding_generation: 0, kind: "prepare_target",
+      data: { target: wireTarget(target), retain_connection: true },
+    }] });
+    await spinUntil(() => requestsFor(harness.bridge, "ahp_ack_command").length === 1);
+    assert.equal(requestsFor(harness.bridge, "ahp_ack_command")[0]?.error_code, "authentication-required");
+    assert.equal(harness.closed.length, 1);
+    assert.equal(harness.reconnectCalls.length, 1);
+    assert.equal(harness.stopped.length, 0, "a failed control client must not stop the retained tunnel");
+
+    harness.rootFailure = undefined;
+    harness.offline.add(preparedTarget(target).endpointId);
+    await harness.core.refreshEndpoints();
+    harness.beforeConnect = async () => { harness.offline.clear(); };
+    t.mock.timers.tick(30_000);
+    await spinUntil(() => harness.connectCalls.length === 2 && harness.disconnected.length === 2);
+    assert.equal(harness.stopped.length, 1, "released operations must allow idle tunnel recovery");
+    assert.equal(harness.closed.length, 1);
+  } finally {
+    await stopManagedHarness(harness, runTask);
+  }
+  assert.equal(harness.stopped.length, 2);
+});
+
 test("discovery and prepare reserve one shared Host while connection is pending", async () => {
   const first = sshTarget("shared", "/first");
   const second = sshTarget("shared", "/second");
@@ -2036,6 +2112,7 @@ function managedHarness(
     prepareTarget: preparedTarget,
     beforeConnect: undefined as ((target: ManagedTarget) => Promise<void>) | undefined,
     beforeReconnect: undefined as ((prepared: PreparedTarget) => Promise<void>) | undefined,
+    rootFailure: undefined as Error | undefined,
   };
   const connection = (prepared: PreparedTarget): ConnectedManagedTarget => {
     state.connected.push(prepared);
@@ -2048,7 +2125,12 @@ function managedHarness(
           assert.fail(`Unexpected managed request: ${method}`);
         },
       } as unknown as ConnectedManagedTarget["client"],
-      rootState: { agents: [{ provider: "copilotcli", displayName: "Copilot", description: "", models: [] }] },
+      get rootState() {
+        if (state.rootFailure) {
+          throw state.rootFailure;
+        }
+        return { agents: [{ provider: "copilotcli", displayName: "Copilot", description: "", models: [] }] };
+      },
       sessions: state.sessions.get(alias) ?? [],
       releasePreparedOwnership() {},
       async disconnect() { state.disconnected.push(prepared); },

@@ -1208,16 +1208,10 @@ export class AdapterRuntime {
         }
         releaseReservation?.();
       };
-      try {
-        const connection = await this.#connectManagedTarget(
-          this.#config,
-          target,
-        );
-        return this.#wrapManagedConnection(connection, release);
-      } catch (error) {
-        release();
-        throw error;
-      }
+      return this.#openManagedConnection(
+        () => this.#connectManagedTarget(this.#config, target),
+        release,
+      );
     }
     if (retained.pruning) {
       throw new AhpOperationError(
@@ -1226,24 +1220,42 @@ export class AdapterRuntime {
       );
     }
     retained.activeOperations += 1;
-    let connection: ConnectedManagedTarget;
+    return this.#openManagedConnection(
+      () =>
+        this.#connectPreparedManagedTarget(
+          managedTargetKey(retained.prepared.target) === managedTargetKey(target)
+            ? retained.prepared
+            : {
+                ...retained.prepared,
+                target,
+                workspaceUri: managedTargetWorkspaceUri(target),
+              },
+        ),
+      () => this.#releaseManagedOperation(key, retained.prepared),
+    );
+  }
+
+  async #openManagedConnection(
+    connect: () => Promise<ConnectedManagedTarget>,
+    releaseConnection: () => void,
+  ): Promise<ConnectedManagedTarget> {
+    let connection: ConnectedManagedTarget | undefined;
     try {
-      connection = await this.#connectPreparedManagedTarget(
-        managedTargetKey(retained.prepared.target) === managedTargetKey(target)
-          ? retained.prepared
-          : {
-              ...retained.prepared,
-              target,
-              workspaceUri: managedTargetWorkspaceUri(target),
-            },
-      );
+      connection = await connect();
+      return this.#wrapManagedConnection(connection, releaseConnection);
     } catch (error) {
-      this.#releaseManagedOperation(key, retained.prepared);
+      try {
+        await connection?.close();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "managed-connection-cleanup-failed",
+        );
+      } finally {
+        releaseConnection();
+      }
       throw error;
     }
-    return this.#wrapManagedConnection(connection, () => {
-      this.#releaseManagedOperation(key, retained.prepared);
-    });
   }
 
   #wrapManagedConnection(
@@ -1258,7 +1270,12 @@ export class AdapterRuntime {
       }
     };
     return {
-      ...connection,
+      prepared: connection.prepared,
+      client: connection.client,
+      get rootState() {
+        return connection.rootState;
+      },
+      sessions: connection.sessions,
       releasePreparedOwnership(): void {
         connection.releasePreparedOwnership();
       },

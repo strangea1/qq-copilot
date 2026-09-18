@@ -79,7 +79,7 @@ test("managed targets prefer the standalone Copilot provider", () => {
   );
 });
 
-test("managed discovery and reconnect list existing Sessions without authentication or model configuration", async () => {
+test("managed discovery and reconnect list existing Sessions without authentication or model configuration", async (t) => {
   const requests: string[] = [];
   const advertisedVersions: string[][] = [];
   const sessions: SessionSummary[] = ["first", "second"].map((id) => ({
@@ -93,6 +93,7 @@ test("managed discovery and reconnect list existing Sessions without authenticat
   }));
   const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   let connections = 0;
+  let authenticationRequired = false;
   server.on("connection", (socket) => {
     connections += 1;
     socket.on("message", (data) => {
@@ -141,7 +142,23 @@ test("managed discovery and reconnect list existing Sessions without authenticat
           }));
           return;
       }
-      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+      const response = JSON.stringify({ jsonrpc: "2.0", id: message.id, result });
+      if (authenticationRequired && message.method === "listSessions") {
+        socket.send(JSON.stringify({
+          jsonrpc: "2.0",
+          method: "auth/required",
+          params: {
+            channel: "ahp-root://",
+            resource: {
+              resource: "https://api.github.com",
+              authorization_servers: ["https://github.com/login/oauth"],
+            },
+          },
+        }));
+        setImmediate(() => socket.send(response));
+      } else {
+        socket.send(response);
+      }
     });
   });
   await once(server, "listening");
@@ -189,6 +206,19 @@ test("managed discovery and reconnect list existing Sessions without authenticat
       "initialize", "listSessions", "listSessions",
     ]);
     assert.ok(advertisedVersions.every((versions) => versions.includes("0.9.0") && !versions.includes("0.1.0")));
+    await t.test("authentication failure during listing closes every connection before retry", async () => {
+      authenticationRequired = true;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const accepted = once(server, "connection");
+        const connecting = connectPreparedManagedTarget(prepared);
+        const [socket] = await accepted;
+        const closed = once(socket, "close");
+        await assert.rejects(connecting, { code: "authentication-required" });
+        await closed;
+        assert.equal(server.clients.size, 0);
+      }
+      assert.equal(connections, 4);
+    });
   } finally {
     for (const socket of server.clients) {
       socket.terminate();

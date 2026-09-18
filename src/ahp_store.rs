@@ -483,12 +483,26 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
         "binding_id",
         "ALTER TABLE ahp_commands ADD COLUMN binding_id TEXT",
     )?;
+    let had_lease_history: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('ahp_commands') WHERE name = 'ever_leased'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
     ensure_column(
         connection,
         "ahp_commands",
         "ever_leased",
         "ALTER TABLE ahp_commands ADD COLUMN ever_leased INTEGER NOT NULL DEFAULT 0",
     )?;
+    if !had_lease_history {
+        // Older requeues erased lease ownership, so their disposal outcome is unknown.
+        connection.execute(
+            "UPDATE ahp_commands SET ever_leased = 1 WHERE kind = 'dispose_session'",
+            [],
+        )?;
+    }
     connection.execute(
         "UPDATE ahp_commands SET ever_leased = 1
          WHERE ever_leased = 0 AND lease_owner IS NOT NULL",
@@ -3609,7 +3623,9 @@ fn ensure_session_binding(
                    OR (
                         state = 'failed'
                         AND (
-                             COALESCE(error_code, '') != 'bridge_timeout'
+                             COALESCE(error_code, '') NOT IN (
+                                 'bridge_timeout', 'session_creation_removed'
+                             )
                              OR ever_leased != 0
                         )
                    )
@@ -5532,6 +5548,16 @@ mod tests {
     #[test]
     fn upgrade_retires_creation_commands_without_removing_existing_sessions() {
         let (_directory, database, binding) = bound_database();
+        let recoverable = numbered_session(2, 1);
+        let uncertain = numbered_session(3, 1);
+        database
+            .ahp_replace_catalog(
+                "adapter-stable",
+                "adapter-run-1",
+                &[host("host-1")],
+                &[session("host-1"), recoverable.clone(), uncertain.clone()],
+            )
+            .expect("catalogue preserved Sessions");
         let message_id = database
             .ahp_enqueue_message("existing-session-message", "keep this task")
             .expect("enqueue existing Session task");
@@ -5577,6 +5603,24 @@ mod tests {
                     ],
                 )
                 .expect("seed retired command");
+            retired_commands.push(connection.last_insert_rowid());
+        }
+        for (candidate, ever_leased) in [(&recoverable, 0), (&uncertain, 1)] {
+            connection
+                .execute(
+                    "INSERT INTO ahp_commands(
+                        command_key, binding_id, binding_generation, kind, data_json,
+                        state, ever_leased, created_at, updated_at
+                     ) VALUES (?1, '__unbound__', 0, 'dispose_session', ?2,
+                               'pending', ?3, ?4, ?4)",
+                    params![
+                        format!("dispose-session:{}", candidate.session_uri),
+                        json!({"session_uri": candidate.session_uri}).to_string(),
+                        ever_leased,
+                        now(),
+                    ],
+                )
+                .expect("seed disposal lease history");
             retired_commands.push(connection.last_insert_rowid());
         }
         migrate_ahp_schema(&connection).expect("upgrade old creation state");
@@ -5632,6 +5676,65 @@ mod tests {
         );
         assert!(AhpCommandKind::try_from("create_session").is_err());
         assert!(AhpCommandKind::try_from("dispose_session").is_err());
+        let tracked = database
+            .ahp_track_session(&recoverable.endpoint_id, &recoverable.session_uri)
+            .expect("retired never-leased disposal must permit tracking");
+        assert_eq!(tracked.session_uri, recoverable.session_uri);
+        let focused = database
+            .ahp_bind_session(&recoverable.endpoint_id, &recoverable.session_uri)
+            .expect("retired never-leased disposal must permit switching");
+        assert!(focused.foreground);
+        for result in [
+            database.ahp_track_session(&uncertain.endpoint_id, &uncertain.session_uri),
+            database.ahp_bind_session(&uncertain.endpoint_id, &uncertain.session_uri),
+        ] {
+            assert_eq!(
+                result
+                    .expect_err("a previously leased disposal must remain blocked")
+                    .to_string(),
+                "AHP Session has already been queued for disposal"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_preserves_disposal_uncertainty_without_lease_history() {
+        let (_directory, database, binding) = bound_database();
+        let connection = database.connection().expect("connection");
+        connection
+            .execute("ALTER TABLE ahp_commands DROP COLUMN ever_leased", [])
+            .expect("restore schema without lease history");
+        connection
+            .execute(
+                "INSERT INTO ahp_commands(
+                    command_key, binding_id, binding_generation, kind, data_json,
+                    state, created_at, updated_at
+                 ) VALUES ('dispose-session:legacy', '__unbound__', 0, 'dispose_session',
+                           ?1, 'pending', ?2, ?2)",
+                params![
+                    json!({"session_uri": binding.session_uri}).to_string(),
+                    now(),
+                ],
+            )
+            .expect("seed disposal with unknown lease history");
+        migrate_ahp_schema(&connection).expect("upgrade legacy disposal");
+        migrate_ahp_schema(&connection).expect("upgrade remains idempotent");
+        let ever_leased: bool = connection
+            .query_row(
+                "SELECT ever_leased FROM ahp_commands WHERE command_key = 'dispose-session:legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("conservative lease history");
+        assert!(ever_leased);
+        drop(connection);
+        assert_eq!(
+            database
+                .ahp_track_session(&binding.endpoint_id, &binding.session_uri)
+                .expect_err("unknown disposal outcome must remain blocked")
+                .to_string(),
+            "AHP Session has already been queued for disposal"
+        );
     }
 
     fn bound_database() -> (tempfile::TempDir, Database, AhpBindingRecord) {

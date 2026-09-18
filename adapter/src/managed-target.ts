@@ -227,10 +227,14 @@ class ManagedRootTracker {
   }
 
   get root(): RootState {
+    this.assertHealthy();
+    return this.#mirror.root;
+  }
+
+  assertHealthy(): void {
     if (this.#error !== undefined) {
       throw this.#error;
     }
-    return this.#mirror.root;
   }
 
   start(): void {
@@ -336,6 +340,7 @@ async function connectPreparedTarget(
     const activeRootTracker = rootTracker;
     activeRootTracker.start();
     const sessions = await listSessions(managedClient);
+    activeRootTracker.assertHealthy();
     const connectedClient = managedClient;
     return {
       prepared,
