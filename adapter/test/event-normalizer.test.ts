@@ -52,7 +52,7 @@ function chatAction(
   };
 }
 
-test("normalizer marks hydrated history and emits live user/assistant text", () => {
+test("normalizer hydrates history without publishing it and emits live text", () => {
   const events = normalizer();
   const historical = events.chatSnapshot({
     endpointId: "endpoint-1",
@@ -86,20 +86,13 @@ test("normalizer marks hydrated history and emits live user/assistant text", () 
       ],
     },
   });
-  const oldMessages = historical.filter(
-    (event) =>
-      event.kind === "user_message" ||
-      event.kind === "assistant_message",
-  );
-  assert.equal(oldMessages.length, 2);
-  assert.ok(
-    oldMessages.every(
+  assert.equal(
+    historical.filter(
       (event) =>
-        typeof event.data === "object" &&
-        event.data !== null &&
-        "historical" in event.data &&
-        event.data.historical === true,
-    ),
+        event.kind === "user_message" ||
+        event.kind === "assistant_message",
+    ).length,
+    0,
   );
 
   const started = events.action({

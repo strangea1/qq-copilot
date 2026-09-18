@@ -1674,12 +1674,11 @@ class SessionBinding implements AhpSessionBinding {
           );
           if (result === "applied") {
             this.#updateTurnObservation();
-            const state = this.#mirror.chat;
-            if (
-              state &&
-              envelope.action.type !== ActionType.ChatDelta
-            ) {
-              this.#runtime.emitChat(state, this.#mirror.chatSeq);
+            if (envelope.action.type !== ActionType.ChatDelta) {
+              const state = this.#mirror.chat;
+              if (state) {
+                this.#runtime.emitChat(state, this.#mirror.chatSeq);
+              }
             }
           }
         });

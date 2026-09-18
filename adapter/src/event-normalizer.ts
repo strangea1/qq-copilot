@@ -518,50 +518,29 @@ export class AhpEventNormalizer {
     chatUri: string,
     historical: boolean,
   ): PublishedEvent[] {
+    this.#openAssistantParts.delete(turn.id);
+    const markdownParts = turn.responseParts.filter(
+      (part) => part.kind === ResponsePartKind.Markdown,
+    );
+    if (historical) {
+      if (turn.message.origin.kind === MessageKind.User) {
+        this.#seenUserTurns.add(turn.id);
+      }
+      for (const part of markdownParts) {
+        this.#seenAssistantParts.add(assistantPartKey(turn.id, part.id));
+      }
+      return [];
+    }
+
     const events = this.#userMessageEvents(
       turn.id,
       turn.startedAt ?? new Date().toISOString(),
       turn.message,
       sequence,
       chatUri,
-      historical,
+      false,
       undefined,
     );
-    this.#openAssistantParts.delete(turn.id);
-    const markdownParts = turn.responseParts.filter(
-      (part) => part.kind === ResponsePartKind.Markdown,
-    );
-    if (historical) {
-      const unseenParts = markdownParts.filter(
-        (part) =>
-          !this.#seenAssistantParts.has(assistantPartKey(turn.id, part.id)),
-      );
-      for (const part of unseenParts) {
-        this.#seenAssistantParts.add(assistantPartKey(turn.id, part.id));
-      }
-      const content = assistantText(turn.responseParts);
-      if (unseenParts.length > 0 && content.length > 0) {
-        events.push(
-          this.#event(
-            "assistant_message",
-            sequence,
-            chatUri,
-            turn.id,
-            {
-              message_id: `turn:${turn.id}:assistant`,
-              content,
-              complete: true,
-              historical,
-              final_response: true,
-            },
-            undefined,
-            turn.startedAt,
-          ),
-        );
-      }
-      return events;
-    }
-
     const finalPart = [...markdownParts]
       .reverse()
       .find((part) => part.content.trim().length > 0);
@@ -701,6 +680,9 @@ export class AhpEventNormalizer {
       return [];
     }
     this.#seenUserTurns.add(turnId);
+    if (historical) {
+      return [];
+    }
     return [
       this.#event(
         "user_message",
@@ -813,14 +795,6 @@ function collectTools(
       output.push([turnId, part.toolCall]);
     }
   }
-}
-
-function assistantText(parts: readonly ResponsePart[]): string {
-  return parts
-    .filter((part) => part.kind === ResponsePartKind.Markdown)
-    .map((part) => part.content)
-    .join("")
-    .trim();
 }
 
 function assistantPartKey(turnId: string, partId: string): string {
