@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
-import { loadAdapterConfig } from "../src/config.js";
+import { loadAdapterConfig, parseAuthorizedTargets } from "../src/config.js";
 
 test("adapter config loads code paths and authorized targets", async (context) => {
   const root = await mkdtemp(join(process.cwd(), ".adapter-config-test-"));
@@ -75,4 +75,29 @@ shared_workspaces = ["C:\\\\test"]
   const config = await loadAdapterConfig(configPath, root);
   assert.equal(config.codeExecutable, undefined);
   assert.equal(config.authorizedTargets.length, 1);
+});
+
+test("authorization wire targets reuse config validation without resolving relative paths", () => {
+  const ssh = {
+    kind: "ssh", alias: "devbox", path: "/srv/project", user: "tester", host: "devbox",
+    port: 22, host_key_fingerprints: ["SHA256:b", "SHA256:a", "SHA256:b"],
+  };
+  assert.deepEqual(parseAuthorizedTargets([{ kind: "local", path: "C:\\work\\project\\" }, ssh]), [
+    { kind: "local", path: "C:\\work\\project" },
+    {
+      kind: "ssh", alias: "devbox", path: "/srv/project", user: "tester", host: "devbox",
+      port: 22, hostKeyFingerprints: ["SHA256:a", "SHA256:b"],
+    },
+  ]);
+  for (const value of [
+    undefined, null, {}, "targets", [null], [{ kind: "other", path: "/project" }],
+    [{ kind: "local", path: "relative" }], [{ kind: "local", path: "\\relative-to-drive" }],
+    [{ ...ssh, path: "relative" }], [{ ...ssh, path: "/bad\0path" }],
+    [{ ...ssh, alias: "-option" }], [{ ...ssh, user: "" }], [{ ...ssh, host: "\n" }],
+    [{ ...ssh, port: 0 }], [{ ...ssh, port: 65_536 }], [{ ...ssh, port: 1.5 }],
+    [{ ...ssh, host_key_fingerprints: [] }], [{ ...ssh, host_key_fingerprints: ["SHA256:"] }],
+    [{ ...ssh, host_key_fingerprints: ["SHA256:bad whitespace"] }],
+  ]) {
+    assert.throws(() => parseAuthorizedTargets(value));
+  }
 });

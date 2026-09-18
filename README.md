@@ -1,15 +1,13 @@
 # QQ Copilot AHP Bridge
 
 本项目让 PC 上的 VS Code Agents Window 与手机 QQ Bot 作为两个客户端，同时共享和
-控制多个 VS Code Agent Host Protocol（AHP）Session，并支持从 QQ 在预授权的本地或
-Remote SSH 目标上创建、绑定和启动新的 Session。
+控制多个 VS Code Agent Host Protocol（AHP）Session，支持从 QQ 发现、绑定和切换
+预授权本地或 Remote SSH 目标上的已有 Session。
 
 完整安装、升级、回滚和故障排查见 [部署指南](docs/deployment.md)；协议与安全设计见
 [远程交互设计](docs/qq-copilot-remote-design.md)。
 
-VS Code 1.136 Local Standalone 手机创建会通过状态扩展的显式授权 Broker 完成
-GitHub 认证，并使用 Host 实际发布的模型；原始故障证据与实现边界见
-[Mobile Session Creation Handoff](docs/mobile-session-creation-handoff.md)。
+Session 创建、GitHub 登录、模型和审批模式选择均在电脑端完成；QQ 只操作已有 Session。
 
 ## 架构
 
@@ -28,7 +26,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 | `ahp-adapter` | 连接 VS Code Editor Host 或本地/Remote SSH Standalone Host，同时订阅并控制多个 Session/Chat |
 | VS Code Agent Host | 唯一权威会话、工具策略和执行状态 |
 | QQ Bot | 手机端共享对话、审批、澄清回答和取消 |
-| QQ Copilot AHP Status | VS Code 状态栏显示运行状态，并在用户显式授权后直接向 Adapter 提供内存中的 GitHub token |
+| QQ Copilot AHP Status | VS Code 状态栏显示运行状态，并报告工作区信任状态 |
 
 旧的 `copilot-qq-hook.exe`、`qq-mcp.exe` 和 QQ Remote Supervisor Agent 仍随安装保留，
 但 AHP 模式会禁用其用户级入口，防止两套链路重复发送或审批。
@@ -36,9 +34,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 ## 已实现
 
 - PC 和 QQ 的用户消息进入同一个 AHP Chat。
-- QQ `/new`、`/new advanced` 可在预授权目标上创建新 Session、自动绑定并提交首条任务。
-- 手机创建使用 Host `AgentInfo.models` 的真实模型选择；首 Turn 立即失败时自动解除绑定、
-  销毁 Session 并恢复原前台。
+- QQ 可发现和切换电脑端创建的 Session，并向已有 Session 发送任务。
 - 每个完整 Assistant 响应段形成后立即同步到 QQ；过程段不会在最终回复中重复，不转发隐藏 reasoning。
 - 工具调用只遵循 VS Code Agent Host 原生审批策略。
 - 工具执行前审批和工具结果复核同时显示在 PC 与 QQ。
@@ -56,7 +52,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
   待执行命令、审批或澄清输入的 Session。
 - Session 编号由 Bridge 稳定分配，目录刷新不会改变。
 - 本地默认 Standalone Host 按需启动/复用；Linux Remote SSH 目标通过 Windows OpenSSH
-  `ssh.exe` 在 Adapter 启动后后台发现并复用远端默认 Host，无需先执行 `/new`。
+  `ssh.exe` 在 Adapter 启动后后台发现并复用远端默认 Host。
 - 本地与远端目标都必须先在电脑上注册并通过 VS Code Workspace Trust 确认后才能被 QQ 选择。
 - Turn 运行期间 QQ 显示官方 `msg_type=6`“正在输入”状态，每 45 秒续期，
   完成、取消、失败或等待审批/澄清时停止。
@@ -75,12 +71,10 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - Editor Host 随相应 VS Code 窗口退出；Local Standalone Host 可在 VS Code 关闭时继续
   执行。Remote SSH 需要 Windows PC 在线、已登录且 Bridge 正在运行。
 - 前台切换允许目标 Session 正在运行。若 5 个槽位全部被前台、活动 Turn、排队消息或
-  Pending 交互保护，新建、切换或定向发送会明确拒绝，而不是强制中断现有任务。
+  Pending 交互保护，切换或定向发送会明确拒绝，而不是强制中断现有任务。
 - Standalone Host 共享 Host 级工具与用户级自定义；无编辑器客户端附着时会明确提示
   editor-client tools 不可用。
-- 受管 Session 认证默认关闭，目前仅支持 GitHub.com Copilot。OAuth token 只在 VS Code
-  状态扩展、Adapter 和 AHP `authenticate` 的内存链路中传递，不进入 QQ、Bridge command、
-  SQLite、TOML 或日志。
+- QQ 不提供 GitHub 凭据 Broker，也不代替电脑端登录或授权。
 - 同一精确工作区允许多个 Turn 并发，但 Bridge 会发送冲突警告；有写操作的并发任务
   应使用独立 Git worktree，避免文件和 Git 索引互相覆盖。
 - AHP 直接连接针对 VS Code 1.136 的实际协议方言验证。当前 VS Code 1.136 宣告
@@ -195,7 +189,7 @@ AppSecret 只进入 Windows Credential Manager，不写入 TOML、命令行或�
 ## 配置与注册目标
 
 `bridge.workspace_roots` 是本地文件操作的安全允许根目录；`ahp.authorized_targets`
-是 QQ 可以选择、创建和切换 Session 的精确目标列表。兼容迁移后，本地目标仍会同步写回
+是 QQ 可以查看和切换 Session 的精确目标列表。兼容迁移后，本地目标仍会同步写回
 `ahp.shared_workspaces`，但新增推荐使用注册脚本并等待 VS Code Workspace Trust 回报：
 
 ```toml
@@ -221,9 +215,9 @@ host_key_fingerprints = ["SHA256:..."]
   -Workspace "C:\src\project-a"
 ```
 
-脚本要求 Bridge 正在运行且 AHP 已配置，并只会在所有 Binding 均无活动 Turn、无排队
-消息、无待审批/澄清且无待执行 Adapter 命令时重启。它会规范化路径、去重，并同时更新
-安全根目录和目标目录。
+脚本要求 Bridge 和 Adapter 正在运行且支持授权热更新。它会规范化路径、去重，并同时
+更新安全根目录和目标目录，等待两端确认生效；追加授权无需重启，也无需等待活动任务、
+审批或澄清结束。
 
 Remote SSH 目标注册：
 
@@ -236,6 +230,28 @@ Remote SSH 目标注册：
 注册会固定 Linux SSH Host 公钥指纹；指纹变化时先在电脑端移除旧目标，再显式重新注册，
 QQ 端不能接受或绕过主机身份变化。
 
+### 追加授权热更新
+
+追加同一 SSH alias 下的新目录时，保留 host/user/port/公钥指纹不变，即可复用已有
+Host、SSH 隧道和 Binding。Adapter 会立即按新授权重新发布已缓存的 Session 目录，
+不会为了新增目录断开或重绑正在运行的 Session。新增其他主机时，后台独立建立发现连接。
+
+Bridge 在 Adapter 命令轮询时检查配置变化，仅接受授权目标与本地安全根的追加；
+重复项和顺序调整不产生新的授权版本。手工保存配置后可显式等待应用确认：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe" `
+  --config "$env:LOCALAPPDATA\CopilotQQBridge\config.toml" reload-targets
+```
+
+该命令仅在 Adapter 已确认当前授权版本且仍连接时成功；超时或不支持热更新会明确失败，
+不会退回自动重启。状态中的 `ahp.authorization` 提供 Bridge/Adapter 版本及最后一次错误。
+无效 TOML、移除目录、修改 SSH 身份/指纹或其他非热更新配置都会保留上一份有效授权，
+并要求修正配置或在空闲后重启；删除文件中的条目不会即时撤销运行中的授权。
+
+注册脚本默认确认热更新。`-SkipReloadConfirmation` 仅跳过显式确认，不阻止后台轮询更新；
+旧参数 `-SkipRestart` 保留为此参数的别名。旧版 Bridge/Adapter 必须先成对升级。
+
 移除目标：
 
 ```powershell
@@ -246,38 +262,10 @@ QQ 端不能接受或绕过主机身份变化。
 目标采用精确匹配，不会隐式包含子目录。Remote 目标只接受现有 `~/.ssh/config` Host alias，
 并以 `(ssh alias, canonical POSIX path)` 作为身份；若 host/user/port 解析结果变化，则必须重新注册。
 
-## 从 QQ 创建并绑定新 Session
-
-首次使用前，在 VS Code 命令面板运行
-`QQ Copilot: Enable Managed Session Authentication`，确认授权并完成 GitHub 登录。
-授权默认关闭，可随时运行 `QQ Copilot: Disable Managed Session Authentication` 撤销
-QQ Copilot Broker 使用权；该操作不会删除 VS Code 自己管理的 GitHub 登录。
-
-主流程：
-
-```text
-/new
-  -> 选择目标按钮
-  -> 发送首条任务文本
-  -> 自动创建 Session、绑定并提交首条任务
-```
-
-高级流程：
-
-```text
-/new advanced
-  -> 选择目标按钮
-  -> 选择模型（若 Host 暴露）
-  -> 选择审批模式（若 Host 暴露）
-  -> 发送首条任务文本
-```
-
-Quick mode 使用 Host 发布的默认模型和 Session 默认值；Advanced 的模型来自认证后刷新
-的 `AgentInfo.models`，审批模式来自 `resolveSessionConfig`。模型必填配置只有在 Host
-提供 JSON primitive 默认值时才会自动携带；若仍需额外 PC 输入，Bridge 会 fail-closed
-并要求回到 PC 创建。
-
 ## 继续查看或切换已有 Session
+
+先在电脑端创建并登录 Session，再从 QQ 使用 `/sessions` 和 `/switch <编号>`。
+`/new`（包括 advanced）已移除；旧命令和创建按钮会被拒绝，不会作为任务发送到前台。
 
 `/sessions` 会列出所有预授权目标内的 Session，并标明所在 `local` 或 `ssh:<alias>`、完整
 路径以及在线/离线缓存状态。对缓存的远端 Session，`/switch` / `/switch <编号>` 会先自动
@@ -301,10 +289,8 @@ qq-bridge ahp-bind --endpoint <endpoint-id> --session <session-uri>
 ## QQ 使用方式
 
 ```text
-/new                     选择目标并创建新 Session
-/new advanced            额外选择模型/审批模式后创建新 Session
 普通文本                 发送到前台 Session
-QQ 语音                  使用内置 ASR 发送到前台 Session，或作为 /new 首条任务
+QQ 语音                  使用内置 ASR 发送到前台 Session
 /ask <文本>              即使 Agent 正等待澄清，也排队为新消息
 /send <编号> <文本>      定向发送到指定 Session，不改变前台
 /sessions                列出前台、后台和未监控 Session
@@ -314,7 +300,7 @@ QQ 语音                  使用内置 ASR 发送到前台 Session，或作为 
 /allow <审批码>          单次批准
 /deny <审批码>           拒绝
 /answer <问题码> <文本>  显式回答澄清
-/cancel                  优先取消 /new 向导；否则取消前台 Session 的当前 Turn
+/cancel                  取消前台 Session 的当前 Turn
 /cancel <编号>           取消指定 Session 的当前 Turn
 /notify                  查看当前通知模式
 /notify <模式>           即时切换 approval_only、compact 或 full
@@ -325,7 +311,7 @@ QQ 语音                  使用内置 ASR 发送到前台 Session，或作为 
 当 Agent 正等待澄清时，普通文本优先作为当前问题的答案。审批永远要求按钮或显式
 `/allow`、`/deny`，普通文本不会被解释为批准。
 
-语音识别结果同样只作为普通输入、澄清回答或 `/new` 首条任务，不会执行 `/new`、
+语音识别结果同样只作为普通输入或澄清回答，不会执行
 `/allow`、`/deny`、`/cancel` 或 `/switch` 等控制命令。QQ 事件未提供 ASR 结果时，
 Bot 会提示重新录制或改发文字；
 Bridge 不下载或长期保存语音文件。
@@ -385,7 +371,8 @@ typing_duration_seconds = 60
 typing_refresh_seconds = 45
 ```
 
-直接编辑 TOML 后需要重启 Bridge；通过 `/notify` 切换则不需要。
+直接编辑上述通知/输入状态配置后需要重启 Bridge；通过 `/notify` 切换通知模式则不需要。
+授权列表的追加使用独立的热更新机制。
 
 ## QQ 输入状态
 

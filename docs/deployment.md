@@ -15,7 +15,7 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter
 - Remote SSH 目标通过 Windows `ssh.exe` 连接并复用远端默认 Standalone Host。
 - Editor Host 随相应 VS Code 窗口退出。
 - QQ 与 PC 最多同时共享 5 个已监控的 Agent Host Session；一个作为 QQ 前台，其余可继续
-  后台运行。QQ 也可新建 Session、自动加入监控并提交首条任务。
+  后台运行。Session 创建和 GitHub 登录在电脑端完成。
 - Bridge、Adapter 和状态栏扩展安装在 Agent 可编辑工作区之外。
 - 旧 Hooks/MCP 链只作为回滚模式。
 
@@ -58,11 +58,8 @@ Editor endpoint 在注册表和握手中均使用 `0.9.0`。VS Code 1.136 的
 宣告 `0.9.0` 并接受 `^0.9.0`。Adapter 保留原始 advertised 值，只对该已验证组合设置
 `wireProtocolVersion = 0.9.0`，不会向 Host 提供 `0.1.0` wire。
 本地 Host 使用 `agent host --new-instance --foreground`，由 Adapter 持有精确进程生命周期；
-默认 detach/reuse 模式不能用于受管目标。Standalone 同时宣告 `copilotcli` 与 `claude`，
-移动端 Copilot 创建固定选择 `copilotcli`。新 Session 在首条消息前采用 deferred backing，
-可能暂不出现在 `listSessions`，Adapter 会订阅客户端选定的 `ahp-session:/<uuid>` 完成确认，
-并在创建 ACK 前建立 provisional Binding，直到正式 Binding 接管或 ACK 后 90 秒期限到达。同一目标
-的后续操作复用 retained Host，避免替换 instance 使其他 Session 断线；本地 owned Host
+默认 detach/reuse 模式不能用于受管目标。同一目标的后续连接操作复用 retained Host，
+避免替换 instance 使其他 Session 断线；本地 owned Host
 通过精确 instance ID 清理，Remote SSH 只关闭本地 tunnel。
 
 仓库的
@@ -136,24 +133,8 @@ shared_workspaces = [
 
 安装器会收紧安装目录和配置目录 ACL，并把 Node 与 Adapter 的绝对路径写入配置。
 
-受管 Session 的 GitHub 认证默认关闭。安装并重新加载 VS Code 后，首次从 QQ 使用
-`/new` 前在命令面板运行：
-
-```text
-QQ Copilot: Enable Managed Session Authentication
-```
-
-该命令会显示 modal 授权说明并通过 VS Code GitHub Authentication API 完成登录。
-OAuth token 仅由状态扩展通过受本机 Bridge IPC token 派生 capability 的 named pipe
-直接交给 Adapter，再用于 AHP `authenticate`；token 不经过 QQ、Bridge command、
-SQLite、TOML 或日志。当前 Broker 只接受 GitHub.com API 和 OAuth server，不支持
-GitHub Enterprise。撤销 Broker 使用权时运行：
-
-```text
-QQ Copilot: Disable Managed Session Authentication
-```
-
-撤销不会删除 VS Code 自己管理的 GitHub Authentication Session。
+升级后执行 **Developer: Reload Window**。状态扩展不再提供 Session 认证 Broker、
+启用/撤销认证命令或相关设置；VS Code 自己管理的 GitHub 登录不受影响。
 
 ## 7. 配置 QQ
 
@@ -236,8 +217,8 @@ QQ AHP 已连接
 ```
 
 目标目录按精确路径匹配；只添加共同父目录不会展示其子目录中的 Session。脚本要求
-Bridge 正在运行且已配置 AHP，并会拒绝在任一 Binding 存在活动 Turn、排队消息、
-Pending 审批/澄清或 Adapter 命令时重启。
+Bridge/Adapter 正在运行且已配置 AHP。追加目标通过授权版本同步热更新，不会重启，
+活动 Turn、排队消息或 Pending 审批/澄清不会阻止追加。
 
 Remote SSH 目标要求现有 `~/.ssh/config` Host alias、`BatchMode=yes` 可用、只接受 Linux
 远端，并会校验 `code agent host` / `code agent endpoints`、远端规范路径和 Linux SSH
@@ -259,26 +240,32 @@ Host 公钥指纹。指纹变化后必须在电脑端重新注册：
   -LocalWorkspace "C:\src\project-a"
 ```
 
-注册脚本默认会在成功后重启 Bridge/Adapter 以载入新配置。
+注册脚本默认先确认运行版本支持热更新，保存授权后再次等待 Adapter 确认。
+同一 SSH alias 的新增目录复用已有连接，host/user/port/指纹必须完全一致。
+配置文件变化由 Adapter 命令轮询驱动检查，可用下面的命令立即请求并等待确认：
 
-## 11. 从 QQ 创建新 Session
-
-```text
-/new
-  -> 目标按钮
-  -> 发送首条任务
-  -> 自动创建 / 绑定 / 首发任务
+```powershell
+qq-bridge reload-targets
+qq-bridge reload-targets --timeout-seconds 30
 ```
 
-`/new advanced` 会在目标之后增加模型和审批模式选择。模型来自认证后 Host 刷新的
-`AgentInfo.models`，并通过首条 AHP `Message.model` 提交；审批模式来自
-`resolveSessionConfig`。Quick mode 使用 Host 默认模型。无安全默认值的必填模型配置会
-明确拒绝并要求回到 PC 创建。
+默认等待两个命令轮询周期加 10 秒；成功表示 Bridge/Adapter 授权版本一致，不保证新增
+主机的网络连接已经完成。已有主机下新目录的缓存 Session 会重新发布，无需重连。
+`status` 中 `ahp.authorization` 可用于诊断未确认版本或配置错误。
 
-其他 Session 的 active Turn、排队消息或待交互不会阻止 `/new`；只有 5 个 Binding
-槽位全部受保护时才会拒绝。首条任务 ACK 后 Bridge 会短暂观察对应 Turn：若立即失败或
-取消，会恢复旧前台、解除新 Binding、调用 `dispose_session` 并等待 Catalog removal
-tombstone；长任务一旦 materialize 或观察窗口结束则正常保留。
+此版本仅支持追加目标/安全根。删除授权、修改 SSH 身份/指纹和其他非热更新配置仍需要
+在空闲后重启；热更新拒绝此类修改并保留上一份有效授权。注册脚本的
+`-SkipReloadConfirmation`（兼容别名 `-SkipRestart`）只跳过显式等待，不禁用后台更新。
+配置无效或 Adapter 不支持热更新时，不会自动重启或报告已经生效。
+
+## 11. 连接已有 Session
+
+先在电脑端创建 Session 并完成登录、模型和审批模式配置。QQ 不再支持 `/new` 或
+`/new advanced`，请通过 `/sessions` 查看，再使用 `/switch <编号>` 选择。
+
+升级必须先等待所有 Turn、命令及交互结束，并停止旧 Bridge/Adapter 后成对安装。
+数据库迁移会终结遗留创建/销毁命令并移除旧向导状态，不删除已有 Session 或对话。
+历史命令与销毁保护记录仅为安全兼容保留，不再提供创建或销毁入口。
 
 QQ `/sessions` 的示例输出：
 
@@ -374,7 +361,8 @@ typing_duration_seconds = 60
 typing_refresh_seconds = 45
 ```
 
-直接编辑 TOML 后需要重启 Bridge；通过 `/notify` 切换不需要。
+直接编辑上述通知/输入状态配置后需要重启 Bridge；通过 `/notify` 切换通知模式不需要。
+授权列表追加使用独立的热更新机制。
 
 ## 14. 登录后自动启动
 
@@ -449,7 +437,8 @@ pending projection 数量。
 - 确保 Session 工作目录与 `ahp.authorized_targets`（本地目标会同步写回 `ahp.shared_workspaces`）中的某个目标精确一致。
 - 不要只配置共同父目录；每个实际 Session 目录都需要单独加入目标列表。
 - 运行 `qq-bridge ahp-sessions`，确认 Adapter 已发现该 Session 及其 `workspace_uris`。
-- 新增目录后若使用的是 `qq-bridge add-workspace`，需要重启 Bridge/Adapter。
+- 新增目录后运行 `qq-bridge reload-targets` 确认授权版本已同步，无需重启。
+  若命令不存在，请先在空闲时成对升级 Bridge/Adapter，而不要在活动任务中强制重启。
 
 ### Session 无法切换或加入监控
 

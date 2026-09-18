@@ -6,14 +6,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
-  type AgentInfo,
-  type ConfigPropertySchema,
-  type ConfigSchema,
-  type ModelSelection,
-  type ProtectedResourceMetadata,
   type RootState,
-  type SessionModelInfo,
-  type SessionState,
   type SessionSummary,
   type Snapshot,
   type URI,
@@ -22,20 +15,11 @@ import {
   AhpClient,
   AhpStateMirror,
   ClientClosedError,
-  RpcError,
   type Subscription,
-  type JsonRpcMessage,
-  TransportError,
-  type AhpTransport,
-  type TransportFrame,
 } from "@microsoft/agent-host-protocol/client";
 
 import { openEndpointTransport } from "./named-pipe-transport.js";
 import type { AdapterConfig } from "./config.js";
-import {
-  requestBrokeredCredential,
-  type ProtectedResourceRequest,
-} from "./credential-broker.js";
 import type {
   EndpointRegistryEntry,
   SocketEndpoint,
@@ -57,12 +41,6 @@ export type ManagedTarget =
       readonly port: number;
       readonly hostKeyFingerprints: readonly string[];
     };
-
-export interface SessionConfigOption {
-  readonly value: unknown;
-  readonly label: string;
-  readonly description?: string;
-}
 
 function localWorkspaceUriMatches(
   targetPath: string,
@@ -106,24 +84,6 @@ function normalizeWindowsPath(path: string): string {
     .toLocaleLowerCase("en-US");
 }
 
-export interface SupportedSessionField {
-  readonly property: string;
-  readonly options: readonly SessionConfigOption[];
-  readonly selected: unknown;
-}
-
-export interface SupportedModelSelection {
-  readonly options: readonly SessionConfigOption[];
-  readonly selected: ModelSelection;
-}
-
-export interface ManagedAuthBroker {
-  resolve(
-    request: ProtectedResourceRequest,
-    signal?: AbortSignal,
-  ): Promise<{ readonly token: string }>;
-}
-
 export interface PrepareTargetResult {
   readonly endpoint_id: string;
   readonly host_instance_id: string;
@@ -131,55 +91,12 @@ export interface PrepareTargetResult {
   readonly workspace_uri: string;
   readonly host_label: string;
   readonly editor_client_tools_available: boolean;
-  readonly resolved_values: unknown;
-  readonly model?: SupportedModelSelection;
-  readonly approval?: SupportedSessionField;
-}
-
-export interface CreateSessionResult {
-  readonly endpoint_id: string;
-  readonly host_instance_id: string;
-  readonly workspace_uri: string;
-  readonly host_label: string;
-  readonly editor_client_tools_available: boolean;
-  readonly session: SessionSummary;
-  readonly confirmation?: ManagedSessionConfirmation;
-}
-
-export interface ManagedSessionConfirmation {
-  close(): Promise<void>;
-}
-
-interface ManagedSessionObservation {
-  readonly session: SessionSummary;
-  readonly confirmation?: ManagedSessionConfirmation;
 }
 
 export async function prepareTargetResult(
   connection: ConnectedManagedTarget,
-  advanced: boolean,
-  config: Record<string, unknown> = {},
 ): Promise<PrepareTargetResult> {
   const provider = defaultManagedProvider(connection.rootState);
-  const resolved = await resolveSessionConfig(
-    connection.client,
-    provider,
-    connection.prepared.workspaceUri,
-    config,
-  );
-  const model = advanced
-    ? supportedModelSelection(managedAgent(connection.rootState, provider))
-    : undefined;
-  if (
-    !advanced &&
-    resolved.approval &&
-    fieldNeedsExplicitSelection(resolved.approval, resolved.values)
-  ) {
-    throw codedError(
-      "requires-new-advanced",
-      "Quick mode can only use host defaults; use /new advanced for this target.",
-    );
-  }
   return {
     endpoint_id: connection.prepared.endpointId,
     host_instance_id: connection.prepared.entry.instanceId,
@@ -188,283 +105,13 @@ export async function prepareTargetResult(
     host_label: connection.prepared.hostLabel,
     editor_client_tools_available:
       connection.prepared.editorClientToolsAvailable,
-    resolved_values: resolved.values,
-    ...(model ? { model } : {}),
-    ...(advanced && resolved.approval ? { approval: resolved.approval } : {}),
   };
-}
-
-export async function createManagedSession(
-  connection: ConnectedManagedTarget,
-  request: {
-    readonly provider: string;
-    readonly sessionUri: string;
-    readonly workspaceUri: string;
-    readonly resolvedValues: unknown;
-    readonly overrides: unknown;
-  },
-): Promise<CreateSessionResult> {
-  const mergedConfig = mergeConfigValues(request.resolvedValues, request.overrides);
-  const resolved = await resolveSessionConfig(
-    connection.client,
-    request.provider,
-    request.workspaceUri,
-    mergedConfig,
-  );
-  if (
-    resolved.approval &&
-      fieldNeedsExplicitSelection(resolved.approval, mergedConfig) &&
-      fieldNeedsExplicitSelection(resolved.approval, resolved.values)
-  ) {
-    throw codedError(
-      "requires-explicit-selection",
-      "The target still requires an explicit model or approval selection.",
-    );
-  }
-  const existing = (await refreshManagedSessions(connection.client)).find(
-    (session) => session.resource === request.sessionUri,
-  );
-  if (existing) {
-    requireMatchingCreatedSession(connection, request, existing);
-    return managedSessionResult(connection, { session: existing });
-  }
-  const progressToken = `create-${request.sessionUri}`;
-  let confirmation: ManagedSessionConfirmation | undefined;
-  try {
-    connection.setProgressToken(progressToken);
-    try {
-      await connection.client.request("createSession", {
-        channel: request.sessionUri,
-        provider: request.provider,
-        workingDirectories: [request.workspaceUri],
-        config: asRecord(resolved.values),
-        progressToken,
-      });
-    } catch (requestError) {
-      let reconciled: ManagedSessionObservation | undefined;
-      try {
-        reconciled = await waitForManagedSession(
-          connection.client,
-          request.sessionUri,
-        );
-      } catch (reconciliationError) {
-        throw new AggregateError(
-          [requestError, reconciliationError],
-          "created-session-reconciliation-failed",
-        );
-      }
-      if (reconciled) {
-        confirmation = reconciled.confirmation;
-        requireMatchingCreatedSession(connection, request, reconciled.session);
-        return managedSessionResult(connection, reconciled);
-      }
-      throw requestError;
-    } finally {
-      connection.setProgressToken(undefined);
-    }
-    const observation = await waitForManagedSession(
-      connection.client,
-      request.sessionUri,
-    );
-    if (observation) {
-      confirmation = observation.confirmation;
-      requireMatchingCreatedSession(connection, request, observation.session);
-      return managedSessionResult(connection, observation);
-    }
-    throw new Error("created-session-not-listed");
-  } catch (error) {
-    let confirmationError: unknown;
-    try {
-      await confirmation?.close();
-    } catch (closeError) {
-      confirmationError = closeError;
-    }
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "session-uri-conflict"
-    ) {
-      if (confirmationError !== undefined) {
-        throw new AggregateError(
-          [error, confirmationError],
-          "conflicting-session-confirmation-cleanup-failed",
-        );
-      }
-      throw error;
-    }
-    try {
-      await disposeManagedSession(connection, request.sessionUri);
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [
-          error,
-          ...(confirmationError === undefined ? [] : [confirmationError]),
-          cleanupError,
-        ],
-        "created-session-cleanup-failed",
-      );
-    }
-    if (confirmationError !== undefined) {
-      throw new AggregateError(
-        [error, confirmationError],
-        "created-session-confirmation-cleanup-failed",
-      );
-    }
-    throw error;
-  }
-}
-
-async function waitForManagedSession(
-  client: AhpClient,
-  sessionUri: string,
-): Promise<ManagedSessionObservation | undefined> {
-  const deadline = Date.now() + MANAGED_SESSION_RECONCILIATION_TIMEOUT_MS;
-  for (;;) {
-    if (Date.now() >= deadline) {
-      return undefined;
-    }
-    const sessions = await beforeDeadline(
-      () => refreshManagedSessions(client),
-      deadline,
-      "managed-session-reconciliation-timeout",
-    );
-    const session = sessions.find(
-      (candidate) => candidate.resource === sessionUri,
-    );
-    if (session) {
-      return { session };
-    }
-    const subscribed = await managedSessionFromSubscription(
-      client,
-      sessionUri,
-      deadline,
-    );
-    if (subscribed) {
-      return subscribed;
-    }
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      return undefined;
-    }
-    await new Promise((resolve) =>
-      setTimeout(resolve, Math.min(200, remaining)),
-    );
-  }
-}
-
-async function managedSessionFromSubscription(
-  client: AhpClient,
-  sessionUri: string,
-  deadline: number,
-): Promise<ManagedSessionObservation | undefined> {
-  let subscribed: Awaited<ReturnType<AhpClient["subscribe"]>>;
-  try {
-    subscribed = await beforeDeadline(
-      () =>
-        client.subscribe(sessionUri, {
-          delivery: { maxLatencyMs: 0 },
-        }),
-      deadline,
-      "managed-session-reconciliation-timeout",
-      (lateSubscription) =>
-        closeManagedSessionSubscription(
-          client,
-          sessionUri,
-          lateSubscription,
-        ),
-    );
-  } catch (error) {
-    if (error instanceof RpcError && error.code === AHP_RESOURCE_NOT_FOUND) {
-      return undefined;
-    }
-    throw error;
-  }
-  try {
-    const snapshot = subscribed.result.snapshot;
-    if (!snapshot || snapshot.resource !== sessionUri) {
-      throw codedError("invalid-created-session-snapshot");
-    }
-    const state = snapshot.state;
-    if (!isSessionState(state)) {
-      throw codedError("invalid-created-session-snapshot");
-    }
-    const timestamp = new Date().toISOString();
-    let closeTask: Promise<void> | undefined;
-    return {
-      session: {
-        resource: sessionUri,
-        provider: state.provider,
-        title: state.title.trim() || "New Session",
-        status: state.status,
-        ...(typeof state.activity === "string"
-          ? { activity: state.activity }
-          : {}),
-        ...(Array.isArray(state.workingDirectories) &&
-        state.workingDirectories.every(
-          (workspaceUri) => typeof workspaceUri === "string",
-        )
-          ? { workingDirectories: state.workingDirectories }
-          : {}),
-        createdAt: timestamp,
-        modifiedAt: timestamp,
-      },
-      confirmation: {
-        close(): Promise<void> {
-          closeTask ??= closeManagedSessionSubscription(
-            client,
-            sessionUri,
-            subscribed,
-          );
-          return closeTask;
-        },
-      },
-    };
-  } catch (error) {
-    try {
-      await closeManagedSessionSubscription(client, sessionUri, subscribed);
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "invalid-created-session-subscription-cleanup-failed",
-      );
-    }
-    throw error;
-  }
-}
-
-async function closeManagedSessionSubscription(
-  client: AhpClient,
-  sessionUri: string,
-  subscribed: Awaited<ReturnType<AhpClient["subscribe"]>>,
-): Promise<void> {
-  const errors: unknown[] = [];
-  try {
-    await subscribed.subscription.close();
-  } catch (error) {
-    errors.push(error);
-  }
-  try {
-    await client.unsubscribe(sessionUri);
-  } catch (error) {
-    errors.push(error);
-  }
-  if (errors.length === 1) {
-    throw errors[0];
-  }
-  if (errors.length > 1) {
-    throw new AggregateError(
-      errors,
-      "created-session-subscription-cleanup-failed",
-    );
-  }
 }
 
 function beforeDeadline<T>(
   startOperation: () => Promise<T>,
   deadline: number,
   timeoutCode: string,
-  lateSuccess?: (value: T) => Promise<void>,
 ): Promise<T> {
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
@@ -487,13 +134,6 @@ function beforeDeadline<T>(
     operation.then(
       (value) => {
         if (settled) {
-          if (lateSuccess) {
-            void lateSuccess(value).catch(() => {
-              process.stderr.write(
-                '{"level":"warn","message":"Late AHP subscription cleanup failed"}\n',
-              );
-            });
-          }
           return;
         }
         settled = true;
@@ -512,99 +152,6 @@ function beforeDeadline<T>(
   });
 }
 
-function isSessionState(value: unknown): value is SessionState {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value)
-  ) {
-    return false;
-  }
-  return (
-    "provider" in value &&
-    typeof value.provider === "string" &&
-    "title" in value &&
-    typeof value.title === "string" &&
-    "status" in value &&
-    typeof value.status === "number" &&
-    Number.isSafeInteger(value.status) &&
-    "lifecycle" in value &&
-    typeof value.lifecycle === "string" &&
-    "chats" in value &&
-    Array.isArray(value.chats) &&
-    "activeClients" in value &&
-    Array.isArray(value.activeClients)
-  );
-}
-
-function requireMatchingCreatedSession(
-  connection: ConnectedManagedTarget,
-  request: {
-    readonly provider: string;
-    readonly workspaceUri: string;
-  },
-  session: SessionSummary,
-): void {
-  if (
-    session.provider !== request.provider ||
-    !session.workingDirectories?.some((workspaceUri) =>
-      managedTargetMatchesWorkspaceUri(connection.prepared.target, workspaceUri),
-    )
-  ) {
-    throw codedError("session-uri-conflict");
-  }
-}
-
-export async function disposeManagedSession(
-  connection: ConnectedManagedTarget,
-  sessionUri: string,
-): Promise<void> {
-  const observation = await waitForManagedSession(
-    connection.client,
-    sessionUri,
-  );
-  if (!observation) {
-    return;
-  }
-  const errors: unknown[] = [];
-  try {
-    await observation.confirmation?.close();
-  } catch (error) {
-    errors.push(error);
-  }
-  try {
-    await beforeDeadline(
-      () =>
-        connection.client.request("disposeSession", {
-          channel: sessionUri,
-        }),
-      Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
-      "managed-session-disposal-timeout",
-    );
-  } catch (error) {
-    errors.push(error);
-  }
-  throwCleanupErrors(errors, "managed-session-disposal-failed");
-}
-
-function managedSessionResult(
-  connection: ConnectedManagedTarget,
-  observation: ManagedSessionObservation,
-): CreateSessionResult {
-  return {
-    endpoint_id: connection.prepared.endpointId,
-    host_instance_id: connection.prepared.entry.instanceId,
-    workspace_uri: connection.prepared.workspaceUri,
-    host_label: connection.prepared.hostLabel,
-    editor_client_tools_available:
-      connection.prepared.editorClientToolsAvailable,
-    session: observation.session,
-    ...(observation.confirmation
-      ? { confirmation: observation.confirmation }
-      : {}),
-  };
-}
-
 interface CodeAgentEndpointsDocument {
   readonly endpoints: readonly CodeAgentEndpoint[];
 }
@@ -617,14 +164,6 @@ interface CodeAgentEndpoint {
   readonly protocolVersion: string;
   readonly connectionToken: string;
   readonly endpoint: SocketEndpoint | TcpEndpoint | WebSocketEndpoint;
-}
-
-interface ProgressNotification {
-  readonly channel: string;
-  readonly progressToken: string;
-  readonly progress: number;
-  readonly total?: number;
-  readonly message?: string;
 }
 
 export interface PreparedTarget {
@@ -642,11 +181,9 @@ export interface PreparedTarget {
 const NEGOTIATED_PROTOCOL_VERSIONS = [...SUPPORTED_PROTOCOL_VERSIONS];
 const MANAGED_REQUEST_TIMEOUT_MS = 295_000;
 const MANAGED_CONTROL_REQUEST_TIMEOUT_MS = 30_000;
-const MANAGED_SESSION_RECONCILIATION_TIMEOUT_MS = 10_000;
 const LOCAL_STANDALONE_START_TIMEOUT_MS = 240_000;
 const LOCAL_STANDALONE_POLL_INTERVAL_MS = 250;
 const LOCAL_STANDALONE_OUTPUT_LIMIT = 64 * 1024;
-const AHP_RESOURCE_NOT_FOUND = -32_001;
 const STANDALONE_REGISTRY_PROTOCOL_ALIASES = new Map<string, string>([
   ["0.1.0", "0.9.0"],
 ]);
@@ -666,7 +203,6 @@ export interface ConnectedManagedTarget {
   readonly client: AhpClient;
   readonly rootState: RootState;
   readonly sessions: readonly SessionSummary[];
-  readonly setProgressToken: (token: string | undefined) => void;
   releasePreparedOwnership(): void;
   disconnect(): Promise<void>;
   close(): Promise<void>;
@@ -676,10 +212,6 @@ class ManagedRootTracker {
   readonly #mirror = new AhpStateMirror();
 
   readonly #subscription: Subscription;
-
-  readonly #waiters = new Set<() => void>();
-
-  readonly #closeController = new AbortController();
 
   #pump: Promise<void> | undefined;
 
@@ -701,48 +233,17 @@ class ManagedRootTracker {
     return this.#mirror.root;
   }
 
-  get signal(): AbortSignal {
-    return this.#closeController.signal;
-  }
-
-  start(
-    onAuthRequired: (resource: ProtectedResourceMetadata) => Promise<void>,
-  ): void {
+  start(): void {
     if (this.#pump) {
       return;
     }
-    this.#pump = this.#run(onAuthRequired).catch((error) => {
+    this.#pump = this.#run().catch((error) => {
       this.#error = error;
-      this.#signal();
     });
   }
 
-  async waitFor(
-    predicate: (state: RootState) => boolean,
-    deadline: number,
-    timeoutCode: string,
-  ): Promise<RootState> {
-    while (!predicate(this.root)) {
-      let resolveChange: (() => void) | undefined;
-      const change = new Promise<void>((resolve) => {
-        resolveChange = resolve;
-        this.#waiters.add(resolve);
-      });
-      try {
-        await beforeDeadline(() => change, deadline, timeoutCode);
-      } finally {
-        if (resolveChange) {
-          this.#waiters.delete(resolveChange);
-        }
-      }
-    }
-    return this.root;
-  }
-
   beginClose(): void {
-    this.#closeController.abort();
     this.#closed = true;
-    this.#signal();
   }
 
   async close(): Promise<void> {
@@ -751,173 +252,48 @@ class ManagedRootTracker {
     await this.#pump;
   }
 
-  async #run(
-    onAuthRequired: (resource: ProtectedResourceMetadata) => Promise<void>,
-  ): Promise<void> {
+  async #run(): Promise<void> {
     for await (const event of this.#subscription) {
       if (event.type === "action") {
         this.#mirror.apply(event.params);
       } else if (event.type === "authRequired") {
-        await onAuthRequired(event.params.resource);
+        throw codedError(
+          "authentication-required",
+          "Sign in to the Agent Host on the PC.",
+        );
       }
-      this.#signal();
     }
     if (!this.#closed) {
       throw codedError("managed-root-subscription-ended");
     }
   }
-
-  #signal(): void {
-    const waiters = [...this.#waiters];
-    this.#waiters.clear();
-    for (const resolve of waiters) {
-      resolve();
-    }
-  }
-}
-
-export class ManagedAuthenticator {
-  readonly #client: AhpClient;
-
-  readonly #rootState: () => RootState;
-
-  readonly #broker: ManagedAuthBroker;
-
-  readonly #signal: AbortSignal | undefined;
-
-  readonly #pending = new Map<string, Promise<void>>();
-
-  constructor(
-    client: AhpClient,
-    rootState: () => RootState,
-    broker: ManagedAuthBroker,
-    signal?: AbortSignal,
-  ) {
-    this.#client = client;
-    this.#rootState = rootState;
-    this.#broker = broker;
-    this.#signal = signal;
-  }
-
-  async authenticateProvider(provider: string): Promise<boolean> {
-    const agent = managedAgent(this.#rootState(), provider);
-    const resources = (agent.protectedResources ?? []).filter(
-      (resource) => resource.required !== false,
-    );
-    for (const resource of resources) {
-      await this.authenticateResource(provider, resource);
-    }
-    return resources.length > 0;
-  }
-
-  authenticateRequiredResource(
-    resource: ProtectedResourceMetadata,
-  ): Promise<void> {
-    const agent = this.#rootState().agents.find((candidate) =>
-      candidate.protectedResources?.some(
-        (advertised) => advertised.resource === resource.resource,
-      ),
-    );
-    if (!agent) {
-      throw codedError("unadvertised-authentication-resource");
-    }
-    return this.authenticateResource(agent.provider, resource);
-  }
-
-  authenticateResource(
-    provider: string,
-    resource: ProtectedResourceMetadata,
-  ): Promise<void> {
-    const existing = this.#pending.get(resource.resource);
-    if (existing) {
-      return existing;
-    }
-    const pending = this.#authenticateResource(provider, resource).finally(() => {
-      if (this.#pending.get(resource.resource) === pending) {
-        this.#pending.delete(resource.resource);
-      }
-    });
-    this.#pending.set(resource.resource, pending);
-    return pending;
-  }
-
-  async #authenticateResource(
-    provider: string,
-    resource: ProtectedResourceMetadata,
-  ): Promise<void> {
-    const authorizationServers = resource.authorization_servers ?? [];
-    const scopes = resource.scopes_supported ?? [];
-    if (authorizationServers.length === 0 || scopes.length === 0) {
-      throw codedError("invalid-authentication-metadata");
-    }
-    const credential = await this.#broker.resolve(
-      {
-        provider,
-        resource: resource.resource,
-        authorizationServers,
-        scopes,
-      },
-      this.#signal,
-    );
-    await beforeDeadline(
-      () =>
-        this.#client.request("authenticate", {
-          channel: "ahp-root://",
-          resource: resource.resource,
-          token: credential.token,
-          scopes: [...scopes],
-        }),
-      Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
-      "managed-authentication-timeout",
-    );
-  }
-}
-
-export function managedAuthBrokerForConfig(
-  config: AdapterConfig,
-): ManagedAuthBroker {
-  return {
-    resolve: (request, signal) =>
-      requestBrokeredCredential(config.bridgeToken, request, undefined, signal),
-  };
 }
 
 export async function connectManagedTarget(
   config: AdapterConfig,
   target: ManagedTarget,
-  onProgress?: (progress: ProgressNotification) => Promise<void> | void,
-  authBroker: ManagedAuthBroker = managedAuthBrokerForConfig(config),
 ): Promise<ConnectedManagedTarget> {
   const prepared = await prepareManagedTarget(config, target);
-  return connectPreparedTarget(prepared, onProgress, true, authBroker);
+  return connectPreparedTarget(prepared, true);
 }
 
 export async function connectPreparedManagedTarget(
   prepared: PreparedTarget,
-  onProgress?: (progress: ProgressNotification) => Promise<void> | void,
-  authBroker?: ManagedAuthBroker,
 ): Promise<ConnectedManagedTarget> {
-  return connectPreparedTarget(prepared, onProgress, false, authBroker);
+  return connectPreparedTarget(prepared, false);
 }
 
 async function connectPreparedTarget(
   prepared: PreparedTarget,
-  onProgress:
-    | ((progress: ProgressNotification) => Promise<void> | void)
-    | undefined,
   stopPreparedOnClose: boolean,
-  authBroker?: ManagedAuthBroker,
 ): Promise<ConnectedManagedTarget> {
   let client: AhpClient | undefined;
   let rootTracker: ManagedRootTracker | undefined;
   let ownsPrepared = stopPreparedOnClose;
   try {
-    const transport = new ProgressTapTransport(
-      await openEndpointTransport(
-        prepared.entry.endpoint,
-        prepared.entry.connectionToken,
-      ),
-      onProgress,
+    const transport = await openEndpointTransport(
+      prepared.entry.endpoint,
+      prepared.entry.connectionToken,
     );
     client = new AhpClient(transport, {
       requestTimeoutMs: MANAGED_REQUEST_TIMEOUT_MS,
@@ -958,34 +334,7 @@ async function connectPreparedTarget(
       rootSubscription,
     );
     const activeRootTracker = rootTracker;
-    const provider = defaultManagedProvider(activeRootTracker.root);
-    const requiresAuthentication = (
-      managedAgent(activeRootTracker.root, provider).protectedResources ?? []
-    ).some((resource) => resource.required !== false);
-    if (requiresAuthentication && !authBroker) {
-      throw codedError("authentication-broker-unavailable");
-    }
-    const authenticator = authBroker
-      ? new ManagedAuthenticator(
-          managedClient,
-          () => activeRootTracker.root,
-          authBroker,
-          activeRootTracker.signal,
-        )
-      : undefined;
-    activeRootTracker.start(async (resource) => {
-      if (!authenticator) {
-        throw codedError("authentication-broker-unavailable");
-      }
-      await authenticator.authenticateRequiredResource(resource);
-    });
-    if (authenticator && (await authenticator.authenticateProvider(provider))) {
-      await activeRootTracker.waitFor(
-        (state) => managedAgent(state, provider).models.length > 0,
-        Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
-        "managed-model-refresh-timeout",
-      );
-    }
+    activeRootTracker.start();
     const sessions = await listSessions(managedClient);
     const connectedClient = managedClient;
     return {
@@ -995,7 +344,6 @@ async function connectPreparedTarget(
         return activeRootTracker.root;
       },
       sessions,
-      setProgressToken: (token) => transport.setProgressToken(token),
       releasePreparedOwnership(): void {
         ownsPrepared = false;
       },
@@ -1130,12 +478,6 @@ async function stopOwnedLocalStandalone(
       cause: killError,
     });
   }
-}
-
-export async function refreshManagedSessions(
-  client: AhpClient,
-): Promise<readonly SessionSummary[]> {
-  return listSessions(client);
 }
 
 async function prepareManagedTarget(
@@ -2011,94 +1353,6 @@ function canConnectToLocalPort(port: number): Promise<boolean> {
   });
 }
 
-class ProgressTapTransport implements AhpTransport {
-  readonly #inner: AhpTransport;
-  readonly #onProgress:
-    | ((progress: ProgressNotification) => Promise<void> | void)
-    | undefined;
-  #progressToken: string | undefined;
-
-  constructor(
-    inner: AhpTransport,
-    onProgress?: (progress: ProgressNotification) => Promise<void> | void,
-  ) {
-    this.#inner = inner;
-    this.#onProgress = onProgress;
-  }
-
-  setProgressToken(token: string | undefined): void {
-    this.#progressToken = token;
-  }
-
-  send(message: JsonRpcMessage | string): Promise<void> | void {
-    return this.#inner.send(message);
-  }
-
-  async recv(): Promise<TransportFrame | null> {
-    const frame = await this.#inner.recv();
-    if (!frame) {
-      return frame;
-    }
-    const notification = readProgressNotification(frame);
-    if (
-      notification &&
-      this.#onProgress &&
-      notification.progressToken === this.#progressToken
-    ) {
-      await this.#onProgress(notification);
-    }
-    return frame;
-  }
-
-  close(): Promise<void> | void {
-    return this.#inner.close();
-  }
-}
-
-function readProgressNotification(
-  frame: TransportFrame,
-): ProgressNotification | undefined {
-  try {
-    const message =
-      frame.kind === "parsed"
-        ? frame.message
-        : JSON.parse(
-            frame.kind === "text"
-              ? frame.text
-              : Buffer.from(frame.data).toString("utf8"),
-          );
-    if (
-      !message ||
-      typeof message !== "object" ||
-      message.method !== "root/progress" ||
-      typeof message.params !== "object" ||
-      message.params === null
-    ) {
-      return undefined;
-    }
-    const params = message.params as Record<string, unknown>;
-    if (
-      typeof params.channel !== "string" ||
-      typeof params.progressToken !== "string" ||
-      typeof params.progress !== "number"
-    ) {
-      return undefined;
-    }
-    return {
-      channel: params.channel,
-      progressToken: params.progressToken,
-      progress: params.progress,
-      ...(typeof params.total === "number" ? { total: params.total } : {}),
-      ...(typeof params.message === "string" ? { message: params.message } : {}),
-    };
-  } catch (error) {
-    if (error instanceof TransportError) {
-      throw error;
-    }
-    return undefined;
-  }
-}
-
 export function defaultManagedProvider(
   rootState: Pick<RootState, "agents">,
 ): string {
@@ -2111,297 +1365,6 @@ export function defaultManagedProvider(
     return rootState.agents[0].provider;
   }
   throw codedError("provider-selection-required");
-}
-
-function managedAgent(rootState: RootState, provider: string): AgentInfo {
-  const agent = rootState.agents.find(
-    (candidate) => candidate.provider === provider,
-  );
-  if (!agent) {
-    throw codedError("managed-provider-unavailable");
-  }
-  return agent;
-}
-
-export function supportedModelSelection(
-  agent: AgentInfo,
-): SupportedModelSelection | undefined {
-  const seen = new Set<string>();
-  const options: SessionConfigOption[] = [];
-  let selected: ModelSelection | undefined;
-  for (const model of agent.models) {
-    if (
-      model.provider !== agent.provider ||
-      model.policyState === "disabled" ||
-      seen.has(model.id)
-    ) {
-      continue;
-    }
-    const selection = defaultModelSelection(model);
-    if (!selection) {
-      continue;
-    }
-    seen.add(model.id);
-    selected ??= selection;
-    const description = modelDescription(model);
-    options.push({
-      value: selection,
-      label: model.name,
-      ...(description ? { description } : {}),
-    });
-  }
-  if (agent.models.length > 0 && options.length === 0) {
-    throw codedError("managed-model-configuration-required");
-  }
-  if (!selected) {
-    return undefined;
-  }
-  return {
-    options,
-    selected,
-  };
-}
-
-function defaultModelSelection(
-  model: SessionModelInfo,
-): ModelSelection | undefined {
-  const schema = model.configSchema;
-  if (!schema) {
-    return { id: model.id };
-  }
-  const config: NonNullable<ModelSelection["config"]> = {};
-  const required = new Set(schema.required ?? []);
-  for (const [property, descriptor] of Object.entries(
-    schema.properties,
-  )) {
-    if (descriptor.default === undefined) {
-      if (required.has(property)) {
-        return undefined;
-      }
-      continue;
-    }
-    if (!isJsonPrimitive(descriptor.default)) {
-      if (required.has(property)) {
-        return undefined;
-      }
-      continue;
-    }
-    if (
-      descriptor.enum &&
-      !descriptor.enum.some((candidate) => candidate === descriptor.default)
-    ) {
-      return undefined;
-    }
-    config[property] = descriptor.default;
-  }
-  if (
-    [...required].some((property) => !(property in schema.properties))
-  ) {
-    return undefined;
-  }
-  return Object.keys(config).length > 0
-    ? { id: model.id, config }
-    : { id: model.id };
-}
-
-function modelDescription(model: SessionModelInfo): string | undefined {
-  const capabilities = [
-    model.supportsVision ? "vision" : undefined,
-    model.maxContextWindow
-      ? `context ${model.maxContextWindow.toLocaleString("en-US")}`
-      : undefined,
-  ].filter((value): value is string => value !== undefined);
-  return capabilities.length > 0 ? capabilities.join(", ") : undefined;
-}
-
-function isJsonPrimitive(
-  value: unknown,
-): value is string | number | boolean | null {
-  return (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  );
-}
-
-async function resolveSessionConfig(
-  client: AhpClient,
-  provider: string,
-  workspaceUri: string,
-  config: Record<string, unknown>,
-): Promise<{
-  readonly values: Record<string, unknown>;
-  readonly approval?: SupportedSessionField;
-}> {
-  const deadline = Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS;
-  const result = await beforeDeadline(
-    () =>
-      client.request("resolveSessionConfig", {
-        channel: "ahp-root://",
-        provider,
-        workingDirectory: workspaceUri,
-        config,
-      }),
-    deadline,
-    "managed-config-resolution-timeout",
-  );
-  const schema = asSchema(result.schema);
-  const values = asRecord(result.values);
-  const approval = await supportedField(
-    client,
-    provider,
-    workspaceUri,
-    schema,
-    values,
-    /approval|confirm|permission/iu,
-    deadline,
-  );
-  const required = schema.required ?? [];
-  for (const property of required) {
-    if (
-      !(property in values) &&
-      property !== approval?.property
-    ) {
-      throw codedError(
-        `unsupported-required-config-${property}`,
-        `unsupported-required-config:${property}`,
-      );
-    }
-  }
-  return {
-    values,
-    ...(approval ? { approval } : {}),
-  };
-}
-
-async function supportedField(
-  client: AhpClient,
-  provider: string,
-  workspaceUri: string,
-  schema: ConfigSchema,
-  values: Record<string, unknown>,
-  matcher: RegExp,
-  deadline: number,
-): Promise<SupportedSessionField | undefined> {
-  for (const [property, descriptor] of Object.entries(schema.properties)) {
-    if (
-      !matcher.test(property) &&
-      !matcher.test(descriptor.title) &&
-      !(descriptor.description && matcher.test(descriptor.description))
-    ) {
-      continue;
-    }
-    const options = await propertyOptions(
-      client,
-      provider,
-      workspaceUri,
-      property,
-      descriptor,
-      values,
-      deadline,
-    );
-    if (!options.length) {
-      continue;
-    }
-    const fallbackValue =
-      property in values
-        ? values[property]
-        : descriptor.default !== undefined
-          ? structuredClone(descriptor.default)
-          : options[0]?.value;
-    if (fallbackValue === undefined) {
-      continue;
-    }
-    return {
-      property,
-      options,
-      selected: fallbackValue,
-    };
-  }
-  return undefined;
-}
-
-function fieldNeedsExplicitSelection(
-  field: SupportedSessionField,
-  values: Record<string, unknown>,
-): boolean {
-  return !(field.property in values);
-}
-
-async function propertyOptions(
-  client: AhpClient,
-  provider: string,
-  workspaceUri: string,
-  property: string,
-  descriptor: ConfigPropertySchema,
-  values: Record<string, unknown>,
-  deadline: number,
-): Promise<readonly SessionConfigOption[]> {
-  if (Array.isArray(descriptor.enum) && descriptor.enum.length > 0) {
-    return descriptor.enum.map((value, index) => ({
-      value,
-      label:
-        typeof descriptor.enumLabels?.[index] === "string"
-          ? descriptor.enumLabels[index]
-          : String(value),
-      ...(typeof descriptor.enumDescriptions?.[index] === "string"
-        ? { description: descriptor.enumDescriptions[index] }
-        : {}),
-    }));
-  }
-  if (!("enumDynamic" in descriptor) || descriptor.enumDynamic !== true) {
-    return [];
-  }
-  const result = await beforeDeadline(
-    () =>
-      client.request("sessionConfigCompletions", {
-        channel: "ahp-root://",
-        provider,
-        workingDirectory: workspaceUri,
-        config: values,
-        property,
-        query: "",
-      }),
-    deadline,
-    "managed-config-completions-timeout",
-  );
-  return result.items.map((item) => ({
-    value: item.value,
-    label: item.label,
-    ...(item.description ? { description: item.description } : {}),
-  }));
-}
-
-function mergeConfigValues(
-  base: unknown,
-  overrides: unknown,
-): Record<string, unknown> {
-  return {
-    ...asRecord(base),
-    ...asRecord(overrides),
-  };
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("invalid-config-record");
-  }
-  return value as Record<string, unknown>;
-}
-
-function asSchema(value: unknown): ConfigSchema {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    (value as { type?: unknown }).type !== "object" ||
-    typeof (value as { properties?: unknown }).properties !== "object" ||
-    (value as { properties?: unknown }).properties === null
-  ) {
-    throw new Error("invalid-config-schema");
-  }
-  return value as ConfigSchema;
 }
 
 function codedError(

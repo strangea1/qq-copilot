@@ -40,7 +40,6 @@ pub struct AhpStatus {
     pub pending_approvals: u32,
     pub pending_inputs: u32,
     pub pending_projections: u32,
-    pub creation: Option<AhpCreationWizardStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,34 +170,12 @@ pub struct AhpProjectionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpCommandProgressRecord {
-    pub progress: u64,
-    pub total: Option<u64>,
-    pub message: Option<String>,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpCommandStatusRecord {
     pub command_id: i64,
     pub kind: AhpCommandKind,
     pub state: String,
     pub error_code: Option<String>,
     pub result: Option<Value>,
-    pub progress: Option<AhpCommandProgressRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AhpTurnObservationRecord {
-    pub kind: String,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AhpCreationCompletionOutcome {
-    Completed,
-    CancelRequested,
-    TurnTerminated(AhpTurnObservationRecord),
 }
 
 struct AhpCommandAckRecord {
@@ -208,53 +185,6 @@ struct AhpCommandAckRecord {
     lease_owner: Option<String>,
     error_code: Option<String>,
     result_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpCreationWizardRecord {
-    pub wizard_id: String,
-    pub mode: String,
-    pub state: String,
-    pub context: Option<Value>,
-    pub pending_task: Option<String>,
-    pub create_command_id: Option<i64>,
-    pub new_session_uri: Option<String>,
-    pub old_binding_endpoint_id: Option<String>,
-    pub old_binding_session_uri: Option<String>,
-    pub old_binding_host_instance_id: Option<String>,
-    pub cancel_requested: bool,
-    pub expires_at: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpCreationWizardStatus {
-    pub wizard_id: String,
-    pub mode: String,
-    pub state: String,
-    pub expires_at: i64,
-    pub cancel_requested: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AhpCreationCancelOutcome {
-    Requested,
-    Cleared,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AhpCreationButtonFailureOutcome {
-    Cleared,
-    Retained,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpWizardButtonRecord {
-    pub button_data: String,
-    pub wizard_id: String,
-    pub action_kind: String,
-    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,41 +428,6 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_ahp_projections_pending
                 ON ahp_projections(state, created_at);
 
-            CREATE TABLE IF NOT EXISTS ahp_creation_wizard (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                wizard_id TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK (mode IN ('quick', 'advanced')),
-                state TEXT NOT NULL CHECK (
-                    state IN (
-                        'select_target', 'select_model', 'select_approval',
-                        'await_task', 'creating', 'cancelled'
-                    )
-                ),
-                context_json TEXT,
-                pending_task TEXT,
-                create_command_id INTEGER REFERENCES ahp_commands(command_id),
-                new_session_uri TEXT,
-                old_binding_endpoint_id TEXT,
-                old_binding_session_uri TEXT,
-                old_binding_host_instance_id TEXT,
-                cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1)),
-                expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ahp_creation_buttons (
-                button_data TEXT PRIMARY KEY,
-                wizard_id TEXT NOT NULL,
-                action_kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
-                used_at INTEGER,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_ahp_creation_buttons_expiry
-                ON ahp_creation_buttons(expires_at, used_at);
-
             CREATE TABLE IF NOT EXISTS ahp_trust_requests (
                 request_id TEXT PRIMARY KEY,
                 workspace_uri TEXT NOT NULL,
@@ -739,6 +634,7 @@ fn migrate_ahp_schema(connection: &Connection) -> Result<()> {
         "ALTER TABLE ahp_commands ADD COLUMN progress_updated_at INTEGER",
     )?;
     migrate_ahp_command_kinds(connection)?;
+    retire_legacy_session_creation(connection)?;
     let mut missing = {
         let mut statement = connection.prepare(
             "SELECT approval_key FROM ahp_approvals
@@ -797,6 +693,58 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
         .optional()
         .map(|row| row.is_some())
         .context("failed to inspect SQLite schema")
+}
+
+fn retire_legacy_session_creation(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    let now = now();
+    let mut retired = transaction.execute(
+        "UPDATE ahp_commands
+         SET state = 'failed', error_code = 'session_creation_removed',
+             lease_owner = NULL, lease_expires_at = NULL,
+             progress_json = NULL, progress_updated_at = NULL, updated_at = ?1
+         WHERE state IN ('pending', 'leased')
+           AND (
+                kind IN ('create_session', 'dispose_session')
+                OR (kind = 'prepare_target' AND command_key LIKE 'prepare-target:%')
+           )",
+        [now],
+    )?;
+    if table_exists(&transaction, "ahp_creation_wizard")? {
+        retired += transaction.execute(
+            "UPDATE ahp_commands
+             SET state = 'failed', error_code = 'session_creation_removed',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 progress_json = NULL, progress_updated_at = NULL, updated_at = ?1
+             WHERE state IN ('pending', 'leased')
+               AND kind IN ('bind_session', 'send_message')
+               AND json_extract(data_json, '$.session_uri') IN (
+                    SELECT new_session_uri FROM ahp_creation_wizard
+                    WHERE new_session_uri IS NOT NULL
+               )",
+            [now],
+        )?;
+        transaction.execute(
+            "UPDATE ahp_bindings
+             SET state = 'failed', error_code = 'session_creation_removed', updated_at = ?1
+             WHERE state = 'binding' AND active_turn_id IS NULL
+               AND session_uri IN (
+                    SELECT new_session_uri FROM ahp_creation_wizard
+                    WHERE new_session_uri IS NOT NULL
+               )",
+            [now],
+        )?;
+    }
+    // Keep command history and existing Sessions; only the retired wizard state is removed.
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS ahp_creation_buttons;
+         DROP TABLE IF EXISTS ahp_creation_wizard;",
+    )?;
+    transaction.commit()?;
+    if retired != 0 {
+        tracing::warn!(retired, "retired commands for removed QQ Session creation");
+    }
+    Ok(())
 }
 
 fn migrate_legacy_binding(connection: &Connection) -> Result<()> {
@@ -1808,46 +1756,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn ahp_turn_observation(
-        &self,
-        session_uri: &str,
-        turn_id: &str,
-    ) -> Result<Option<AhpTurnObservationRecord>> {
-        let connection = self.connection()?;
-        let row: Option<(String, String)> = connection
-            .query_row(
-                "SELECT kind, data_redacted_json
-                 FROM ahp_events
-                 WHERE session_uri = ?1
-                   AND turn_id = ?2
-                   AND kind IN (
-                       'assistant_message', 'tool_status', 'approval_pending', 'input_pending',
-                       'turn_completed', 'turn_cancelled', 'turn_failed'
-                   )
-                 ORDER BY CASE
-                     WHEN kind IN ('turn_completed', 'turn_cancelled', 'turn_failed') THEN 0
-                     ELSE 1
-                 END, event_sequence ASC
-                 LIMIT 1",
-                params![session_uri, turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .context("failed to query AHP Turn observation")?;
-        row.map(|(kind, data)| {
-            let data: Value =
-                serde_json::from_str(&data).context("stored AHP event data is invalid")?;
-            Ok(AhpTurnObservationRecord {
-                kind,
-                summary: data
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-        })
-        .transpose()
-    }
-
     pub fn ahp_enqueue_message(&self, message_id: &str, content: &str) -> Result<i64> {
         let binding = self
             .ahp_binding()?
@@ -1861,31 +1769,16 @@ impl Database {
         session_uri: &str,
         content: &str,
     ) -> Result<i64> {
-        self.ahp_enqueue_message_to_session_with_model(message_id, session_uri, content, None)
-    }
-
-    pub fn ahp_enqueue_message_to_session_with_model(
-        &self,
-        message_id: &str,
-        session_uri: &str,
-        content: &str,
-        model_selection: Option<&Value>,
-    ) -> Result<i64> {
         let now = now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding = require_routable_binding_for_session(&transaction, session_uri)?;
-        let mut data = json!({
+        let data = json!({
             "client_message_id": message_id,
             "session_uri": binding.session_uri,
             "chat_uri": binding.chat_uri,
             "content": content,
         });
-        if let Some(model_selection) = model_selection {
-            data.as_object_mut()
-                .context("AHP send_message payload is not an object")?
-                .insert("model_selection".to_owned(), model_selection.clone());
-        }
         let command_id = enqueue_command(
             &transaction,
             &format!("qq-message:{message_id}"),
@@ -1950,51 +1843,6 @@ impl Database {
 
     pub fn ahp_enqueue_prepare_target(&self, command_key: &str, data: &Value) -> Result<i64> {
         self.ahp_enqueue_unbound_command(command_key, AhpCommandKind::PrepareTarget, data)
-    }
-
-    pub fn ahp_begin_session_creation(
-        &self,
-        wizard: &AhpCreationWizardRecord,
-        command_key: &str,
-        data: &Value,
-    ) -> Result<Option<AhpCreationWizardRecord>> {
-        validate_creation_wizard(wizard)?;
-        if wizard.state != "creating"
-            || wizard.pending_task.is_none()
-            || wizard.create_command_id.is_some()
-            || wizard.new_session_uri.is_none()
-            || wizard.cancel_requested
-        {
-            bail!("invalid AHP Session creation transition");
-        }
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_ahp_auxiliary_state(&transaction, now)?;
-        if !creation_wizard_matches(&transaction, &wizard.wizard_id, "await_task", now)? {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let command_id = enqueue_command(
-            &transaction,
-            command_key,
-            "__unbound__",
-            0,
-            AhpCommandKind::CreateSession,
-            data,
-            now,
-        )?;
-        let mut started = wizard.clone();
-        started.create_command_id = Some(command_id);
-        if update_creation_wizard(&transaction, &started, "await_task")? != 1 {
-            bail!("AHP creation wizard changed before Session creation");
-        }
-        transaction.commit()?;
-        Ok(Some(started))
-    }
-
-    pub fn ahp_enqueue_dispose_session(&self, command_key: &str, data: &Value) -> Result<i64> {
-        self.ahp_enqueue_unbound_command(command_key, AhpCommandKind::DisposeSession, data)
     }
 
     fn ahp_enqueue_unbound_command(
@@ -2468,6 +2316,7 @@ impl Database {
                             | "binding_migration_unresolved"
                             | "bridge_timeout"
                             | "creation_rollback"
+                            | "session_creation_removed"
                     )
                 )
             {
@@ -2560,60 +2409,15 @@ impl Database {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn ahp_record_command_progress(
-        &self,
-        adapter_id: &str,
-        adapter_instance_id: &str,
-        command_id: i64,
-        progress: u64,
-        total: Option<u64>,
-        message: Option<&str>,
-        lease_seconds: u64,
-    ) -> Result<()> {
-        let now = now();
-        let lease_expires_at = now
-            + i64::try_from(lease_seconds).context("AHP command lease exceeds supported range")?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_adapter(&transaction, adapter_id, adapter_instance_id)?;
-        let payload = canonical_json(&json!({
-            "progress": progress,
-            "total": total,
-            "message": message,
-        }));
-        let changed = transaction.execute(
-            "UPDATE ahp_commands
-             SET progress_json = ?1, progress_updated_at = ?2,
-                 lease_expires_at = ?3, updated_at = ?2
-             WHERE command_id = ?4 AND state = 'leased' AND lease_owner = ?5",
-            params![
-                payload,
-                now,
-                lease_expires_at,
-                command_id,
-                adapter_instance_id
-            ],
-        )?;
-        if changed != 1 {
-            bail!("AHP command progress targets a stale or inactive lease");
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     pub fn ahp_command_status(&self, command_id: i64) -> Result<Option<AhpCommandStatusRecord>> {
         self.connection()?
             .query_row(
-                "SELECT command_id, kind, state, error_code, result_json,
-                        progress_json, progress_updated_at
+                "SELECT command_id, kind, state, error_code, result_json
                  FROM ahp_commands WHERE command_id = ?1",
                 [command_id],
                 |row| {
                     let kind: String = row.get(1)?;
                     let result: Option<String> = row.get(4)?;
-                    let progress: Option<String> = row.get(5)?;
-                    let progress_updated_at: Option<i64> = row.get(6)?;
                     Ok(AhpCommandStatusRecord {
                         command_id: row.get(0)?,
                         kind: AhpCommandKind::try_from(kind.as_str()).map_err(|error| {
@@ -2639,97 +2443,11 @@ impl Database {
                                 })
                             })
                             .transpose()?,
-                        progress: match (progress, progress_updated_at) {
-                            (Some(progress), Some(updated_at)) => {
-                                let progress: Value =
-                                    serde_json::from_str(&progress).map_err(|error| {
-                                        SqliteError::FromSqlConversionFailure(
-                                            5,
-                                            rusqlite::types::Type::Text,
-                                            Box::new(error),
-                                        )
-                                    })?;
-                                Some(AhpCommandProgressRecord {
-                                    progress: progress
-                                        .get("progress")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(0),
-                                    total: progress.get("total").and_then(Value::as_u64),
-                                    message: progress
-                                        .get("message")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_owned),
-                                    updated_at,
-                                })
-                            }
-                            _ => None,
-                        },
                     })
                 },
             )
             .optional()
             .context("failed to query AHP command status")
-    }
-
-    pub fn ahp_retire_timed_out_command(&self, command_id: i64) -> Result<bool> {
-        let now = now();
-        let changed = self.connection()?.execute(
-            "UPDATE ahp_commands
-             SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
-                 error_code = 'bridge_timeout', progress_json = NULL,
-                 progress_updated_at = NULL, updated_at = ?1
-             WHERE command_id = ?2
-               AND state = 'pending'",
-            params![now, command_id],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn ahp_quiesce_binding_commands(&self, binding_id: &str) -> Result<bool> {
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "UPDATE ahp_commands
-             SET state = 'failed', lease_owner = NULL, lease_expires_at = NULL,
-                 error_code = 'creation_rollback', progress_json = NULL,
-                 progress_updated_at = NULL, updated_at = ?1
-             WHERE binding_id = ?2
-               AND kind IN (
-                    'bind_session', 'send_message', 'approve_tool',
-                    'review_tool_result', 'complete_input'
-               )
-               AND state = 'pending'",
-            params![now, binding_id],
-        )?;
-        let remaining: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM ahp_commands
-             WHERE binding_id = ?1 AND state IN ('pending', 'leased')",
-            [binding_id],
-            |row| row.get(0),
-        )?;
-        if remaining == 0 {
-            transaction.execute(
-                "UPDATE ahp_approvals
-                 SET state = 'failed', updated_at = ?1
-                 WHERE state IN ('pending', 'submitted')
-                   AND session_uri = (
-                        SELECT session_uri FROM ahp_bindings WHERE binding_id = ?2
-                   )",
-                params![now, binding_id],
-            )?;
-            transaction.execute(
-                "UPDATE ahp_inputs
-                 SET state = 'failed', updated_at = ?1
-                 WHERE state IN ('pending', 'submitted')
-                   AND session_uri = (
-                        SELECT session_uri FROM ahp_bindings WHERE binding_id = ?2
-                   )",
-                params![now, binding_id],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(remaining == 0)
     }
 
     pub fn ahp_has_pending_commands(&self) -> Result<bool> {
@@ -2869,403 +2587,7 @@ impl Database {
             pending_approvals,
             pending_inputs,
             pending_projections,
-            creation: self.ahp_creation_wizard_status()?,
         })
-    }
-
-    pub fn ahp_creation_wizard(&self) -> Result<Option<AhpCreationWizardRecord>> {
-        let now = now();
-        let connection = self.connection()?;
-        expire_ahp_auxiliary_state(&connection, now)?;
-        connection
-            .query_row(
-                "SELECT wizard_id, mode, state, context_json, pending_task, create_command_id,
-                        new_session_uri, old_binding_endpoint_id, old_binding_session_uri,
-                        old_binding_host_instance_id, cancel_requested, expires_at,
-                        created_at, updated_at
-                 FROM ahp_creation_wizard WHERE singleton = 1",
-                [],
-                map_creation_wizard,
-            )
-            .optional()
-            .context("failed to query AHP creation wizard")
-    }
-
-    pub fn ahp_creation_wizard_status(&self) -> Result<Option<AhpCreationWizardStatus>> {
-        self.ahp_creation_wizard().map(|wizard| {
-            wizard.map(|wizard| AhpCreationWizardStatus {
-                wizard_id: wizard.wizard_id,
-                mode: wizard.mode,
-                state: wizard.state,
-                expires_at: wizard.expires_at,
-                cancel_requested: wizard.cancel_requested,
-            })
-        })
-    }
-
-    pub fn ahp_insert_creation_wizard(&self, wizard: &AhpCreationWizardRecord) -> Result<bool> {
-        validate_creation_wizard(wizard)?;
-        let context = wizard.context.as_ref().map(canonical_json);
-        let changed = self.connection()?.execute(
-            "INSERT INTO ahp_creation_wizard(
-                singleton, wizard_id, mode, state, context_json, pending_task,
-                create_command_id, new_session_uri, old_binding_endpoint_id,
-                old_binding_session_uri, old_binding_host_instance_id, cancel_requested,
-                expires_at, created_at, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(singleton) DO NOTHING",
-            params![
-                wizard.wizard_id,
-                wizard.mode,
-                wizard.state,
-                context,
-                wizard.pending_task,
-                wizard.create_command_id,
-                wizard.new_session_uri,
-                wizard.old_binding_endpoint_id,
-                wizard.old_binding_session_uri,
-                wizard.old_binding_host_instance_id,
-                if wizard.cancel_requested {
-                    1_i64
-                } else {
-                    0_i64
-                },
-                wizard.expires_at,
-                wizard.created_at,
-                wizard.updated_at
-            ],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn ahp_transition_creation_wizard(
-        &self,
-        wizard: &AhpCreationWizardRecord,
-        expected_state: &str,
-    ) -> Result<bool> {
-        validate_creation_wizard(wizard)?;
-        if wizard.cancel_requested {
-            bail!("cannot transition a cancelled AHP creation wizard");
-        }
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_ahp_auxiliary_state(&transaction, now)?;
-        let changed = update_creation_wizard(&transaction, wizard, expected_state)?;
-        transaction.commit()?;
-        Ok(changed == 1)
-    }
-
-    pub fn ahp_begin_creation_preparation(
-        &self,
-        wizard: &AhpCreationWizardRecord,
-        expected_state: &str,
-        command_key: &str,
-        data: &Value,
-    ) -> Result<Option<(AhpCreationWizardRecord, i64)>> {
-        validate_creation_wizard(wizard)?;
-        if wizard.state != "creating"
-            || wizard.create_command_id.is_some()
-            || wizard.cancel_requested
-        {
-            bail!("invalid AHP creation preparation transition");
-        }
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_ahp_auxiliary_state(&transaction, now)?;
-        if !creation_wizard_matches(&transaction, &wizard.wizard_id, expected_state, now)? {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        let command_id = enqueue_command(
-            &transaction,
-            command_key,
-            "__unbound__",
-            0,
-            AhpCommandKind::PrepareTarget,
-            data,
-            now,
-        )?;
-        if update_creation_wizard(&transaction, wizard, expected_state)? != 1 {
-            bail!("AHP creation wizard changed before target preparation");
-        }
-        transaction.commit()?;
-        Ok(Some((wizard.clone(), command_id)))
-    }
-
-    pub fn ahp_clear_creation_wizard_if_matches(&self, wizard_id: &str) -> Result<bool> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [wizard_id],
-        )?;
-        let changed = transaction.execute(
-            "DELETE FROM ahp_creation_wizard
-             WHERE singleton = 1 AND wizard_id = ?1",
-            [wizard_id],
-        )?;
-        transaction.commit()?;
-        Ok(changed == 1)
-    }
-
-    pub fn ahp_handle_creation_button_failure(
-        &self,
-        wizard_id: &str,
-        action_kind: &str,
-    ) -> Result<Option<AhpCreationButtonFailureOutcome>> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = transaction
-            .query_row(
-                "SELECT state, context_json, create_command_id, new_session_uri
-                 FROM ahp_creation_wizard
-                 WHERE singleton = 1 AND wizard_id = ?1",
-                [wizard_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((state, context, create_command_id, new_session_uri)) = current else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let preparation =
-            state == "creating" && create_command_id.is_none() && new_session_uri.is_none();
-        let owned = match action_kind {
-            "target" => state == "select_target" || preparation && context.is_none(),
-            "model" => state == "select_model",
-            "approval" => state == "select_approval" || preparation && context.is_some(),
-            _ => false,
-        };
-        if !owned {
-            transaction.commit()?;
-            return Ok(Some(AhpCreationButtonFailureOutcome::Retained));
-        }
-        transaction.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [wizard_id],
-        )?;
-        let changed = transaction.execute(
-            "DELETE FROM ahp_creation_wizard
-             WHERE singleton = 1 AND wizard_id = ?1",
-            [wizard_id],
-        )?;
-        if changed != 1 {
-            bail!("AHP creation wizard changed during button failure cleanup");
-        }
-        transaction.commit()?;
-        Ok(Some(AhpCreationButtonFailureOutcome::Cleared))
-    }
-
-    pub fn ahp_cancel_creation_wizard(&self) -> Result<Option<AhpCreationCancelOutcome>> {
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let wizard: Option<(String, String)> = transaction
-            .query_row(
-                "SELECT wizard_id, state FROM ahp_creation_wizard WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((wizard_id, state)) = wizard else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        if state == "creating" {
-            let changed = transaction.execute(
-                "UPDATE ahp_creation_wizard
-                 SET cancel_requested = 1, updated_at = ?1
-                 WHERE singleton = 1 AND wizard_id = ?2 AND state = 'creating'",
-                params![now, wizard_id],
-            )?;
-            if changed != 1 {
-                bail!("AHP creation wizard changed before cancellation");
-            }
-            transaction.commit()?;
-            return Ok(Some(AhpCreationCancelOutcome::Requested));
-        }
-        transaction.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [&wizard_id],
-        )?;
-        let changed = transaction.execute(
-            "DELETE FROM ahp_creation_wizard
-             WHERE singleton = 1 AND wizard_id = ?1 AND state != 'creating'",
-            [&wizard_id],
-        )?;
-        if changed != 1 {
-            bail!("AHP creation wizard changed before cancellation");
-        }
-        transaction.commit()?;
-        Ok(Some(AhpCreationCancelOutcome::Cleared))
-    }
-
-    pub fn ahp_complete_creation_wizard(
-        &self,
-        wizard_id: &str,
-        session_uri: &str,
-        turn_id: &str,
-    ) -> Result<AhpCreationCompletionOutcome> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cancel_requested: i64 = transaction
-            .query_row(
-                "SELECT cancel_requested FROM ahp_creation_wizard
-                 WHERE singleton = 1 AND wizard_id = ?1",
-                [wizard_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .context("AHP creation wizard disappeared before completion")?;
-        if cancel_requested != 0 {
-            transaction.commit()?;
-            return Ok(AhpCreationCompletionOutcome::CancelRequested);
-        }
-        let terminal: Option<(String, String)> = transaction
-            .query_row(
-                "SELECT kind, data_redacted_json
-                 FROM ahp_events
-                 WHERE session_uri = ?1 AND turn_id = ?2
-                   AND kind IN ('turn_cancelled', 'turn_failed')
-                 ORDER BY event_sequence ASC
-                 LIMIT 1",
-                params![session_uri, turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .context("failed to query terminal AHP creation Turn")?;
-        if let Some((kind, data)) = terminal {
-            let data: Value =
-                serde_json::from_str(&data).context("stored AHP event data is invalid")?;
-            transaction.commit()?;
-            return Ok(AhpCreationCompletionOutcome::TurnTerminated(
-                AhpTurnObservationRecord {
-                    kind,
-                    summary: data
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                },
-            ));
-        }
-        transaction.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [wizard_id],
-        )?;
-        let changed = transaction.execute(
-            "DELETE FROM ahp_creation_wizard
-             WHERE singleton = 1 AND wizard_id = ?1 AND cancel_requested = 0",
-            [wizard_id],
-        )?;
-        if changed != 1 {
-            bail!("AHP creation wizard changed before completion");
-        }
-        transaction.commit()?;
-        Ok(AhpCreationCompletionOutcome::Completed)
-    }
-
-    pub fn ahp_create_wizard_buttons(
-        &self,
-        wizard_id: &str,
-        action_kind: &str,
-        payloads: &[Value],
-        ttl_seconds: u64,
-    ) -> Result<Vec<AhpWizardButtonRecord>> {
-        if payloads.len() > 100 {
-            bail!("too many AHP creation wizard buttons");
-        }
-        let now = now();
-        let expires_at =
-            now + i64::try_from(ttl_seconds).context("wizard button TTL exceeds range")?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_ahp_auxiliary_state(&transaction, now)?;
-        transaction.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [wizard_id],
-        )?;
-        let mut buttons = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let button_data = allocate_creation_button_token(&transaction, action_kind)?;
-            transaction.execute(
-                "INSERT INTO ahp_creation_buttons(
-                    button_data, wizard_id, action_kind, payload_json, expires_at, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    button_data,
-                    wizard_id,
-                    action_kind,
-                    canonical_json(payload),
-                    expires_at,
-                    now
-                ],
-            )?;
-            buttons.push(AhpWizardButtonRecord {
-                button_data,
-                wizard_id: wizard_id.to_owned(),
-                action_kind: action_kind.to_owned(),
-                payload: payload.clone(),
-            });
-        }
-        transaction.commit()?;
-        Ok(buttons)
-    }
-
-    pub fn ahp_consume_wizard_button(
-        &self,
-        button_data: &str,
-    ) -> Result<Option<AhpWizardButtonRecord>> {
-        let now = now();
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_ahp_auxiliary_state(&transaction, now)?;
-        let record: Option<(String, String, String, String, i64, Option<i64>)> = transaction
-            .query_row(
-                "SELECT button_data, wizard_id, action_kind, payload_json, expires_at, used_at
-                 FROM ahp_creation_buttons WHERE button_data = ?1",
-                [button_data],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((button_data, wizard_id, action_kind, payload_json, expires_at, used_at)) = record
-        else {
-            return Ok(None);
-        };
-        if used_at.is_some() || expires_at <= now {
-            return Ok(None);
-        }
-        transaction.execute(
-            "UPDATE ahp_creation_buttons
-             SET used_at = ?1
-             WHERE wizard_id = ?2 AND action_kind = ?3 AND used_at IS NULL",
-            params![now, wizard_id, action_kind],
-        )?;
-        transaction.commit()?;
-        Ok(Some(AhpWizardButtonRecord {
-            button_data,
-            wizard_id,
-            action_kind,
-            payload: serde_json::from_str(&payload_json)
-                .context("stored wizard button payload is invalid")?,
-        }))
     }
 
     pub fn ahp_begin_trust_request(
@@ -4119,26 +3441,6 @@ fn expire_ahp_interactions(connection: &Connection, now: i64) -> Result<()> {
 
 fn expire_ahp_auxiliary_state(connection: &Connection, now: i64) -> Result<()> {
     connection.execute(
-        "DELETE FROM ahp_creation_buttons
-         WHERE expires_at <= ?1 OR used_at IS NOT NULL",
-        [now],
-    )?;
-    let expired_wizard_id: Option<String> = connection
-        .query_row(
-            "SELECT wizard_id FROM ahp_creation_wizard
-             WHERE singleton = 1 AND expires_at <= ?1",
-            [now],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(wizard_id) = expired_wizard_id {
-        connection.execute(
-            "DELETE FROM ahp_creation_buttons WHERE wizard_id = ?1",
-            [wizard_id],
-        )?;
-        connection.execute("DELETE FROM ahp_creation_wizard WHERE singleton = 1", [])?;
-    }
-    connection.execute(
         "DELETE FROM ahp_trust_requests WHERE expires_at <= ?1",
         [now],
     )?;
@@ -4177,113 +3479,6 @@ fn map_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpProjectionReco
         content: row.get(2)?,
         replay_key: row.get(3)?,
         replay_generation: row.get(4)?,
-    })
-}
-
-fn validate_creation_wizard(wizard: &AhpCreationWizardRecord) -> Result<()> {
-    if !matches!(wizard.mode.as_str(), "quick" | "advanced") {
-        bail!("invalid AHP creation wizard mode");
-    }
-    if !matches!(
-        wizard.state.as_str(),
-        "select_target"
-            | "select_model"
-            | "select_approval"
-            | "await_task"
-            | "creating"
-            | "cancelled"
-    ) {
-        bail!("invalid AHP creation wizard state");
-    }
-    Ok(())
-}
-
-fn creation_wizard_matches(
-    connection: &Connection,
-    wizard_id: &str,
-    expected_state: &str,
-    now: i64,
-) -> Result<bool> {
-    connection
-        .query_row(
-            "SELECT 1 FROM ahp_creation_wizard
-             WHERE singleton = 1 AND wizard_id = ?1 AND state = ?2
-               AND cancel_requested = 0 AND expires_at > ?3",
-            params![wizard_id, expected_state, now],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|match_| match_.is_some())
-        .context("failed to match AHP creation wizard transition")
-}
-
-fn update_creation_wizard(
-    connection: &Connection,
-    wizard: &AhpCreationWizardRecord,
-    expected_state: &str,
-) -> Result<usize> {
-    let context = wizard.context.as_ref().map(canonical_json);
-    connection
-        .execute(
-            "UPDATE ahp_creation_wizard
-             SET mode = ?1, state = ?2, context_json = ?3, pending_task = ?4,
-                 create_command_id = ?5, new_session_uri = ?6,
-                 old_binding_endpoint_id = ?7, old_binding_session_uri = ?8,
-                 old_binding_host_instance_id = ?9, cancel_requested = ?10,
-                 expires_at = ?11, updated_at = ?12
-             WHERE singleton = 1 AND wizard_id = ?13 AND state = ?14
-               AND cancel_requested = 0",
-            params![
-                wizard.mode,
-                wizard.state,
-                context,
-                wizard.pending_task,
-                wizard.create_command_id,
-                wizard.new_session_uri,
-                wizard.old_binding_endpoint_id,
-                wizard.old_binding_session_uri,
-                wizard.old_binding_host_instance_id,
-                if wizard.cancel_requested {
-                    1_i64
-                } else {
-                    0_i64
-                },
-                wizard.expires_at,
-                wizard.updated_at,
-                wizard.wizard_id,
-                expected_state,
-            ],
-        )
-        .context("failed to transition AHP creation wizard")
-}
-
-fn map_creation_wizard(row: &rusqlite::Row<'_>) -> rusqlite::Result<AhpCreationWizardRecord> {
-    let context: Option<String> = row.get(3)?;
-    Ok(AhpCreationWizardRecord {
-        wizard_id: row.get(0)?,
-        mode: row.get(1)?,
-        state: row.get(2)?,
-        context: context
-            .map(|value| {
-                serde_json::from_str(&value).map_err(|error| {
-                    SqliteError::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })
-            })
-            .transpose()?,
-        pending_task: row.get(4)?,
-        create_command_id: row.get(5)?,
-        new_session_uri: row.get(6)?,
-        old_binding_endpoint_id: row.get(7)?,
-        old_binding_session_uri: row.get(8)?,
-        old_binding_host_instance_id: row.get(9)?,
-        cancel_requested: row.get::<_, i64>(10)? != 0,
-        expires_at: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
     })
 }
 
@@ -4819,41 +4014,6 @@ fn allocate_session_switch_token(connection: &Connection) -> Result<String> {
     bail!("failed to allocate a unique Session switch token")
 }
 
-fn allocate_creation_button_token(connection: &Connection, action_kind: &str) -> Result<String> {
-    let prefix = match action_kind {
-        "target" => "newt".to_owned(),
-        "model" => "newm".to_owned(),
-        "approval" => "newa".to_owned(),
-        other => {
-            let shortened: String = other
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .take(4)
-                .collect();
-            if shortened.is_empty() {
-                "newx".to_owned()
-            } else {
-                format!("n{shortened}")
-            }
-        }
-    };
-    for _ in 0..32 {
-        let token = format!("{prefix}_{}", random_code(None, 20));
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM ahp_creation_buttons WHERE button_data = ?1",
-                [&token],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !exists {
-            return Ok(token);
-        }
-    }
-    bail!("failed to allocate a unique creation wizard token")
-}
-
 fn parse_host_state(value: &str) -> Result<crate::protocol::AhpHostState> {
     use crate::protocol::AhpHostState;
     match value {
@@ -5143,58 +4303,6 @@ mod tests {
                     None,
                 )
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn command_progress_renews_the_active_lease() {
-        let (_directory, database) = database();
-        database
-            .ahp_register_adapter(&registration("adapter-run-1"))
-            .expect("register");
-        database
-            .ahp_replace_catalog(
-                "adapter-stable",
-                "adapter-run-1",
-                &[host("host-1")],
-                &[session("host-1")],
-            )
-            .expect("catalogue");
-        database
-            .ahp_bind_session("endpoint-1", "copilot:/session-1")
-            .expect("bind");
-        let command = database
-            .ahp_poll_commands("adapter-stable", "adapter-run-1", 1)
-            .expect("poll")
-            .into_iter()
-            .next()
-            .expect("leased command");
-        database
-            .connection()
-            .expect("connection")
-            .execute(
-                "UPDATE ahp_commands SET lease_expires_at = ?1 WHERE command_id = ?2",
-                params![now() - 1, command.command_id],
-            )
-            .expect("expire original lease");
-
-        database
-            .ahp_record_command_progress(
-                "adapter-stable",
-                "adapter-run-1",
-                command.command_id,
-                1,
-                Some(2),
-                Some("working"),
-                60,
-            )
-            .expect("record progress");
-
-        assert!(
-            database
-                .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
-                .expect("poll after progress")
-                .is_empty()
         );
     }
 
@@ -5788,55 +4896,6 @@ mod tests {
             .expect("replay")
             .expect("button exists");
         assert!(!replay.accepted);
-    }
-
-    #[test]
-    fn turn_observation_prioritizes_terminal_failure_over_progress() {
-        let (_directory, database, binding) = bound_database();
-        database
-            .ahp_publish_events(
-                "adapter-stable",
-                "adapter-run-1",
-                &binding.binding_id,
-                binding.generation,
-                &[
-                    AhpPublishedEvent {
-                        event_id: sha256_hex(b"initial-progress"),
-                        host_instance_id: "host-1".to_owned(),
-                        server_sequence: Some(2),
-                        session_uri: binding.session_uri.clone(),
-                        chat_uri: binding.chat_uri.clone(),
-                        turn_id: Some("turn-initial".to_owned()),
-                        kind: crate::protocol::AhpEventKind::AssistantMessage,
-                        origin_client_id: None,
-                        occurred_at: "2026-08-27T00:00:01Z".to_owned(),
-                        data: json!({"content": "starting"}),
-                    },
-                    AhpPublishedEvent {
-                        event_id: sha256_hex(b"initial-failure"),
-                        host_instance_id: "host-1".to_owned(),
-                        server_sequence: Some(3),
-                        session_uri: binding.session_uri.clone(),
-                        chat_uri: binding.chat_uri.clone(),
-                        turn_id: Some("turn-initial".to_owned()),
-                        kind: crate::protocol::AhpEventKind::TurnFailed,
-                        origin_client_id: None,
-                        occurred_at: "2026-08-27T00:00:02Z".to_owned(),
-                        data: json!({"summary": "authentication required"}),
-                    },
-                ],
-            )
-            .expect("publish initial Turn events");
-
-        let observation = database
-            .ahp_turn_observation(&binding.session_uri, "turn-initial")
-            .expect("query initial Turn")
-            .expect("Turn observation");
-        assert_eq!(observation.kind, "turn_failed");
-        assert_eq!(
-            observation.summary.as_deref(),
-            Some("authentication required")
-        );
     }
 
     #[test]
@@ -6444,55 +5503,8 @@ mod tests {
     }
 
     #[test]
-    fn creation_wizard_buttons_and_trust_requests_round_trip() {
+    fn trust_requests_round_trip() {
         let (_directory, database) = database();
-        let now = now();
-        let wizard = AhpCreationWizardRecord {
-            wizard_id: "wizard-1".to_owned(),
-            mode: "advanced".to_owned(),
-            state: "select_target".to_owned(),
-            context: Some(json!({"step": "target"})),
-            pending_task: None,
-            create_command_id: None,
-            new_session_uri: None,
-            old_binding_endpoint_id: None,
-            old_binding_session_uri: None,
-            old_binding_host_instance_id: None,
-            cancel_requested: false,
-            expires_at: now + 600,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert wizard")
-        );
-        let buttons = database
-            .ahp_create_wizard_buttons(
-                "wizard-1",
-                "target",
-                &[
-                    json!({"kind": "local", "path": r"C:\test"}),
-                    json!({"kind": "local", "path": r"C:\other"}),
-                ],
-                600,
-            )
-            .expect("create wizard buttons");
-        assert_eq!(buttons.len(), 2);
-        let consumed = database
-            .ahp_consume_wizard_button(&buttons[0].button_data)
-            .expect("consume button")
-            .expect("button exists");
-        assert_eq!(consumed.wizard_id, "wizard-1");
-        assert_eq!(consumed.action_kind, "target");
-        assert!(
-            database
-                .ahp_consume_wizard_button(&buttons[1].button_data)
-                .expect("sibling replay")
-                .is_none()
-        );
-
         let request = database
             .ahp_begin_trust_request("trust-1", "file:///C:/test", true, 600)
             .expect("begin trust request");
@@ -6518,374 +5530,108 @@ mod tests {
     }
 
     #[test]
-    fn creation_wizard_completion_and_cancellation_are_atomic() {
-        let (_directory, database) = database();
-        let now = now();
-        let wizard = AhpCreationWizardRecord {
-            wizard_id: "wizard-race".to_owned(),
-            mode: "quick".to_owned(),
-            state: "await_task".to_owned(),
-            context: None,
-            pending_task: None,
-            create_command_id: None,
-            new_session_uri: None,
-            old_binding_endpoint_id: None,
-            old_binding_session_uri: None,
-            old_binding_host_instance_id: None,
-            cancel_requested: false,
-            expires_at: now + 600,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert cancellable wizard")
-        );
-        assert_eq!(
-            database
-                .ahp_cancel_creation_wizard()
-                .expect("cancel pending wizard"),
-            Some(AhpCreationCancelOutcome::Cleared)
-        );
-        let mut starting = wizard.clone();
-        starting.state = "creating".to_owned();
-        starting.pending_task = Some("test".to_owned());
-        starting.new_session_uri = Some("ahp-session:/race".to_owned());
-        assert!(
-            database
-                .ahp_begin_session_creation(
-                    &starting,
-                    "create-session:wizard-race",
-                    &json!({"session_uri": "ahp-session:/race"}),
-                )
-                .expect("begin after cancellation")
-                .is_none()
-        );
-        assert!(
-            database
-                .ahp_creation_wizard()
-                .expect("cancelled wizard query")
-                .is_none()
-        );
-
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert startable wizard")
-        );
-        let started = database
-            .ahp_begin_session_creation(
-                &starting,
-                "create-session:wizard-race",
-                &json!({"session_uri": "ahp-session:/race"}),
-            )
-            .expect("begin creation")
-            .expect("creation started");
-        assert!(started.create_command_id.is_some());
-        assert_eq!(
-            database
-                .ahp_cancel_creation_wizard()
-                .expect("request cancellation"),
-            Some(AhpCreationCancelOutcome::Requested)
-        );
-        assert_eq!(
-            database
-                .ahp_complete_creation_wizard(&wizard.wizard_id, "ahp-session:/race", "turn-race",)
-                .expect("cancelled completion"),
-            AhpCreationCompletionOutcome::CancelRequested
-        );
-        assert!(
-            database
-                .ahp_creation_wizard()
-                .expect("cancelled creation query")
-                .expect("cancelled creation")
-                .cancel_requested
-        );
-
-        database
-            .ahp_clear_creation_wizard_if_matches(&wizard.wizard_id)
-            .expect("clear cancelled creation");
-        let mut completable = wizard.clone();
-        completable.wizard_id = "wizard-complete".to_owned();
-        let mut completing = starting;
-        completing.wizard_id = completable.wizard_id.clone();
-        completing.new_session_uri = Some("ahp-session:/complete".to_owned());
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&completable)
-                .expect("insert completable wizard")
-        );
-        database
-            .ahp_begin_session_creation(
-                &completing,
-                "create-session:wizard-complete",
-                &json!({"session_uri": "ahp-session:/complete"}),
-            )
-            .expect("begin completable creation")
-            .expect("completable creation started");
-        assert_eq!(
-            database
-                .ahp_complete_creation_wizard(
-                    &completable.wizard_id,
-                    "ahp-session:/complete",
-                    "turn-complete",
-                )
-                .expect("complete wizard"),
-            AhpCreationCompletionOutcome::Completed
-        );
-        assert_eq!(
-            database
-                .ahp_cancel_creation_wizard()
-                .expect("cancel after completion"),
-            None
-        );
-        assert!(
-            database
-                .ahp_creation_wizard()
-                .expect("completed wizard query")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn creation_completion_atomically_observes_a_late_terminal_event() {
+    fn upgrade_retires_creation_commands_without_removing_existing_sessions() {
         let (_directory, database, binding) = bound_database();
-        let now = now();
-        let wizard = AhpCreationWizardRecord {
-            wizard_id: "wizard-late-terminal".to_owned(),
-            mode: "quick".to_owned(),
-            state: "creating".to_owned(),
-            context: None,
-            pending_task: Some("test".to_owned()),
-            create_command_id: None,
-            new_session_uri: Some(binding.session_uri.clone()),
-            old_binding_endpoint_id: None,
-            old_binding_session_uri: None,
-            old_binding_host_instance_id: None,
-            cancel_requested: false,
-            expires_at: now + 600,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert creating wizard")
-        );
-        database
-            .ahp_publish_events(
-                "adapter-stable",
-                "adapter-run-1",
-                &binding.binding_id,
-                binding.generation,
-                &[
-                    AhpPublishedEvent {
-                        event_id: sha256_hex(b"late-terminal-start"),
-                        host_instance_id: "host-1".to_owned(),
-                        server_sequence: Some(2),
-                        session_uri: binding.session_uri.clone(),
-                        chat_uri: binding.chat_uri.clone(),
-                        turn_id: Some("turn-late-terminal".to_owned()),
-                        kind: crate::protocol::AhpEventKind::TurnStarted,
-                        origin_client_id: None,
-                        occurred_at: "2026-08-27T00:00:01Z".to_owned(),
-                        data: json!({}),
-                    },
-                    AhpPublishedEvent {
-                        event_id: sha256_hex(b"late-terminal-failure"),
-                        host_instance_id: "host-1".to_owned(),
-                        server_sequence: Some(3),
-                        session_uri: binding.session_uri.clone(),
-                        chat_uri: binding.chat_uri.clone(),
-                        turn_id: Some("turn-late-terminal".to_owned()),
-                        kind: crate::protocol::AhpEventKind::TurnFailed,
-                        origin_client_id: None,
-                        occurred_at: "2026-08-27T00:00:02Z".to_owned(),
-                        data: json!({"summary": "late authentication failure"}),
-                    },
-                ],
+        let message_id = database
+            .ahp_enqueue_message("existing-session-message", "keep this task")
+            .expect("enqueue existing Session task");
+        let reconnect_id = database
+            .ahp_enqueue_prepare_target(
+                "prepare-switch:existing-session:test",
+                &json!({"target": {"kind": "local", "path": r"C:\test"}, "retain_connection": true}),
             )
-            .expect("publish late terminal event");
-
-        assert_eq!(
-            database
-                .ahp_complete_creation_wizard(
-                    &wizard.wizard_id,
-                    &binding.session_uri,
-                    "turn-late-terminal",
+            .expect("enqueue existing Session reconnect");
+        let connection = database.connection().expect("connection");
+        connection
+            .execute_batch(
+                "CREATE TABLE ahp_creation_wizard (
+                    singleton INTEGER PRIMARY KEY,
+                    new_session_uri TEXT
+                 );
+                 INSERT INTO ahp_creation_wizard VALUES (1, 'copilot:/old-wizard');
+                 CREATE TABLE ahp_creation_buttons (button_data TEXT);
+                 INSERT INTO ahp_creation_buttons VALUES ('newt_old');",
+            )
+            .expect("seed retired wizard");
+        let mut retired_commands = Vec::new();
+        for (kind, state, key) in [
+            ("create_session", "pending", "create-session:wizard"),
+            ("dispose_session", "leased", "dispose-session:old"),
+            ("bind_session", "pending", "bind:old"),
+            ("send_message", "leased", "qq-message:old"),
+            ("prepare_target", "pending", "prepare-target:wizard"),
+            ("prepare_target", "leased", "prepare-target:wizard:approval"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO ahp_commands(
+                        command_key, binding_id, binding_generation, kind, data_json,
+                        state, lease_owner, lease_expires_at, created_at, updated_at
+                     ) VALUES (?5, '__unbound__', 0, ?1, ?2, ?3, 'adapter-run-1', ?4, ?4, ?4)",
+                    params![
+                        kind,
+                        r#"{"session_uri":"copilot:/old-wizard"}"#,
+                        state,
+                        now(),
+                        key
+                    ],
                 )
-                .expect("complete with terminal event"),
-            AhpCreationCompletionOutcome::TurnTerminated(AhpTurnObservationRecord {
-                kind: "turn_failed".to_owned(),
-                summary: Some("late authentication failure".to_owned()),
-            })
-        );
-        assert!(
-            database
-                .ahp_creation_wizard()
-                .expect("terminal wizard query")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn stale_creation_updates_cannot_restore_cancelled_or_replace_active_wizard() {
-        let (_directory, database) = database();
-        let now = now();
-        let wizard = AhpCreationWizardRecord {
-            wizard_id: "wizard-stale".to_owned(),
-            mode: "advanced".to_owned(),
-            state: "select_model".to_owned(),
-            context: Some(json!({"step": "model"})),
-            pending_task: None,
-            create_command_id: None,
-            new_session_uri: None,
-            old_binding_endpoint_id: None,
-            old_binding_session_uri: None,
-            old_binding_host_instance_id: None,
-            cancel_requested: false,
-            expires_at: now + 600,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert selectable wizard")
-        );
-        let mut replacement = wizard.clone();
-        replacement.wizard_id = "wizard-replacement".to_owned();
-        assert!(
-            !database
-                .ahp_insert_creation_wizard(&replacement)
-                .expect("reject replacement wizard")
-        );
-        assert_eq!(
-            database
-                .ahp_creation_wizard()
-                .expect("active wizard query")
-                .expect("active wizard")
-                .wizard_id,
-            wizard.wizard_id
-        );
-        assert_eq!(
-            database
-                .ahp_cancel_creation_wizard()
-                .expect("cancel selectable wizard"),
-            Some(AhpCreationCancelOutcome::Cleared)
-        );
-        let mut stale_update = wizard.clone();
-        stale_update.state = "await_task".to_owned();
-        stale_update.updated_at += 1;
-        assert!(
-            !database
-                .ahp_transition_creation_wizard(&stale_update, "select_model")
-                .expect("reject stale transition")
-        );
-        assert!(
-            database
-                .ahp_creation_wizard()
-                .expect("cancelled wizard query")
-                .is_none()
-        );
-
-        let mut target_wizard = wizard;
-        target_wizard.wizard_id = "wizard-target".to_owned();
-        target_wizard.state = "select_target".to_owned();
-        target_wizard.context = None;
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&target_wizard)
-                .expect("insert target wizard")
-        );
-        assert_eq!(
-            database
-                .ahp_cancel_creation_wizard()
-                .expect("cancel target wizard"),
-            Some(AhpCreationCancelOutcome::Cleared)
-        );
-        let mut stale_preparation = target_wizard;
-        stale_preparation.state = "creating".to_owned();
-        stale_preparation.updated_at += 1;
-        assert!(
-            database
-                .ahp_begin_creation_preparation(
-                    &stale_preparation,
-                    "select_target",
-                    "prepare-target:wizard-target",
-                    &json!({"target": {"kind": "local", "path": r"C:\test"}}),
+                .expect("seed retired command");
+            retired_commands.push(connection.last_insert_rowid());
+        }
+        migrate_ahp_schema(&connection).expect("upgrade old creation state");
+        migrate_ahp_schema(&connection).expect("upgrade is idempotent");
+        assert!(!table_exists(&connection, "ahp_creation_wizard").expect("wizard table query"));
+        assert!(!table_exists(&connection, "ahp_creation_buttons").expect("button table query"));
+        for command_id in &retired_commands {
+            let (state, code): (String, String) = connection
+                .query_row(
+                    "SELECT state, error_code FROM ahp_commands WHERE command_id = ?1",
+                    [command_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .expect("reject stale preparation")
-                .is_none()
-        );
-        assert!(
+                .expect("retirement tombstone");
+            assert_eq!(state, "failed");
+            assert_eq!(code, "session_creation_removed");
+        }
+        drop(connection);
+        for command_id in retired_commands {
             database
-                .ahp_creation_wizard()
-                .expect("stale preparation query")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn stale_button_failure_does_not_clear_a_wizard_advanced_by_another_action() {
-        let (_directory, database) = database();
-        let now = now();
-        let wizard = AhpCreationWizardRecord {
-            wizard_id: "wizard-button-failure".to_owned(),
-            mode: "advanced".to_owned(),
-            state: "select_approval".to_owned(),
-            context: Some(json!({"step": "approval"})),
-            pending_task: None,
-            create_command_id: None,
-            new_session_uri: None,
-            old_binding_endpoint_id: None,
-            old_binding_session_uri: None,
-            old_binding_host_instance_id: None,
-            cancel_requested: false,
-            expires_at: now + 600,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(
-            database
-                .ahp_insert_creation_wizard(&wizard)
-                .expect("insert advanced wizard")
-        );
-        let mut approval_preparation = wizard.clone();
-        approval_preparation.state = "creating".to_owned();
-        approval_preparation.updated_at += 1;
-        assert!(
-            database
-                .ahp_transition_creation_wizard(&approval_preparation, "select_approval")
-                .expect("advance to approval preparation")
-        );
+                .ahp_ack_command(
+                    "adapter-stable",
+                    "adapter-run-1",
+                    command_id,
+                    AhpCommandOutcome::Rejected,
+                    Some("unsupported-command"),
+                    None,
+                )
+                .expect("accept late acknowledgement without replay");
+        }
+        let commands = database
+            .ahp_poll_commands("adapter-stable", "adapter-run-1", 60)
+            .expect("poll after upgrade");
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().any(|command| {
+            command.command_id == message_id && command.kind == AhpCommandKind::SendMessage
+        }));
+        assert!(commands.iter().any(|command| {
+            command.command_id == reconnect_id && command.kind == AhpCommandKind::PrepareTarget
+        }));
         assert_eq!(
             database
-                .ahp_handle_creation_button_failure(&wizard.wizard_id, "target")
-                .expect("handle stale target failure"),
-            Some(AhpCreationButtonFailureOutcome::Retained)
-        );
-        assert_eq!(
-            database
-                .ahp_creation_wizard()
-                .expect("retained wizard query")
-                .expect("retained wizard")
-                .state,
-            "creating"
-        );
-        assert_eq!(
-            database
-                .ahp_handle_creation_button_failure(&wizard.wizard_id, "approval")
-                .expect("handle owned approval failure"),
-            Some(AhpCreationButtonFailureOutcome::Cleared)
+                .ahp_binding()
+                .expect("foreground")
+                .expect("binding")
+                .binding_id,
+            binding.binding_id
         );
         assert!(
             database
-                .ahp_creation_wizard()
-                .expect("cleared wizard query")
-                .is_none()
+                .ahp_session_is_available(&binding.session_uri)
+                .expect("existing Session availability")
         );
+        assert!(AhpCommandKind::try_from("create_session").is_err());
+        assert!(AhpCommandKind::try_from("dispose_session").is_err());
     }
 
     fn bound_database() -> (tempfile::TempDir, Database, AhpBindingRecord) {

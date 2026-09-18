@@ -1,22 +1,19 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import test from "node:test";
 
-import { PolicyState } from "@microsoft/agent-host-protocol";
-import {
-  AhpClient,
-  InMemoryTransport,
-  type TransportFrame,
-} from "@microsoft/agent-host-protocol/client";
+import { SessionStatus, type SessionSummary } from "@microsoft/agent-host-protocol";
+import { WebSocketServer } from "ws";
 
-import type { ProtectedResourceRequest } from "../src/credential-broker.js";
 import {
-  ManagedAuthenticator,
   connectManagedTarget,
+  connectPreparedManagedTarget,
   defaultManagedProvider,
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
+  prepareTargetResult,
   standaloneWireProtocolVersion,
-  supportedModelSelection,
+  type PreparedTarget,
 } from "../src/managed-target.js";
 
 test("managed target reports executable spawn failures without crashing", async () => {
@@ -82,218 +79,125 @@ test("managed targets prefer the standalone Copilot provider", () => {
   );
 });
 
-test("managed model picker uses AgentInfo models and defaultable model config", () => {
-  const selection = supportedModelSelection({
+test("managed discovery and reconnect list existing Sessions without authentication or model configuration", async () => {
+  const requests: string[] = [];
+  const advertisedVersions: string[][] = [];
+  const sessions: SessionSummary[] = ["first", "second"].map((id) => ({
+    resource: `ahp-session:/${id}`,
     provider: "copilotcli",
-    displayName: "Copilot",
-    description: "Copilot",
-    models: [
-      {
-        id: "disabled",
-        provider: "copilotcli",
-        name: "Disabled",
-        policyState: PolicyState.Disabled,
-      },
-      {
-        id: "gpt-test",
-        provider: "copilotcli",
-        name: "GPT Test",
-        supportsVision: true,
-        maxContextWindow: 128_000,
-        configSchema: {
-          type: "object",
-          properties: {
-            thinking: {
-              type: "string",
-              title: "Thinking",
-              default: "medium",
-              enum: ["low", "medium", "high"],
-            },
-          },
-          required: ["thinking"],
-        },
-      },
-    ],
-  });
-  assert.deepEqual(selection, {
-    options: [
-      {
-        value: {
-          id: "gpt-test",
-          config: { thinking: "medium" },
-        },
-        label: "GPT Test",
-        description: "vision, context 128,000",
-      },
-    ],
-    selected: {
-      id: "gpt-test",
-      config: { thinking: "medium" },
-    },
-  });
-});
-
-test("managed model picker fails closed for required config without defaults", () => {
-  assert.throws(
-    () =>
-      supportedModelSelection({
-        provider: "copilotcli",
-        displayName: "Copilot",
-        description: "Copilot",
-        models: [
-          {
-            id: "gpt-test",
-            provider: "copilotcli",
-            name: "GPT Test",
-            configSchema: {
-              type: "object",
-              properties: {
-                thinking: {
-                  type: "string",
-                  title: "Thinking",
-                },
+    title: id,
+    status: SessionStatus.Idle,
+    workingDirectories: ["file:///srv/project"],
+    createdAt: "2026-09-16T00:00:00.000Z",
+    modifiedAt: "2026-09-16T00:00:00.000Z",
+  }));
+  const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  let connections = 0;
+  server.on("connection", (socket) => {
+    connections += 1;
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        readonly id?: number;
+        readonly method: string;
+        readonly params: { readonly cursor?: string; readonly protocolVersions?: string[] };
+      };
+      requests.push(message.method);
+      let result: unknown;
+      switch (message.method) {
+        case "initialize":
+          advertisedVersions.push(message.params.protocolVersions ?? []);
+          result = {
+            protocolVersion: "0.9.0",
+            serverSeq: 1,
+            snapshots: [{
+              resource: "ahp-root://",
+              fromSeq: 1,
+              state: {
+                agents: [{
+                  provider: "copilotcli",
+                  displayName: "Copilot",
+                  description: "",
+                  models: [],
+                  protectedResources: [{
+                    resource: "https://api.github.com",
+                    authorization_servers: ["https://github.com/login/oauth"],
+                    scopes_supported: ["read:user"],
+                    required: true,
+                  }],
+                }],
               },
-              required: ["thinking"],
-            },
-          },
-        ],
-      }),
-    /managed-model-configuration-required/u,
-  );
-});
-
-test("managed authentication brokers an advertised resource into AHP authenticate", async () => {
-  const [clientTransport, serverTransport] = InMemoryTransport.pair();
-  const client = new AhpClient(clientTransport);
-  const brokerRequests: ProtectedResourceRequest[] = [];
-  const authenticator = new ManagedAuthenticator(
-    client,
-    () => ({
-      agents: [
-        {
-          provider: "copilotcli",
-          displayName: "Copilot",
-          description: "Copilot",
-          models: [],
-          protectedResources: [
-            {
-              resource: "https://api.github.com",
-              resource_name: "GitHub Copilot",
-              authorization_servers: ["https://github.com/login/oauth"],
-              scopes_supported: ["read:user", "user:email"],
-              required: true,
-            },
-          ],
-        },
-      ],
-    }),
-    {
-      resolve: async (request) => {
-        brokerRequests.push(request);
-        return { token: "managed-test-token" };
-      },
-    },
-  );
-  client.connect();
-  try {
-    const authentication = authenticator.authenticateProvider("copilotcli");
-    const frame = await serverTransport.recv();
-    if (frame === null) {
-      assert.fail("AHP client closed before sending authenticate");
-    }
-    const request = decodeFrame(frame);
-    assert.equal(request.method, "authenticate");
-    assert.deepEqual(request.params, {
-      channel: "ahp-root://",
-      resource: "https://api.github.com",
-      token: "managed-test-token",
-      scopes: ["read:user", "user:email"],
+            }],
+          };
+          break;
+        case "listSessions":
+          result = message.params.cursor
+            ? { items: sessions.slice(1) }
+            : { items: sessions.slice(0, 1), nextCursor: "next" };
+          break;
+        default:
+          socket.send(JSON.stringify({
+            jsonrpc: "2.0", id: message.id,
+            error: { code: -32601, message: "Unexpected method" },
+          }));
+          return;
+      }
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
     });
-    await serverTransport.send(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {},
-      }),
-    );
-    assert.equal(await authentication, true);
-    assert.deepEqual(brokerRequests, [
-      {
-        provider: "copilotcli",
-        resource: "https://api.github.com",
-        authorizationServers: ["https://github.com/login/oauth"],
-        scopes: ["read:user", "user:email"],
-      },
-    ]);
-  } finally {
-    await client.shutdown();
-  }
-});
-
-test("managed authentication propagates shutdown cancellation to the broker", async () => {
-  const [clientTransport] = InMemoryTransport.pair();
-  const client = new AhpClient(clientTransport);
-  const controller = new AbortController();
-  let brokerStarted = false;
-  const authenticator = new ManagedAuthenticator(
-    client,
-    () => ({
-      agents: [
-        {
-          provider: "copilotcli",
-          displayName: "Copilot",
-          description: "Copilot",
-          models: [],
-          protectedResources: [
-            {
-              resource: "https://api.github.com",
-              resource_name: "GitHub Copilot",
-              authorization_servers: ["https://github.com/login/oauth"],
-              scopes_supported: ["read:user"],
-              required: true,
-            },
-          ],
-        },
-      ],
-    }),
-    {
-      resolve: async (_request, signal) =>
-        await new Promise((_resolve, reject) => {
-          brokerStarted = true;
-          assert.equal(signal, controller.signal);
-          signal?.addEventListener(
-            "abort",
-            () => reject(new Error("authentication cancelled")),
-            { once: true },
-          );
-        }),
+  });
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const prepared: PreparedTarget = {
+    target: {
+      kind: "ssh", alias: "existing", path: "/srv/project",
+      user: "tester", host: "existing", port: 22, hostKeyFingerprints: ["SHA256:pinned"],
     },
-    controller.signal,
-  );
-  client.connect();
+    entry: {
+      schemaVersion: 2, type: "standalone", pid: process.pid, instanceId: "existing-host",
+      protocolVersion: "0.1.0", wireProtocolVersion: "0.9.0",
+      connectionToken: "test-connection-token",
+      endpoint: { type: "tcp", host: "127.0.0.1", port: address.port },
+      sourceFile: "unused",
+    },
+    endpointId: "existing-endpoint",
+    hostLabel: "ssh:existing",
+    workspaceUri: "file:///srv/project",
+    editorClientToolsAvailable: false,
+  };
   try {
-    const authentication = authenticator.authenticateProvider("copilotcli");
-    await Promise.resolve();
-    assert.equal(brokerStarted, true);
-    controller.abort();
-    await assert.rejects(authentication, /authentication cancelled/u);
+    for (let reconnect = 0; reconnect < 2; reconnect += 1) {
+      const connection = await connectPreparedManagedTarget(prepared);
+      try {
+        assert.equal(connection.prepared, prepared);
+        assert.deepEqual(connection.sessions, sessions);
+        assert.deepEqual(await prepareTargetResult(connection), {
+          endpoint_id: prepared.endpointId,
+          host_instance_id: prepared.entry.instanceId,
+          provider: "copilotcli",
+          workspace_uri: prepared.workspaceUri,
+          host_label: prepared.hostLabel,
+          editor_client_tools_available: false,
+        });
+      } finally {
+        await connection.disconnect();
+      }
+      sessions[0] = { ...sessions[0]!, title: "Updated on PC" };
+    }
+    assert.equal(connections, 2);
+    assert.deepEqual(requests, [
+      "initialize", "listSessions", "listSessions",
+      "initialize", "listSessions", "listSessions",
+    ]);
+    assert.ok(advertisedVersions.every((versions) => versions.includes("0.9.0") && !versions.includes("0.1.0")));
   } finally {
-    await client.shutdown();
+    for (const socket of server.clients) {
+      socket.terminate();
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
   }
 });
-
-function decodeFrame(frame: TransportFrame): Record<string, unknown> {
-  const value =
-    frame.kind === "parsed"
-      ? frame.message
-      : frame.kind === "text"
-        ? JSON.parse(frame.text)
-        : JSON.parse(new TextDecoder().decode(frame.data));
-  assert.equal(typeof value, "object");
-  assert.notEqual(value, null);
-  assert.equal(Array.isArray(value), false);
-  return value as Record<string, unknown>;
-}
 
 test("managed target workspace URIs preserve path delimiters as data", () => {
   const local = new URL(

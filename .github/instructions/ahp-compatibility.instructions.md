@@ -17,16 +17,10 @@ applyTo: "adapter/**,vendor/**,scripts/vendor-ahp-client.ps1"
 - Start local managed Hosts with `agent host --new-instance --foreground`.
   The default command detaches/reuses a supervisor, so launcher exit is not a
   Host-liveness signal and does not provide an owned lifecycle.
-- The VS Code 1.136 standalone root advertises `copilotcli` and `claude`;
-  mobile Copilot creation must prefer `copilotcli`. A newly created Copilot
-  Session has deferred backing and is absent from `listSessions` until its
-  first message. Confirm the exact client-chosen `ahp-session:/<uuid>` by
-  subscribing to it, then establish an `AhpCore` provisional binding before
-  acknowledging creation. Transfer that binding to the Bridge bind command,
-  or close it on failure/timeout; a temporary summary alone does not prevent
-  Host garbage collection. Never treat the initial empty listing as creation
-  failure.
-- Reuse a retained managed Host for later prepare/create/dispose operations on
+- QQ only operates existing Sessions created and authenticated on the PC.
+  Do not reintroduce mobile Session creation, model selection or a credential
+  Broker. Retired command strings in migrations only preserve upgrade safety.
+- Reuse a retained managed Host for later discovery/reconnect operations on
   the same target. Replacing its instance invalidates every existing binding.
   Cleanup local owned instances with `agent kill --instance-id` and verify the
   registry entry disappears; Remote SSH cleanup closes only the local tunnel.

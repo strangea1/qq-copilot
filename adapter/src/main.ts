@@ -3,7 +3,6 @@ import { pathToFileURL } from "node:url";
 
 import {
   SUPPORTED_PROTOCOL_VERSIONS,
-  type ModelSelection,
   type SessionSummary,
 } from "@microsoft/agent-host-protocol";
 
@@ -27,21 +26,17 @@ import {
 import {
   loadAdapterConfig,
   parseAdapterArguments,
+  parseAuthorizedTargets,
   type AdapterConfig,
 } from "./config.js";
 import {
   connectManagedTarget,
   connectPreparedManagedTarget,
-  createManagedSession,
-  disposeManagedSession,
-  managedAuthBrokerForConfig,
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
   prepareTargetResult,
-  refreshManagedSessions,
   stopManagedTargetProcesses,
   type ConnectedManagedTarget,
-  type ManagedAuthBroker,
   type ManagedTarget,
   type PrepareTargetResult,
 } from "./managed-target.js";
@@ -86,6 +81,7 @@ export interface BridgeBinding {
 export interface RegisterResult {
   readonly bindings: readonly BridgeBinding[];
   readonly foreground_binding_id?: string;
+  readonly authorization?: unknown;
 }
 
 export interface AdapterCommand {
@@ -101,14 +97,18 @@ export interface AdapterCommand {
     | "approve_tool"
     | "review_tool_result"
     | "complete_input"
-    | "prepare_target"
-    | "create_session"
-    | "dispose_session";
+    | "prepare_target";
   readonly data: unknown;
 }
 
 interface PollResult {
   readonly commands: readonly AdapterCommand[];
+  readonly authorization?: unknown;
+}
+
+interface AuthorizationSnapshot {
+  readonly revision: string;
+  readonly targets: readonly ManagedTarget[];
 }
 
 interface PendingBinding {
@@ -142,7 +142,6 @@ export interface AhpCoreLike {
   start(): Promise<CatalogueSnapshot | void>;
   stop(): Promise<void>;
   refreshEndpoints(): Promise<CatalogueSnapshot>;
-  rememberSession(endpointId: string, summary: SessionSummary): void;
   bindSession(endpointId: string, sessionUri: string): Promise<AhpSessionBinding>;
 }
 
@@ -152,9 +151,6 @@ export interface RuntimeDependencies {
   readonly connectManagedTarget?: typeof connectManagedTarget;
   readonly connectPreparedManagedTarget?: typeof connectPreparedManagedTarget;
   readonly stopManagedTargetProcesses?: typeof stopManagedTargetProcesses;
-  readonly createManagedAuthBroker?: (
-    config: AdapterConfig,
-  ) => ManagedAuthBroker;
 }
 
 interface ManagedEntryState {
@@ -165,16 +161,6 @@ interface ManagedEntryState {
   readonly protectedUntil: number;
   activeOperations: number;
   pruning: boolean;
-}
-
-interface ProvisionalBindingState {
-  readonly commandId: number;
-  readonly endpointId: string;
-  readonly sessionUri: string;
-  readonly binding: AhpSessionBinding;
-  readonly target: ManagedTarget;
-  expiresAt?: number;
-  disposing: boolean;
 }
 
 interface BridgeCatalogueSession extends Record<string, unknown> {
@@ -199,13 +185,15 @@ class SerialQueue {
 export class AdapterRuntime {
   readonly #config: AdapterConfig;
 
+  #authorizedTargets: readonly ManagedTarget[];
+
+  #appliedAuthorizationRevision: string | undefined;
+
   readonly #bridge: BridgeClientLike;
 
   readonly #adapterInstanceId = randomUUID();
 
   readonly #core: AhpCoreLike;
-
-  readonly #managedAuthBroker: ManagedAuthBroker;
 
   readonly #callbackQueue = new SerialQueue();
 
@@ -214,8 +202,6 @@ export class AdapterRuntime {
   readonly #commandQueues = new Map<string, SerialQueue>();
 
   readonly #inFlightCommandIds = new Set<number>();
-
-  readonly #removedSessionUris = new Map<string, string>();
 
   readonly #events = new Map<string, Map<string, PublishedEvent>>();
 
@@ -230,7 +216,7 @@ export class AdapterRuntime {
 
   readonly #managedDiscoveryAbort = new AbortController();
 
-  readonly #managedDiscoveryTasks = new Set<Promise<void>>();
+  readonly #managedDiscoveryTasks = new Map<string, Promise<void>>();
 
   readonly #connectManagedTarget: typeof connectManagedTarget;
 
@@ -243,11 +229,6 @@ export class AdapterRuntime {
   readonly #bindings = new Map<string, ActiveBinding>();
 
   readonly #pendingBindings = new Map<string, PendingBinding>();
-
-  readonly #provisionalBindings = new Map<
-    string,
-    ProvisionalBindingState
-  >();
 
   readonly #eventFlushes = new Map<string, Promise<void>>();
 
@@ -277,6 +258,7 @@ export class AdapterRuntime {
   ) {
     const runtime = this;
     this.#config = config;
+    this.#authorizedTargets = config.authorizedTargets;
     this.#connectManagedTarget =
       dependencies.connectManagedTarget ?? connectManagedTarget;
     this.#connectPreparedManagedTarget =
@@ -286,9 +268,6 @@ export class AdapterRuntime {
     this.#bridge =
       dependencies.createBridgeClient?.(config) ??
       new BridgeClient(config.bridgePipePath, config.bridgeToken);
-    this.#managedAuthBroker =
-      dependencies.createManagedAuthBroker?.(config) ??
-      managedAuthBrokerForConfig(config);
     const coreOptions: AhpCoreOptions = {
       userDataDirectory: config.userDataDirectory,
       clientId: config.adapterId,
@@ -362,6 +341,9 @@ export class AdapterRuntime {
         },
       }),
     );
+    if ("authorization" in registration) {
+      await this.#applyAuthorization(registration.authorization, true);
+    }
     for (const binding of registration.bindings) {
       if (binding.state !== "binding" && binding.state !== "bound") {
         continue;
@@ -369,7 +351,7 @@ export class AdapterRuntime {
       this.#restoreBindings.set(binding.binding_id, binding);
       const target = managedTargetFromBinding(
         binding,
-        this.#config.authorizedTargets,
+        this.#authorizedTargets,
       );
       if (target) {
         this.#restoreManagedTargets.set(binding.binding_id, target);
@@ -407,9 +389,18 @@ export class AdapterRuntime {
             adapter_id: this.#config.adapterId,
             adapter_instance_id: this.#adapterInstanceId,
             timeout_seconds: this.#config.pollSeconds,
+            ...(this.#appliedAuthorizationRevision === undefined
+              ? {}
+              : { applied_authorization_revision: this.#appliedAuthorizationRevision }),
           },
           (this.#config.pollSeconds + 5) * 1_000,
         );
+        if (signal.aborted) {
+          break;
+        }
+        if ("authorization" in poll) {
+          await this.#applyAuthorization(poll.authorization);
+        }
         for (const command of poll.commands) {
           if (signal.aborted) {
             break;
@@ -446,7 +437,8 @@ export class AdapterRuntime {
     await Promise.all(
       [...this.#commandQueues.values()].map((queue) => queue.drain()),
     );
-    await Promise.all(this.#managedDiscoveryTasks);
+    await Promise.all(this.#managedDiscoveryTasks.values());
+    this.#managedDiscoveryTasks.clear();
     this.#commandQueues.clear();
     this.#inFlightCommandIds.clear();
     await this.#callbackQueue.drain();
@@ -468,7 +460,6 @@ export class AdapterRuntime {
     const bindings = [...this.#bindings.values()];
     this.#bindings.clear();
     this.#pendingBindings.clear();
-    this.#provisionalBindings.clear();
     this.#restoreBindings.clear();
     this.#restoreManagedTargets.clear();
     this.#restoringBindings.clear();
@@ -583,7 +574,6 @@ export class AdapterRuntime {
           result = await this.#requireBinding(command).binding.queueUserText(
             content,
             command.command_id,
-            requireModelSelection(data.model_selection),
           );
           break;
         }
@@ -638,13 +628,6 @@ export class AdapterRuntime {
           result = await this.#prepareTarget(command);
           break;
         }
-        case "create_session": {
-          result = await this.#createSession(command);
-          break;
-        }
-        case "dispose_session":
-          await this.#disposeSession(command);
-          break;
         default:
           throw new AhpOperationError(
             "invalid-command",
@@ -676,9 +659,6 @@ export class AdapterRuntime {
       undefined,
       result,
     );
-    if (command.kind === "create_session") {
-      await this.#armProvisionalBinding(command.command_id);
-    }
   }
 
   #requireBinding(command: AdapterCommand): ActiveBinding {
@@ -730,14 +710,9 @@ export class AdapterRuntime {
         "Bound Agent Host is not connected",
       );
     }
-    const provisionalKey = provisionalBindingKey(
-      binding.endpoint_id,
-      binding.session_uri,
-    );
     if (
       this.#retiringManagedEndpointIds.has(binding.endpoint_id) ||
-      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning ||
-      this.#provisionalBindings.get(provisionalKey)?.disposing
+      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning
     ) {
       throw new AhpOperationError(
         "binding-unavailable",
@@ -779,8 +754,7 @@ export class AdapterRuntime {
 
     if (
       this.#retiringManagedEndpointIds.has(binding.endpoint_id) ||
-      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning ||
-      this.#provisionalBindings.get(provisionalKey)?.disposing
+      this.#managedEntryByEndpointId(binding.endpoint_id)?.pruning
     ) {
       throw new AhpOperationError(
         "binding-unavailable",
@@ -823,7 +797,6 @@ export class AdapterRuntime {
         normalizer,
       };
       this.#bindings.set(binding.binding_id, active);
-      this.#provisionalBindings.delete(provisionalKey);
       await this.#bridge.call({
         operation: "ahp_binding_ready",
         adapter_id: this.#config.adapterId,
@@ -840,7 +813,6 @@ export class AdapterRuntime {
       await this.#flushEvents(binding.binding_id);
     } catch (error) {
       this.#pendingBindings.delete(binding.binding_id);
-      this.#provisionalBindings.delete(provisionalKey);
       this.#clearQueuedEvents(binding.binding_id);
       this.#bindings.delete(binding.binding_id);
       await sessionBinding?.close().catch((closeError: unknown) => {
@@ -948,6 +920,54 @@ export class AdapterRuntime {
     this.#scheduleRestoreRetry();
   }
 
+  async #applyAuthorization(value: unknown, initial = false): Promise<void> {
+    const authorization = parseAuthorizationSnapshot(value);
+    if (initial) {
+      this.#authorizedTargets = authorization.targets;
+      this.#appliedAuthorizationRevision = authorization.revision;
+      return;
+    }
+    const previous = new Map(
+      this.#authorizedTargets.map((target) => [managedTargetKey(target), target]),
+    );
+    const next = new Map(
+      authorization.targets.map((target) => [managedTargetKey(target), target]),
+    );
+    for (const [key, target] of previous) {
+      const candidate = next.get(key);
+      if (!candidate || !sameManagedHost(target, candidate)) {
+        throw new AhpOperationError(
+          "authorization-restart-required",
+          "Removing targets or changing SSH identity requires an Adapter restart",
+        );
+      }
+    }
+    const changed = next.size !== previous.size;
+    if (authorization.revision === this.#appliedAuthorizationRevision) {
+      if (changed) {
+        throw new AhpOperationError(
+          "authorization-revision-conflict",
+          "An authorization revision cannot identify different targets",
+        );
+      }
+      return;
+    }
+    if (changed) {
+      await this.#catalogueQueue.run(async () => {
+        // Publish cached raw Sessions without refreshing or replacing live Hosts.
+        await this.#publishCatalogueSnapshot(
+          this.#core.catalogue,
+          authorization.targets,
+        );
+        this.#authorizedTargets = authorization.targets;
+        this.#appliedAuthorizationRevision = authorization.revision;
+      });
+      this.#syncManagedDiscovery();
+    } else {
+      this.#appliedAuthorizationRevision = authorization.revision;
+    }
+  }
+
   #startManagedDiscovery(signal: AbortSignal): void {
     const abort = this.#managedDiscoveryAbort;
     if (signal.aborted || this.#stopping) {
@@ -958,33 +978,39 @@ export class AdapterRuntime {
       once: true,
       signal: abort.signal,
     });
-    const hosts = new Map<string, ManagedTarget[]>();
-    for (const target of this.#config.authorizedTargets) {
+    this.#syncManagedDiscovery();
+  }
+
+  #syncManagedDiscovery(): void {
+    if (this.#managedDiscoveryAbort.signal.aborted || this.#stopping) {
+      return;
+    }
+    for (const target of this.#authorizedTargets) {
       if (target.kind !== "ssh") {
         continue;
       }
       const key = managedHostKey(target);
-      const targets = hosts.get(key) ?? [];
-      targets.push(target);
-      hosts.set(key, targets);
-    }
-    for (const targets of hosts.values()) {
-      const task = this.#discoverManagedHost(targets, abort.signal);
-      this.#managedDiscoveryTasks.add(task);
-      void task.finally(() => this.#managedDiscoveryTasks.delete(task));
+      if (!this.#managedDiscoveryTasks.has(key)) {
+        const task = this.#discoverManagedHost(key, this.#managedDiscoveryAbort.signal);
+        this.#managedDiscoveryTasks.set(key, task);
+      }
     }
   }
 
   async #discoverManagedHost(
-    targets: readonly ManagedTarget[],
+    hostKey: string,
     signal: AbortSignal,
   ): Promise<void> {
-    let target = targets[0];
-    if (!target) {
-      return;
-    }
+    let targetIndex = 0;
     let retryDelay = RETRY_DELAY_MS;
     while (!signal.aborted && !this.#stopping) {
+      const targets = this.#authorizedTargets.filter(
+        (target) => managedHostKey(target) === hostKey,
+      );
+      const target = targets[targetIndex % targets.length];
+      if (!target) {
+        return;
+      }
       let nextDelay = MANAGED_DISCOVERY_INTERVAL_MS;
       try {
         this.#requireAuthorizedTarget(target);
@@ -1038,7 +1064,7 @@ export class AdapterRuntime {
             retryDelayMs: nextDelay,
           },
         );
-        target = targets[(targets.indexOf(target) + 1) % targets.length] ?? target;
+        targetIndex += 1;
       }
       await delay(nextDelay, signal);
     }
@@ -1052,21 +1078,18 @@ export class AdapterRuntime {
       this.#managedTargetReservations.has(entry.key) ||
       [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
         (binding) => binding.endpointId === endpointId,
-      ) ||
-      [...this.#provisionalBindings.values()].some(
-        (binding) => binding.endpointId === endpointId,
       )
     );
   }
 
   #requireAuthorizedTarget(target: ManagedTarget): void {
     if (
-      !this.#config.authorizedTargets.some(
+      !this.#authorizedTargets.some(
         (authorized) =>
           managedTargetKey(authorized) === managedTargetKey(target) &&
           sameManagedHost(authorized, target),
       ) ||
-      this.#config.authorizedTargets.some(
+      this.#authorizedTargets.some(
         (authorized) =>
           managedHostKey(authorized) === managedHostKey(target) &&
           !sameManagedHost(authorized, target),
@@ -1107,23 +1130,15 @@ export class AdapterRuntime {
   async #prepareTarget(command: AdapterCommand): Promise<PrepareTargetResult> {
     const data = requireRecord(command.data);
     const target = parseManagedTarget(data.target);
-    const advanced =
-      "advanced" in data ? requireBoolean(data.advanced, "advanced") : false;
     const retainConnection =
       "retain_connection" in data
         ? requireBoolean(data.retain_connection, "retain_connection")
         : false;
-    const currentConfig =
-      "config" in data ? requireRecord(data.config, "config") : {};
     const connection = await this.#connectTarget(target);
     const alreadyRetained = this.#managedEntries.has(managedHostKey(target));
     let retained = false;
     try {
-      const result = await prepareTargetResult(
-        connection,
-        advanced,
-        currentConfig,
-      );
+      const result = await prepareTargetResult(connection);
       if (retainConnection) {
         await this.#retainManagedPrepared(target, connection.prepared);
         connection.releasePreparedOwnership();
@@ -1170,272 +1185,15 @@ export class AdapterRuntime {
     }
   }
 
-  async #createSession(command: AdapterCommand): Promise<Record<string, unknown>> {
-    const data = requireRecord(command.data);
-    const target = parseManagedTarget(data.target);
-    const provider = requireString(data.provider, "provider");
-    const sessionUri = requireString(data.session_uri, "session_uri");
-    const workspaceUri = requireString(data.workspace_uri, "workspace_uri");
-    const resolvedValues = requireRecord(data.resolved_values, "resolved_values");
-    const overrides = requireRecord(data.overrides, "overrides");
-    const connection = await this.#connectTarget(
-      target,
-      async (progress) => {
-        await this.#bridge.call({
-          operation: "ahp_command_progress",
-          adapter_id: this.#config.adapterId,
-          adapter_instance_id: this.#adapterInstanceId,
-          command_id: command.command_id,
-          progress: progress.progress,
-          ...(progress.total !== undefined ? { total: progress.total } : {}),
-          ...(progress.message ? { message: progress.message } : {}),
-        });
-      },
-    );
-    let createdSessionUri: string | undefined;
-    let confirmation: Awaited<
-      ReturnType<typeof createManagedSession>
-    >["confirmation"];
-    try {
-      const result = await createManagedSession(connection, {
-        provider,
-        sessionUri,
-        workspaceUri,
-        resolvedValues,
-        overrides,
-      });
-      confirmation = result.confirmation;
-      createdSessionUri = result.session.resource;
-      this.#removedSessionUris.delete(createdSessionUri);
-      const session = toBridgeSession(
-        connection.prepared,
-        target,
-        result.session,
-      );
-      await this.#retainManagedPrepared(target, connection.prepared);
-      connection.releasePreparedOwnership();
-      this.#core.rememberSession(result.endpoint_id, result.session);
-      const provisionalBinding = await this.#core.bindSession(
-        result.endpoint_id,
-        result.session.resource,
-      );
-      this.#provisionalBindings.set(
-        provisionalBindingKey(
-          result.endpoint_id,
-          result.session.resource,
-        ),
-        {
-          commandId: command.command_id,
-          endpointId: result.endpoint_id,
-          sessionUri: result.session.resource,
-          binding: provisionalBinding,
-          target,
-          disposing: false,
-        },
-      );
-      await confirmation?.close();
-      confirmation = undefined;
-      const listedSessions = await refreshManagedSessions(connection.client);
-      const sessions = listedSessions.some(
-        (listed) => listed.resource === result.session.resource,
-      )
-        ? listedSessions
-        : [...listedSessions, result.session];
-      await this.#publishManagedCatalogue(connection, sessions);
-      await this.#publishCatalogue(this.#core.catalogue);
-      await connection.disconnect();
-      return {
-        endpoint_id: result.endpoint_id,
-        host_instance_id: result.host_instance_id,
-        workspace_uri: result.workspace_uri,
-        host_label: result.host_label,
-        editor_client_tools_available: result.editor_client_tools_available,
-        session,
-      };
-    } catch (error) {
-      const cleanupErrors: unknown[] = [];
-      if (createdSessionUri) {
-        try {
-          await confirmation?.close();
-        } catch (closeError) {
-          cleanupErrors.push(closeError);
-        }
-        try {
-          await this.#forgetProvisionalBindings(createdSessionUri);
-        } catch (provisionalError) {
-          cleanupErrors.push(provisionalError);
-        }
-        let disposed = false;
-        try {
-          await disposeManagedSession(connection, createdSessionUri);
-          disposed = true;
-        } catch (disposeError) {
-          cleanupErrors.push(disposeError);
-        }
-        if (disposed) {
-          this.#removedSessionUris.set(
-            createdSessionUri,
-            managedTargetKey(target),
-          );
-          try {
-            const sessions = await refreshManagedSessions(connection.client);
-            await this.#publishManagedCatalogue(
-              connection,
-              sessions,
-              this.#managedEntries.has(managedHostKey(target))
-                ? "connected"
-                : "unreachable",
-              [createdSessionUri],
-            );
-          } catch (publishError) {
-            cleanupErrors.push(publishError);
-          }
-        }
-      }
-      try {
-        await connection.close();
-      } catch (closeError) {
-        cleanupErrors.push(closeError);
-      }
-      try {
-        await this.#pruneManagedEntries();
-      } catch (pruneError) {
-        cleanupErrors.push(pruneError);
-      }
-      if (cleanupErrors.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupErrors],
-          "created-session-cleanup-failed",
-        );
-      }
-      throw error;
-    }
-  }
-
-  async #disposeSession(command: AdapterCommand): Promise<void> {
-    const data = requireRecord(command.data);
-    const target = parseManagedTarget(data.target);
-    const sessionUri = requireString(data.session_uri, "session_uri");
-    const alreadyRetained = this.#managedEntries.has(managedHostKey(target));
-    const connection = await this.#connectTarget(target);
-    let operationFailed = false;
-    let operationError: unknown;
-    try {
-      await disposeManagedSession(connection, sessionUri);
-      this.#removedSessionUris.set(sessionUri, managedTargetKey(target));
-      await this.#forgetRemovedSessionBindings(sessionUri);
-      const sessions = await refreshManagedSessions(connection.client);
-      await this.#publishManagedCatalogue(
-        connection,
-        sessions,
-        alreadyRetained ? "connected" : "unreachable",
-        [sessionUri],
-      );
-    } catch (error) {
-      operationFailed = true;
-      operationError = error;
-    }
-    const cleanupErrors: unknown[] = [];
-    if (operationFailed) {
-      cleanupErrors.push(operationError);
-    }
-    try {
-      await connection.close();
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    try {
-      await this.#pruneManagedEntries();
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    if (cleanupErrors.length === 1) {
-      throw cleanupErrors[0];
-    }
-    if (cleanupErrors.length > 1) {
-      throw new AggregateError(
-        cleanupErrors,
-        "disposed-session-cleanup-failed",
-      );
-    }
-  }
-
-  async #forgetRemovedSessionBindings(sessionUri: string): Promise<void> {
-    await this.#forgetProvisionalBindings(sessionUri);
-    for (const [bindingId, binding] of [...this.#bindings]) {
-      if (binding.sessionUri !== sessionUri) {
-        continue;
-      }
-      this.#bindings.delete(bindingId);
-      this.#clearQueuedEvents(bindingId);
-      this.#eventFlushes.delete(bindingId);
-      try {
-        await binding.binding.close();
-      } catch (error) {
-        safeLog("warn", "Failed to close a binding for a removed Session", {
-          bindingId,
-          code: errorCode(error),
-        });
-      }
-    }
-    for (const [bindingId, binding] of [...this.#pendingBindings]) {
-      if (binding.sessionUri === sessionUri) {
-        this.#pendingBindings.delete(bindingId);
-        this.#clearQueuedEvents(bindingId);
-        this.#eventFlushes.delete(bindingId);
-      }
-    }
-    for (const [bindingId, binding] of [...this.#restoreBindings]) {
-      if (binding.session_uri === sessionUri) {
-        this.#clearPendingRestore(bindingId);
-      }
-    }
-  }
-
-  async #forgetProvisionalBindings(sessionUri: string): Promise<void> {
-    const matches = [...this.#provisionalBindings].filter(
-      ([, binding]) => binding.sessionUri === sessionUri,
-    );
-    for (const [key] of matches) {
-      this.#provisionalBindings.delete(key);
-    }
-    await Promise.all(
-      matches.map(([, binding]) => binding.binding.close()),
-    );
-  }
-
-  async #armProvisionalBinding(commandId: number): Promise<void> {
-    const expiresAt = Date.now() + MANAGED_BIND_GRACE_MS;
-    let armed = false;
-    for (const provisional of this.#provisionalBindings.values()) {
-      if (provisional.commandId === commandId) {
-        provisional.expiresAt = expiresAt;
-        armed = true;
-      }
-    }
-    if (!armed) {
-      return;
-    }
-    try {
-      await this.#pruneManagedEntries();
-    } catch (error) {
-      safeLog("warn", "Failed to schedule provisional binding expiry", {
-        commandId,
-        code: errorCode(error),
-      });
-    }
-  }
-
   async #connectTarget(
     target: ManagedTarget,
-    onProgress?: Parameters<typeof connectManagedTarget>[2],
   ): Promise<ConnectedManagedTarget> {
     this.#requireAuthorizedTarget(target);
     const key = managedHostKey(target);
     const reservation = this.#managedTargetReservations.get(key);
     if (reservation) {
       await reservation;
-      return this.#connectTarget(target, onProgress);
+      return this.#connectTarget(target);
     }
     const retained = this.#managedEntries.get(key);
     if (!retained) {
@@ -1454,8 +1212,6 @@ export class AdapterRuntime {
         const connection = await this.#connectManagedTarget(
           this.#config,
           target,
-          onProgress,
-          this.#managedAuthBroker,
         );
         return this.#wrapManagedConnection(connection, release);
       } catch (error) {
@@ -1480,8 +1236,6 @@ export class AdapterRuntime {
               target,
               workspaceUri: managedTargetWorkspaceUri(target),
             },
-        onProgress,
-        this.#managedAuthBroker,
       );
     } catch (error) {
       this.#releaseManagedOperation(key, retained.prepared);
@@ -1572,9 +1326,6 @@ export class AdapterRuntime {
         (previousEndpointId !== undefined &&
           this.#retiringManagedEndpointIds.has(previousEndpointId)) ||
         [...this.#bindings.values(), ...this.#pendingBindings.values()].some(
-          (binding) => binding.endpointId === previousEndpointId,
-        ) ||
-        [...this.#provisionalBindings.values()].some(
           (binding) => binding.endpointId === previousEndpointId,
         ))
     ) {
@@ -1686,68 +1437,6 @@ export class AdapterRuntime {
     let nextPruneDelay: number | undefined;
     const errors: unknown[] = [];
     const now = Date.now();
-    for (const [key, provisional] of [...this.#provisionalBindings]) {
-      const active = [...this.#bindings.values()].some(
-        (binding) =>
-          binding.endpointId === provisional.endpointId &&
-          binding.sessionUri === provisional.sessionUri,
-      );
-      if (active) {
-        this.#provisionalBindings.delete(key);
-        continue;
-      }
-      const bindingPending = [...this.#pendingBindings.values()].some(
-        (binding) =>
-          binding.endpointId === provisional.endpointId &&
-          binding.sessionUri === provisional.sessionUri,
-      );
-      if (bindingPending) {
-        provisional.expiresAt = now + RETRY_DELAY_MS;
-        nextPruneDelay =
-          nextPruneDelay === undefined
-            ? RETRY_DELAY_MS
-            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
-        continue;
-      }
-      if (provisional.disposing) {
-        continue;
-      }
-      if (provisional.expiresAt === undefined) {
-        continue;
-      }
-      if (provisional.expiresAt > now) {
-        const delay = provisional.expiresAt - now;
-        nextPruneDelay =
-          nextPruneDelay === undefined
-            ? delay
-            : Math.min(nextPruneDelay, delay);
-        continue;
-      }
-      provisional.disposing = true;
-      delete provisional.expiresAt;
-      try {
-        await provisional.binding.close();
-      } catch (error) {
-        errors.push(error);
-      }
-      let disposed = false;
-      try {
-        await this.#disposeExpiredProvisional(provisional);
-        disposed = true;
-      } catch (error) {
-        errors.push(error);
-      }
-      if (disposed) {
-        this.#provisionalBindings.delete(key);
-      } else {
-        provisional.disposing = false;
-        provisional.expiresAt = Date.now() + RETRY_DELAY_MS;
-        nextPruneDelay =
-          nextPruneDelay === undefined
-            ? RETRY_DELAY_MS
-            : Math.min(nextPruneDelay, RETRY_DELAY_MS);
-      }
-    }
     for (const [key, entry] of [...this.#managedEntries.entries()]) {
       const endpointId = endpointPublicId(entry.entry);
       if (entry.target.kind === "ssh") {
@@ -1768,9 +1457,6 @@ export class AdapterRuntime {
         ) ||
         [...this.#restoreBindings.values()].some(
           (binding) => binding.endpoint_id === endpointId,
-        ) ||
-        [...this.#provisionalBindings.values()].some(
-          (binding) => binding.endpointId === endpointId,
         )
       ) {
         continue;
@@ -1838,61 +1524,13 @@ export class AdapterRuntime {
     }
   }
 
-  async #disposeExpiredProvisional(
-    provisional: ProvisionalBindingState,
-  ): Promise<void> {
-    const connection = await this.#connectTarget(provisional.target);
-    const errors: unknown[] = [];
-    let disposed = false;
-    try {
-      await disposeManagedSession(connection, provisional.sessionUri);
-      disposed = true;
-      this.#removedSessionUris.set(
-        provisional.sessionUri,
-        managedTargetKey(provisional.target),
-      );
-      const sessions = await refreshManagedSessions(connection.client);
-      await this.#publishManagedCatalogue(
-        connection,
-        sessions,
-        "connected",
-        [provisional.sessionUri],
-      );
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await connection.close();
-    } catch (error) {
-      errors.push(error);
-    }
-    if (!disposed && errors.length === 0) {
-      errors.push(new Error("expired-provisional-session-not-disposed"));
-    }
-    if (errors.length === 1) {
-      throw errors[0];
-    }
-    if (errors.length > 1) {
-      throw new AggregateError(
-        errors,
-        "expired-provisional-session-cleanup-failed",
-      );
-    }
-  }
-
   async #publishManagedCatalogue(
     connection: ConnectedManagedTarget,
     sessions = connection.sessions,
     hostState: "connected" | "unreachable" = "connected",
-    removedSessionUris: readonly string[] = [],
   ): Promise<void> {
     const { prepared } = connection;
     const target = prepared.target;
-    const targetKey = managedTargetKey(target);
-    const pendingRemovals = [...this.#removedSessionUris]
-      .filter(([, removedTargetKey]) => removedTargetKey === targetKey)
-      .map(([sessionUri]) => sessionUri);
-    const removals = [...new Set([...pendingRemovals, ...removedSessionUris])];
     await this.#catalogueQueue.run(async () => {
       await this.#bridge.call({
         operation: "ahp_catalog_replace",
@@ -1923,19 +1561,11 @@ export class AdapterRuntime {
             editor_client_tools_available: prepared.editorClientToolsAvailable,
           },
         ],
-        sessions: sessions
-          .filter((session) => !removals.includes(session.resource))
-          .flatMap(
-            (session) => this.#managedCatalogueSession(prepared, session) ?? [],
-          ),
-        removed_session_uris: removals,
+        sessions: sessions.flatMap(
+          (session) => this.#managedCatalogueSession(prepared, session) ?? [],
+        ),
         full_snapshot: false,
       });
-      for (const sessionUri of removals) {
-        if (this.#removedSessionUris.get(sessionUri) === targetKey) {
-          this.#removedSessionUris.delete(sessionUri);
-        }
-      }
     });
   }
 
@@ -2206,6 +1836,15 @@ export class AdapterRuntime {
   }
 
   async #publishCatalogue(snapshot: CatalogueSnapshot): Promise<void> {
+    await this.#catalogueQueue.run(() =>
+      this.#publishCatalogueSnapshot(snapshot, this.#authorizedTargets),
+    );
+  }
+
+  async #publishCatalogueSnapshot(
+    snapshot: CatalogueSnapshot,
+    authorizedTargets: readonly ManagedTarget[],
+  ): Promise<void> {
     const hosts = snapshot.endpoints.map((entry) => {
       const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
       return {
@@ -2247,11 +1886,12 @@ export class AdapterRuntime {
       }
       const managed = this.#managedEntryByEndpointId(entry.endpoint.id);
       for (const session of entry.sessions) {
-        if (this.#removedSessionUris.has(session.resource)) {
-          continue;
-        }
         const candidate = managed
-          ? this.#managedCatalogueSession(managed.prepared, session)
+          ? this.#managedCatalogueSession(
+              managed.prepared,
+              session,
+              authorizedTargets,
+            )
           : toEditorBridgeSession(entry, session);
         if (!candidate) {
           continue;
@@ -2270,20 +1910,13 @@ export class AdapterRuntime {
       }
     }
     const sessions = [...sessionsByUri.values()];
-    const pendingRemovals = [...this.#removedSessionUris.keys()];
-    await this.#catalogueQueue.run(async () => {
-      await this.#bridge.call({
-        operation: "ahp_catalog_replace",
-        adapter_id: this.#config.adapterId,
-        adapter_instance_id: this.#adapterInstanceId,
-        hosts,
-        sessions,
-        removed_session_uris: pendingRemovals,
-        full_snapshot: true,
-      });
-      for (const sessionUri of pendingRemovals) {
-        this.#removedSessionUris.delete(sessionUri);
-      }
+    await this.#bridge.call({
+      operation: "ahp_catalog_replace",
+      adapter_id: this.#config.adapterId,
+      adapter_instance_id: this.#adapterInstanceId,
+      hosts,
+      sessions,
+      full_snapshot: true,
     });
   }
 
@@ -2307,8 +1940,9 @@ export class AdapterRuntime {
   #managedCatalogueSession(
     prepared: ConnectedManagedTarget["prepared"],
     session: SessionSummary,
+    authorizedTargets = this.#authorizedTargets,
   ): BridgeCatalogueSession | undefined {
-    const target = this.#config.authorizedTargets.find(
+    const target = authorizedTargets.find(
       (candidate) =>
         sameManagedHost(candidate, prepared.target) &&
         session.workingDirectories?.some((uri) =>
@@ -2365,13 +1999,6 @@ function snapshotCoalescingKey(event: PublishedEvent): string | undefined {
   return undefined;
 }
 
-function provisionalBindingKey(
-  endpointId: string,
-  sessionUri: string,
-): string {
-  return `${endpointId}\0${sessionUri}`;
-}
-
 function parseRegisterResult(value: unknown): RegisterResult {
   const data = requirePlainRecord(value, "Bridge registration result");
   const bindings = data.bindings;
@@ -2384,10 +2011,44 @@ function parseRegisterResult(value: unknown): RegisterResult {
   );
   return {
     bindings: bindings.map((binding) => parseBridgeBinding(binding)),
+    ...("authorization" in data ? { authorization: data.authorization } : {}),
     ...(foregroundBindingId
       ? { foreground_binding_id: foregroundBindingId }
       : {}),
   };
+}
+
+function parseAuthorizationSnapshot(value: unknown): AuthorizationSnapshot {
+  try {
+    const data = requirePlainRecord(value, "Bridge authorization");
+    const revision = requirePlainString(data.revision, "authorization.revision");
+    if (!revision.trim()) {
+      throw new Error("authorization.revision must not be blank");
+    }
+    const targets = new Map<string, ManagedTarget>();
+    const hosts = new Map<string, ManagedTarget>();
+    for (const target of parseAuthorizedTargets(data.authorized_targets)) {
+      const hostKey = managedHostKey(target);
+      const previous = hosts.get(hostKey);
+      if (previous && !sameManagedHost(previous, target)) {
+        throw new Error("Authorization contains conflicting SSH identities");
+      }
+      hosts.set(hostKey, target);
+      const key = managedTargetKey(target);
+      if (!targets.has(key)) {
+        targets.set(key, target);
+      }
+    }
+    return { revision, targets: [...targets.values()] };
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      throw error;
+    }
+    throw new AhpOperationError(
+      "invalid-authorization",
+      `Invalid Bridge authorization: ${error.message}`,
+    );
+  }
 }
 
 function parseBridgeBinding(value: unknown): BridgeBinding {
@@ -2689,34 +2350,6 @@ function requireInteger(value: unknown, name: string): number {
     );
   }
   return value;
-}
-
-function requireModelSelection(value: unknown): ModelSelection | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  const record = requireRecord(value, "model_selection");
-  const id = requireString(record.id, "model_selection.id");
-  if (record.config === undefined) {
-    return { id };
-  }
-  const source = requireRecord(record.config, "model_selection.config");
-  const config: Record<string, string | number | boolean | null> = {};
-  for (const [key, item] of Object.entries(source)) {
-    if (
-      item !== null &&
-      typeof item !== "string" &&
-      typeof item !== "number" &&
-      typeof item !== "boolean"
-    ) {
-      throw new AhpOperationError(
-        "invalid-command",
-        `model_selection.config.${key} must be a JSON primitive`,
-      );
-    }
-    config[key] = item;
-  }
-  return { id, config };
 }
 
 function errorCode(error: unknown): string {

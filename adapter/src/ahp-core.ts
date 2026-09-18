@@ -18,7 +18,6 @@ import {
   type ChatToolCallResultConfirmedAction,
   type InitializeParams,
   type Message,
-  type ModelSelection,
   type SessionChatInputRequest,
   type SessionInputRequest,
   type SessionState,
@@ -208,9 +207,12 @@ export interface AhpCoreOptions {
 export type AhpOperationErrorCode =
   | "already-closed"
   | "ambiguous-input"
+  | "authorization-restart-required"
+  | "authorization-revision-conflict"
   | "binding-unavailable"
   | "chat-unavailable"
   | "endpoint-not-found"
+  | "invalid-authorization"
   | "invalid-command"
   | "invalid-confirmation-option"
   | "no-active-turn"
@@ -288,7 +290,6 @@ export interface AhpSessionBinding {
   queueUserText(
     text: string,
     clientSeq?: number,
-    model?: ModelSelection,
   ): Promise<QueueUserTextResult>;
   cancelActiveTurn(
     clientSeq?: number,
@@ -530,18 +531,6 @@ export class AhpCore {
     await Promise.all(refreshes);
     this.#emitCatalogue();
     return this.catalogue;
-  }
-
-  rememberSession(endpointId: string, summary: SessionSummary): void {
-    const record = this.#records.get(endpointId);
-    if (!record || !record.present || !record.connection || record.connection.closed) {
-      throw new AhpOperationError(
-        "binding-unavailable",
-        "The managed Agent Host endpoint is not connected",
-      );
-    }
-    record.sessions.set(summary.resource, structuredClone(summary));
-    this.#emitCatalogue();
   }
 
   async bindSession(
@@ -1367,7 +1356,6 @@ class SessionBinding implements AhpSessionBinding {
   queueUserText(
     text: string,
     clientSeq?: number,
-    model?: ModelSelection,
   ): Promise<QueueUserTextResult> {
     return this.#queue.run(() => {
       this.#assertOpen();
@@ -1381,7 +1369,6 @@ class SessionBinding implements AhpSessionBinding {
       const message: Message = {
         text,
         origin: { kind: MessageKind.User },
-        ...(model ? { model } : {}),
       };
       if (
         chat.activeTurn === undefined &&

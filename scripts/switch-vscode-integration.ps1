@@ -85,9 +85,6 @@ if ($RequireIdle) {
     ) {
         throw "Resolve pending approvals or input requests before restarting."
     }
-    if ($Status.ahp.creation) {
-        throw "Finish or cancel the current /new workflow before restarting."
-    }
 }
 if ($CheckIdleOnly) {
     Write-Host "Bridge is idle."
@@ -118,9 +115,6 @@ if ($null -ne $Status) {
             [int]($Status.ahp.pending_inputs) -ne 0
         ) {
             throw "Wait for pending approvals and clarification inputs to finish before switching integration."
-        }
-        if ($Status.ahp.creation) {
-            throw "Finish or cancel the current /new workflow before switching integration."
         }
     }
 }
@@ -172,6 +166,12 @@ if ($Mode -eq "Ahp") {
         -Destination $StatusExtensionTarget `
         -Recurse `
         -Force
+    foreach ($ObsoleteFile in @("auth-broker.js", "auth-broker.js.map")) {
+        $ObsoletePath = Join-Path $StatusExtensionTarget "dist\$ObsoleteFile"
+        if (Test-Path -LiteralPath $ObsoletePath -PathType Leaf) {
+            Remove-Item -LiteralPath $ObsoletePath -Force
+        }
+    }
 }
 else {
     if (-not (Test-Path -LiteralPath $GeneratedMcp -PathType Leaf)) {

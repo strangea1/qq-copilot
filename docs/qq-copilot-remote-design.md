@@ -1,6 +1,6 @@
 # VS Code Copilot 与 QQ Bot 远程交互设计
 
-状态：AHP 双客户端、最多 5 个并发 Binding、QQ 新建 Session 与本地/Remote SSH 预授权目标已实现；Hooks/MCP 保留为 Legacy 回滚路径<br>
+状态：AHP 双客户端、最多 5 个并发 Binding、本地/Remote SSH 已有 Session 发现与切换；Hooks/MCP 保留为 Legacy 回滚路径<br>
 日期：2026-09-02<br>
 目标环境：Windows、单个 QQ 单聊用户、本地/Remote SSH Agent Host、当前 Windows 标准用户权限
 
@@ -41,8 +41,7 @@ flowchart LR
 - SQLite `ahp_bindings` 保存所有 Binding，`ahp_foreground_binding` 只保存 QQ 前台
   指针。普通 QQ 文本/语音进入前台 Chat；`/send <code>` 可定向进入后台 Chat；
   Agent 忙碌时继续使用 AHP queued message。
-- QQ 可通过 `/new` / `/new advanced` 选择电脑端预授权目标、创建新的 Session、自动加入
-  监控并提交首条任务；也可 `/switch` 到已有 Session。
+- Session 创建、登录和模型配置在电脑端完成；QQ 通过 `/switch` 选择已有 Session。
 - `bridge.workspace_roots` 定义本地操作安全边界；`ahp.shared_workspaces` 定义 QQ
   兼容的本地精确目标目录，`ahp.authorized_targets` 定义完整的 Local/Remote 目标身份。
   Local 使用规范化 Windows 路径；Remote 使用 `(ssh alias, canonical POSIX path)`；
@@ -51,19 +50,18 @@ flowchart LR
   标题、完整目录、`local` / `ssh:<alias>`、在线/离线缓存，以及前台、后台、运行中和
   未监控状态。`/switch` 返回一次性回调按钮，`/switch <code>` 作为文本兜底，两者都只
   改变前台指针，不停止旧 Session。
-- 受管 Host 在 `initialize` 后由 Adapter 根据 `AgentInfo.protectedResources` 通过 VS Code
-  状态扩展的显式授权 Broker 获取 GitHub token，并发送 AHP `authenticate`。token 不经过
-  QQ、Bridge command、SQLite、TOML 或日志；未知 resource/server/scopes fail-closed。
-- `/new advanced` 的模型来自认证后刷新的 `AgentInfo.models`，以首条 `Message.model`
-  提交；审批模式来自 `resolveSessionConfig`。必填模型配置只有 Host 提供 JSON primitive
-  默认值时才允许自动填充，否则要求回到 PC 创建。
+- Adapter 不获取 VS Code GitHub token，不提供 Session 创建或销毁命令。
 - 最近活跃 Session 自动加入监控。达到 5 个时，LRU 只能选择非前台、无 active Turn、
   queued message、Pending Adapter command、审批或澄清的 Binding；所有槽位受保护时
-  新建、切换或定向发送明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。
-- 目录配置变化、Session 目录变化、过期或已使用的按钮都会 fail-closed。每个 Keyboard
+  切换或定向发送明确失败。`/detach <code>` 使用相同安全条件主动释放后台 Binding。
+- Session 目录变化、过期或已使用的按钮都会 fail-closed。每个 Keyboard
   最多 25 项，最多 4 页。不同通知的“切换到该 Session”按钮使用独立 group，互不失效。
 - `qq-bridge add-workspace` 规范化并去重目录，同时追加安全根和 AHP 目标列表；
-  `scripts/add-workspace.ps1` 在确认当前绑定空闲后完成配置和 Bridge/Adapter 重启。
+  `scripts/add-workspace.ps1` 保存后通过 `reload-targets` 等待 Bridge/Adapter 版本确认。
+  追加授权不要求 Binding 空闲，不重启或重绑；同一 SSH alias/身份复用已保留的 Host 和隧道。
+- Bridge 保存不可变授权快照，并在 Adapter 轮询时检查配置变化。注册与轮询响应带授权
+  版本，Adapter 应用后在下一次轮询确认；重新投影缓存目录使同主机新增目录立即可见。
+  无效配置、删除目录或身份/指纹变更被拒绝，保留最后有效授权并报告需要重启，不能静默撤权。
 - `scripts/register-local-target.ps1` / `register-remote-target.ps1` 会在电脑端验证目标、
   打开对应 VS Code 工作区并等待状态扩展报告 `workspace.isTrusted` 后才持久化授权。
 - 旧的标量 `ahp.shared_workspace` 可读取，配置保存后迁移为
@@ -110,11 +108,7 @@ VS Code 1.136 standalone 注册表中的 `protocolVersion = 0.1.0` 是 launcher 
 这一已探针验证的组合使用 `wireProtocolVersion = 0.9.0`；未知 registry-to-wire 组合
 继续 fail-closed，且 `0.1.0` 不会加入 wire 协议支持列表。
 Local managed Host 使用 `--new-instance --foreground` 启动并由 Adapter 持有进程；
-standalone 多 provider 环境固定优先 `copilotcli`。`createSession` 使用
-`ahp-session:/<uuid>`，创建后即使 deferred Copilot backing 尚未进入 `listSessions`，
-也必须通过精确 URI 订阅 Snapshot 确认，并在 create ACK 前建立 provisional Binding；
-正式 Binding 在 ACK 后 90 秒内接管，否则 dispose Session、发布 removal 并释放 Host。临时 Summary 本身不能
-阻止 Host 回收。每个目标复用 retained Host，避免新建 Session 时替换 Host identity；
+每个目标复用 retained Host，避免重连已有 Session 时替换 Host identity；
 本地 owned Host 用 instance ID 精确清理，Remote SSH 仅关闭本地 tunnel。
 
 下文第 1–20 节保留最初 Hooks/MCP 设计和安全分析，作为 Legacy 模式与演进记录；

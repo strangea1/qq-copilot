@@ -40,6 +40,10 @@ enum Command {
     Run,
     Status,
     AhpSessions,
+    ReloadTargets {
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: Option<u64>,
+    },
     AhpBind {
         #[arg(long)]
         endpoint: String,
@@ -178,6 +182,9 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
+        Command::ReloadTargets { timeout_seconds } => {
+            reload_targets(&config_path, timeout_seconds).await
+        }
         Command::AhpBind { endpoint, session } => {
             let result = admin_call(
                 &config_path,
@@ -276,6 +283,58 @@ async fn main() -> Result<()> {
             println!("QQ remote control enabled.");
             Ok(())
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct AuthorizationReloadState {
+    revision: String,
+    adapter_revision: Option<String>,
+    adapter_connected: bool,
+    last_error: Option<String>,
+}
+
+impl AuthorizationReloadState {
+    fn applied(&self) -> bool {
+        !self.revision.is_empty()
+            && self.adapter_connected
+            && self.adapter_revision.as_deref() == Some(self.revision.as_str())
+            && self.last_error.is_none()
+    }
+}
+
+async fn reload_targets(config_path: &Path, timeout_seconds: Option<u64>) -> Result<()> {
+    let config = AppConfig::load(config_path)?;
+    let wait = Duration::from_secs(
+        timeout_seconds.unwrap_or(config.ahp.poll_seconds.saturating_mul(2).saturating_add(10)),
+    );
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "authorization hot reload timed out waiting for the Adapter; configuration remains saved, but live application is unconfirmed. Check Bridge/Adapter status and upgrade both together"
+            );
+        }
+        let response = ipc::call(
+            &config,
+            BridgeRequest::AhpReloadTargets,
+            remaining.min(Duration::from_secs(10)),
+        )
+        .await
+        .context(
+            "authorization hot reload failed; ensure the running Bridge supports reload-targets",
+        )?;
+        let state: AuthorizationReloadState = serde_json::from_value(response.clone())
+            .context("Bridge returned an invalid authorization reload status")?;
+        if let Some(error) = state.last_error.as_deref() {
+            bail!("authorization hot reload was rejected: {error}");
+        }
+        if state.applied() {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -479,7 +538,9 @@ fn add_workspaces(config_path: &Path, workspaces: Vec<PathBuf>) -> Result<()> {
     config.save(config_path)?;
     println!("Added {added} target workspace(s).");
     print_target_workspaces(&config);
-    println!("Restart qq-bridge and the AHP Adapter to apply the updated target list.");
+    println!(
+        "Use `qq-bridge reload-targets` to confirm append-only authorization updates without restarting."
+    );
     Ok(())
 }
 
@@ -675,6 +736,12 @@ fn register_remote_target(
             .any(|configured| configured.matches(original))
     }) {
         bail!("SSH target authorization changed while workspace trust confirmation was pending");
+    }
+    if config.ahp.authorized_targets.iter().any(|configured| {
+        matches!(configured, AhpAuthorizedTarget::Ssh { alias, .. } if alias == ssh_alias)
+            && !configured.same_ssh_host(&target)
+    }) {
+        bail!("SSH Host alias identity changed while workspace trust confirmation was pending");
     }
     if !config
         .ahp
@@ -1366,6 +1433,43 @@ mod tests {
         }
         assert!(validate_endpoints_json(r#"{"endpoints":[]}"#).is_err());
         assert!(validate_endpoints_json("invalid JSON").is_err());
+    }
+
+    #[test]
+    fn authorization_reload_cli_and_revision_confirmation() {
+        assert!(matches!(
+            Cli::try_parse_from(["qq-bridge", "reload-targets"])
+                .expect("reload command")
+                .command,
+            Some(Command::ReloadTargets {
+                timeout_seconds: None
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["qq-bridge", "reload-targets", "--timeout-seconds", "20"])
+                .expect("bounded reload")
+                .command,
+            Some(Command::ReloadTargets {
+                timeout_seconds: Some(20)
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["qq-bridge", "reload-targets", "--timeout-seconds", "0"]).is_err()
+        );
+        let mut state = AuthorizationReloadState {
+            revision: "new".to_owned(),
+            adapter_revision: Some("old".to_owned()),
+            adapter_connected: true,
+            last_error: None,
+        };
+        assert!(!state.applied());
+        state.adapter_revision = Some("new".to_owned());
+        assert!(state.applied());
+        state.adapter_connected = false;
+        assert!(!state.applied());
+        state.adapter_connected = true;
+        state.last_error = Some("authorization_reload_requires_restart".to_owned());
+        assert!(!state.applied());
     }
 
     #[test]

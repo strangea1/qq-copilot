@@ -195,6 +195,12 @@ Copy-Item `
     -Destination $AdapterDirectory `
     -Recurse `
     -Force
+foreach ($ObsoleteFile in @("credential-broker.js", "credential-broker.js.map", "credential-broker.d.ts")) {
+    $ObsoletePath = Join-Path $AdapterDirectory "dist\$ObsoleteFile"
+    if (Test-Path -LiteralPath $ObsoletePath -PathType Leaf) {
+        Remove-Item -LiteralPath $ObsoletePath -Force
+    }
+}
 Copy-Item `
     -LiteralPath (Join-Path $ProjectRoot "vendor\microsoft-agent-host-protocol-0.8.0.tgz") `
     -Destination (Join-Path $AdapterVendorDirectory "microsoft-agent-host-protocol-0.8.0.tgz") `
@@ -217,6 +223,12 @@ try {
         -Destination $StatusExtensionSource `
         -Recurse `
         -Force
+    foreach ($ObsoleteFile in @("auth-broker.js", "auth-broker.js.map")) {
+        $ObsoletePath = Join-Path $StatusExtensionSource "dist\$ObsoleteFile"
+        if (Test-Path -LiteralPath $ObsoletePath -PathType Leaf) {
+            Remove-Item -LiteralPath $ObsoletePath -Force
+        }
+    }
 }
 finally {
     Pop-Location

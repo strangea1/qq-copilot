@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { resolve, win32 } from "node:path";
 
 import { parse } from "smol-toml";
 
@@ -71,7 +71,7 @@ export async function loadAdapterConfig(
     typeof ahp.ssh_executable === "string" && ahp.ssh_executable.length > 0
       ? ahp.ssh_executable
       : undefined;
-  const authorizedTargets = parseAuthorizedTargets(ahp);
+  const authorizedTargets = parseConfiguredTargets(ahp);
   const adapterId = `qq-copilot-ahp-${createHash("sha256")
     .update(`adapter\0${pipeName}\0${bridgeToken}`, "utf8")
     .digest("hex")
@@ -143,7 +143,7 @@ function requireInteger(value: unknown, name: string): number {
   return value;
 }
 
-function parseAuthorizedTargets(
+function parseConfiguredTargets(
   ahp: Record<string, unknown>,
 ): readonly AuthorizedTargetConfig[] {
   const targets: AuthorizedTargetConfig[] = [];
@@ -161,51 +161,81 @@ function parseAuthorizedTargets(
     }
   }
   if (Array.isArray(ahp.authorized_targets)) {
-    for (const item of ahp.authorized_targets) {
-      const target = requireTable(item, "ahp.authorized_targets[]");
-      if (target.kind === "local") {
-        targets.push({
-          kind: "local",
-          path: resolve(requireString(target.path, "authorized target path")),
-        });
-        continue;
-      }
-      if (target.kind === "ssh") {
-        const alias = requireString(target.alias, "authorized target alias");
-        if (
-          alias.startsWith("-") ||
-          !/^[A-Za-z0-9._-]+$/u.test(alias)
-        ) {
-          throw new Error("authorized target alias is invalid");
-        }
-        const hostKeyFingerprints = requireStringArray(
-          target.host_key_fingerprints,
-          "authorized target host key fingerprints",
-        );
-        if (
-          hostKeyFingerprints.length === 0 ||
-          hostKeyFingerprints.some(
-            (fingerprint) =>
-              !fingerprint.startsWith("SHA256:") || /\s/u.test(fingerprint),
-          )
-        ) {
-          throw new Error("authorized target host key fingerprints are invalid");
-        }
-        targets.push({
-          kind: "ssh",
-          alias,
-          path: requireString(target.path, "authorized target path"),
-          user: requireString(target.user, "authorized target user"),
-          host: requireString(target.host, "authorized target host"),
-          port: requireInteger(target.port, "authorized target port"),
-          hostKeyFingerprints,
-        });
-        continue;
-      }
-      throw new Error("authorized target kind is invalid");
-    }
+    targets.push(...parseAuthorizedTargets(ahp.authorized_targets, true));
   }
   return targets;
+}
+
+export function parseAuthorizedTargets(
+  value: unknown,
+  resolveLocalPaths = false,
+): readonly AuthorizedTargetConfig[] {
+  if (!Array.isArray(value)) {
+    throw new Error("authorized_targets must be an array");
+  }
+  return value.map((item): AuthorizedTargetConfig => {
+    const target = requireTable(item, "authorized_targets[]");
+    const path = requireTargetString(target.path, "authorized target path");
+    if (target.kind === "local") {
+      if (
+        !resolveLocalPaths &&
+        !/^[A-Za-z]:[\\/]/u.test(path) &&
+        !/^\\\\[^\\]+\\[^\\]+/u.test(path)
+      ) {
+        throw new Error("authorized local target path must be absolute");
+      }
+      return {
+        kind: "local",
+        path: resolveLocalPaths ? resolve(path) : win32.resolve(path),
+      };
+    }
+    if (target.kind !== "ssh") {
+      throw new Error("authorized target kind is invalid");
+    }
+    const alias = requireTargetString(target.alias, "authorized target alias");
+    if (alias.startsWith("-") || !/^[A-Za-z0-9._-]+$/u.test(alias)) {
+      throw new Error("authorized target alias is invalid");
+    }
+    if (!path.startsWith("/")) {
+      throw new Error("authorized SSH target path must be absolute");
+    }
+    const hostKeyFingerprints = requireStringArray(
+      target.host_key_fingerprints,
+      "authorized target host key fingerprints",
+    );
+    if (
+      hostKeyFingerprints.length === 0 ||
+      hostKeyFingerprints.some(
+        (fingerprint) =>
+          !fingerprint.startsWith("SHA256:") ||
+          fingerprint.length === "SHA256:".length ||
+          /\s/u.test(fingerprint),
+      )
+    ) {
+      throw new Error("authorized target host key fingerprints are invalid");
+    }
+    const port = requireInteger(target.port, "authorized target port");
+    if (port < 1 || port > 65_535) {
+      throw new Error("authorized target port is out of range");
+    }
+    return {
+      kind: "ssh",
+      alias,
+      path,
+      user: requireTargetString(target.user, "authorized target user"),
+      host: requireTargetString(target.host, "authorized target host"),
+      port,
+      hostKeyFingerprints: [...new Set(hostKeyFingerprints)].sort(),
+    };
+  });
+}
+
+function requireTargetString(value: unknown, name: string): string {
+  const result = requireString(value, name);
+  if (!result.trim() || /[\0\r\n]/u.test(result)) {
+    throw new Error(`${name} is invalid`);
+  }
+  return result;
 }
 
 function requireStringArray(value: unknown, name: string): string[] {

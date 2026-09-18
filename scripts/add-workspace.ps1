@@ -10,49 +10,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Bridge = Join-Path $InstallDirectory "qq-bridge.exe"
-$SwitchScript = Join-Path $InstallDirectory "scripts\switch-vscode-integration.ps1"
 
 if (-not (Test-Path -LiteralPath $Bridge -PathType Leaf)) {
     throw "Bridge executable not found: $Bridge"
 }
-if (-not (Test-Path -LiteralPath $SwitchScript -PathType Leaf)) {
-    throw "Integration switch script not found: $SwitchScript"
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "Bridge config not found: $ConfigPath"
 }
 
-$StatusOutput = & $Bridge --config $ConfigPath status
+& $Bridge --config $ConfigPath reload-targets
 if ($LASTEXITCODE -ne 0) {
-    throw "The Bridge must be running so its idle state can be verified before restart."
+    throw "Bridge/Adapter authorization hot reload is unavailable; no workspace was added."
 }
-$Status = ($StatusOutput -join [Environment]::NewLine) | ConvertFrom-Json
-if (-not $Status.ahp) {
-    throw "AHP mode is not configured."
-}
-
-$Bindings = @()
-if ($Status.ahp.bindings) {
-    $Bindings = @($Status.ahp.bindings)
-} elseif ($Status.ahp.binding) {
-    $Bindings = @($Status.ahp.binding)
-}
-$BusyBindings = @($Bindings | Where-Object {
-    $_.active_turn_id -or [int]($_.queued_message_count) -ne 0
-})
-if ($BusyBindings.Count -ne 0) {
-    throw "Wait for all active Turns and queued messages to finish before adding a workspace."
-}
-if ([int]($Status.ahp.pending_commands) -ne 0) {
-    throw "Wait for pending Adapter commands to finish before adding a workspace."
-}
-if (
-    [int]($Status.ahp.pending_approvals) -ne 0 -or
-    [int]($Status.ahp.pending_inputs) -ne 0
-) {
-    throw "Wait for pending approvals and clarification inputs to finish before adding a workspace."
-}
-if ($Status.ahp.creation) {
-    throw "Finish or cancel the current /new workflow before adding a workspace."
-}
-
 $Arguments = @("--config", $ConfigPath, "add-workspace")
 foreach ($Path in $Workspace) {
     $Resolved = (Resolve-Path -LiteralPath $Path).Path
@@ -67,13 +36,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "qq-bridge add-workspace failed with exit code $LASTEXITCODE"
 }
 
-& $SwitchScript `
-    -Mode Ahp `
-    -InstallDirectory $InstallDirectory `
-    -ConfigPath $ConfigPath `
-    -RequireIdle
+& $Bridge --config $ConfigPath reload-targets
 if ($LASTEXITCODE -ne 0) {
-    throw "Bridge restart failed with exit code $LASTEXITCODE"
+    throw "Workspaces were saved, but live authorization reload is unconfirmed. Check Bridge/Adapter status and retry reload-targets."
 }
 
 Write-Host "Target workspace configuration applied. Send /sessions in QQ to verify it."

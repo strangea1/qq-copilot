@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::IPC_PROTOCOL_VERSION;
+use crate::{IPC_PROTOCOL_VERSION, config::AhpAuthorizedTarget};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcEnvelope {
@@ -120,14 +120,8 @@ pub enum BridgeRequest {
         adapter_id: String,
         adapter_instance_id: String,
         timeout_seconds: u64,
-    },
-    AhpCommandProgress {
-        adapter_id: String,
-        adapter_instance_id: String,
-        command_id: i64,
-        progress: u64,
-        total: Option<u64>,
-        message: Option<String>,
+        #[serde(default)]
+        applied_authorization_revision: Option<String>,
     },
     AhpAckCommand {
         adapter_id: String,
@@ -138,6 +132,7 @@ pub enum BridgeRequest {
         result: Option<Value>,
     },
     AhpSessions,
+    AhpReloadTargets,
     AhpBindSession {
         endpoint_id: String,
         session_uri: String,
@@ -225,34 +220,10 @@ pub enum AhpManagedTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpSessionConfigOption {
-    pub value: Value,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpSupportedSessionField {
-    pub property: String,
-    pub options: Vec<AhpSessionConfigOption>,
-    pub selected: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpSupportedModelSelection {
-    pub options: Vec<AhpSessionConfigOption>,
-    pub selected: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpPrepareTargetCommand {
     pub target: AhpManagedTarget,
-    pub advanced: bool,
     #[serde(default)]
     pub retain_connection: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,43 +234,6 @@ pub struct AhpPrepareTargetResult {
     pub workspace_uri: String,
     pub host_label: String,
     pub editor_client_tools_available: bool,
-    pub resolved_values: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<AhpSupportedModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval: Option<AhpSupportedSessionField>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpCreateSessionCommand {
-    pub target: AhpManagedTarget,
-    pub provider: String,
-    pub session_uri: String,
-    pub workspace_uri: String,
-    pub resolved_values: Value,
-    pub overrides: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpCreateSessionResult {
-    pub endpoint_id: String,
-    pub host_instance_id: String,
-    pub workspace_uri: String,
-    pub host_label: String,
-    pub editor_client_tools_available: bool,
-    pub session: AhpSessionDescriptor,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpSendMessageResult {
-    pub disposition: String,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AhpDisposeSessionCommand {
-    pub target: AhpManagedTarget,
-    pub session_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,8 +340,6 @@ pub enum AhpCommandKind {
     ReviewToolResult,
     CompleteInput,
     PrepareTarget,
-    CreateSession,
-    DisposeSession,
 }
 
 impl AhpCommandKind {
@@ -421,8 +353,6 @@ impl AhpCommandKind {
             Self::ReviewToolResult => "review_tool_result",
             Self::CompleteInput => "complete_input",
             Self::PrepareTarget => "prepare_target",
-            Self::CreateSession => "create_session",
-            Self::DisposeSession => "dispose_session",
         }
     }
 }
@@ -440,8 +370,6 @@ impl TryFrom<&str> for AhpCommandKind {
             "review_tool_result" => Ok(Self::ReviewToolResult),
             "complete_input" => Ok(Self::CompleteInput),
             "prepare_target" => Ok(Self::PrepareTarget),
-            "create_session" => Ok(Self::CreateSession),
-            "dispose_session" => Ok(Self::DisposeSession),
             other => Err(format!("unknown AHP command kind {other}")),
         }
     }
@@ -492,8 +420,15 @@ pub struct AhpBindingRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AhpAuthorizationSnapshot {
+    pub revision: String,
+    pub authorized_targets: Vec<AhpAuthorizedTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AhpCommandPollResult {
     pub commands: Vec<AhpAdapterCommand>,
+    pub authorization: AhpAuthorizationSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

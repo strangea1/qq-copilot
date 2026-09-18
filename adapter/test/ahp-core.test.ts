@@ -8,6 +8,7 @@ import {
   ChatInputQuestionKind,
   ChatInputResponseKind,
   ConfirmationOptionKind,
+  MessageKind,
   ResponsePartKind,
   SessionInputRequestKind,
   SessionLifecycle,
@@ -411,19 +412,6 @@ test("core preserves standalone 0.1.0 metadata while negotiating its audited 0.9
     );
     assert.ok(server.initializeProtocolVersions[0]?.includes("0.9.0"));
     assert.equal(server.initializeProtocolVersions[0]?.includes("0.1.0"), false);
-    const endpointId = catalogue.endpoints[0]?.endpoint.id;
-    assert.ok(endpointId);
-    const deferred = summary(
-      "ahp-session:/deferred-standalone",
-      "Deferred standalone",
-    );
-    core.rememberSession(endpointId, deferred);
-    assert.deepEqual(
-      core.catalogue.endpoints[0]?.sessions.find(
-        (session) => session.resource === deferred.resource,
-      ),
-      deferred,
-    );
   } finally {
     await core.stop();
     await server.done;
@@ -641,13 +629,8 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
     );
     assert.equal(pendingCancellation.turnId, "pending-turn");
 
-    const firstPromise = binding.queueUserText("start now", undefined, {
-      id: "model-started",
-      config: { thinking: "medium" },
-    });
-    const secondPromise = binding.queueUserText("queue next", undefined, {
-      id: "model-queued",
-    });
+    const firstPromise = binding.queueUserText("start now");
+    const secondPromise = binding.queueUserText("queue next");
     const [first, second] = await Promise.all([
       firstPromise,
       secondPromise,
@@ -753,8 +736,14 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
       dispatched[2]?.actionType,
       ActionType.ChatPendingMessageSet,
     );
-    assert.equal(dispatched[1]?.modelId, "model-started");
-    assert.equal(dispatched[2]?.modelId, "model-queued");
+    assert.deepEqual(dispatched[1]?.message, {
+      text: "start now",
+      origin: { kind: MessageKind.User },
+    });
+    assert.deepEqual(dispatched[2]?.message, {
+      text: "queue next",
+      origin: { kind: MessageKind.User },
+    });
     assert.equal(
       dispatched[3]?.actionType,
       ActionType.ChatTurnCancelled,
@@ -881,7 +870,7 @@ interface DispatchDetails {
   readonly actionType?: string;
   readonly turnId?: string;
   readonly duration?: number;
-  readonly modelId?: string;
+  readonly message?: unknown;
 }
 
 function dispatchDetails(value: unknown): DispatchDetails {
@@ -893,15 +882,12 @@ function dispatchDetails(value: unknown): DispatchDetails {
   const actionType = stringProperty(action, "type");
   const turnId = stringProperty(action, "turnId");
   const duration = numberProperty(action, "duration");
-  const message = isRecord(action.message) ? action.message : {};
-  const model = isRecord(message.model) ? message.model : {};
-  const modelId = stringProperty(model, "id");
   return {
     ...(channel ? { channel } : {}),
     ...(actionType ? { actionType } : {}),
     ...(turnId ? { turnId } : {}),
     ...(duration !== undefined ? { duration } : {}),
-    ...(modelId ? { modelId } : {}),
+    ...(action.message ? { message: action.message } : {}),
   };
 }
 

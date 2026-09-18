@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -7,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::security::path_is_within;
+use crate::security::{path_is_within, sha256_hex};
 
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
@@ -248,6 +249,32 @@ impl AhpAuthorizedTarget {
             _ => false,
         }
     }
+
+    pub fn same_ssh_host(&self, other: &Self) -> bool {
+        let Self::Ssh {
+            alias,
+            user,
+            host,
+            port,
+            host_key_fingerprints,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        matches!(
+            other,
+            Self::Ssh {
+                alias: other_alias,
+                user: other_user,
+                host: other_host,
+                port: other_port,
+                host_key_fingerprints: other_fingerprints,
+                ..
+            } if alias == other_alias && user == other_user && host == other_host
+                && port == other_port && host_key_fingerprints == other_fingerprints
+        )
+    }
 }
 
 impl AhpConfig {
@@ -308,11 +335,86 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        Self::parse(&content)
+    }
+
+    pub fn parse(content: &str) -> Result<Self> {
+        let mut config: Self =
+            toml::from_str(content).map_err(|error: toml::de::Error| match error.span() {
+                Some(span) => anyhow::anyhow!(
+                    "failed to parse config near bytes {}..{}",
+                    span.start,
+                    span.end
+                ),
+                None => anyhow::anyhow!("failed to parse config"),
+            })?;
         config.ahp.sync_authorized_targets();
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn with_authorization_additions(&self, candidate: &Self) -> Result<Self> {
+        candidate.validate()?;
+        let current_targets = self.ahp.effective_authorized_targets();
+        let candidate_targets = candidate.ahp.effective_authorized_targets();
+        if current_targets.iter().any(|current| {
+            !candidate_targets
+                .iter()
+                .any(|candidate| current.matches(candidate))
+        }) || self.bridge.workspace_roots.iter().any(|current| {
+            !candidate.bridge.workspace_roots.iter().any(|candidate| {
+                path_is_within(current, candidate) && path_is_within(candidate, current)
+            })
+        }) {
+            bail!(
+                "authorization_reload_requires_restart: removing targets or roots, or changing SSH identity or fingerprints, is not an additive update"
+            );
+        }
+
+        let mut other_settings = candidate.clone();
+        other_settings.bridge.workspace_roots = self.bridge.workspace_roots.clone();
+        other_settings.ahp.shared_workspaces = self.ahp.shared_workspaces.clone();
+        other_settings.ahp.authorized_targets = self.ahp.authorized_targets.clone();
+        // Notification mode already has its own hot-update path.
+        other_settings.ahp.tool_notification_mode = self.ahp.tool_notification_mode;
+        if serde_json::to_value(&other_settings)? != serde_json::to_value(self)? {
+            bail!("authorization_reload_requires_restart: non-authorization configuration changed");
+        }
+
+        let mut updated = self.clone();
+        for root in &candidate.bridge.workspace_roots {
+            if !updated
+                .bridge
+                .workspace_roots
+                .iter()
+                .any(|current| path_is_within(current, root) && path_is_within(root, current))
+            {
+                updated.bridge.workspace_roots.push(root.clone());
+            }
+        }
+        updated.ahp.authorized_targets = current_targets;
+        for target in candidate_targets {
+            if !updated
+                .ahp
+                .authorized_targets
+                .iter()
+                .any(|current| current.matches(&target))
+            {
+                updated.ahp.authorized_targets.push(target);
+            }
+        }
+        updated.ahp.sync_authorized_targets();
+        updated.validate()?;
+        Ok(updated)
+    }
+
+    pub fn authorization_revision(&self) -> Result<String> {
+        let authorization = serde_json::to_vec(&(
+            &self.bridge.workspace_roots,
+            self.ahp.effective_authorized_targets(),
+        ))
+        .context("failed to serialize authorization snapshot")?;
+        Ok(sha256_hex(&authorization))
     }
 
     pub fn write_new(path: &Path, workspace_roots: Vec<PathBuf>) -> Result<Self> {
@@ -410,6 +512,7 @@ impl AppConfig {
         }
         if self.ahp.enabled {
             let targets = self.ahp.effective_authorized_targets();
+            let mut ssh_aliases = HashMap::<&str, &AhpAuthorizedTarget>::new();
             for target in &targets {
                 match target {
                     AhpAuthorizedTarget::Local { path } => {
@@ -436,6 +539,13 @@ impl AppConfig {
                         port,
                         host_key_fingerprints,
                     } => {
+                        if let Some(previous) = ssh_aliases.insert(alias, target)
+                            && !previous.same_ssh_host(target)
+                        {
+                            bail!(
+                                "authorization_reload_requires_restart: SSH alias has conflicting identities; remove its old targets before changing identity"
+                            );
+                        }
                         if alias.is_empty()
                             || alias.starts_with('-')
                             || alias.len() > 255
@@ -921,6 +1031,194 @@ mod tests {
 
         let error = config.validate().expect_err("outside target must fail");
         assert!(error.to_string().contains("outside bridge.workspace_roots"));
+    }
+
+    fn ssh_target(path: &str) -> AhpAuthorizedTarget {
+        AhpAuthorizedTarget::Ssh {
+            alias: "dev".to_owned(),
+            path: path.to_owned(),
+            user: "owner".to_owned(),
+            host: "dev.example.test".to_owned(),
+            port: 22,
+            host_key_fingerprints: vec!["SHA256:test".to_owned()],
+        }
+    }
+
+    fn authorization_config(directory: &Path) -> AppConfig {
+        let mut config = AppConfig::write_new(
+            &directory.join("config.toml"),
+            vec![directory.to_path_buf()],
+        )
+        .expect("write config");
+        config.ahp.enabled = true;
+        config.ahp.ssh_executable = Some(directory.join("ssh.exe"));
+        config.ahp.authorized_targets = vec![
+            AhpAuthorizedTarget::local(directory.to_path_buf()),
+            ssh_target("/srv/one"),
+        ];
+        config.ahp.sync_authorized_targets();
+        config.validate().expect("valid authorization test config");
+        config
+    }
+
+    #[test]
+    fn authorization_additions_preserve_settings_and_allow_sibling_ssh_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = authorization_config(directory.path());
+        let mut candidate = config.clone();
+        candidate
+            .ahp
+            .authorized_targets
+            .push(ssh_target("/srv/two"));
+        let updated = config
+            .with_authorization_additions(&candidate)
+            .expect("append");
+        assert_eq!(updated.ahp.effective_authorized_targets().len(), 3);
+        assert_eq!(updated.bridge.ipc_token, config.bridge.ipc_token);
+        assert_eq!(updated.bridge.database_path, config.bridge.database_path);
+        assert_ne!(
+            updated.authorization_revision().expect("updated revision"),
+            config.authorization_revision().expect("original revision")
+        );
+        let replay = updated
+            .with_authorization_additions(&candidate)
+            .expect("replay");
+        assert_eq!(
+            replay.authorization_revision().expect("replayed revision"),
+            updated.authorization_revision().expect("updated revision")
+        );
+    }
+
+    #[test]
+    fn authorization_additions_normalize_duplicate_and_reordered_targets() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = authorization_config(directory.path());
+        let mut candidate = config.clone();
+        candidate.ahp.authorized_targets.reverse();
+        candidate
+            .ahp
+            .authorized_targets
+            .push(ssh_target("/srv/one"));
+        candidate
+            .bridge
+            .workspace_roots
+            .push(directory.path().to_path_buf());
+        let updated = config
+            .with_authorization_additions(&candidate)
+            .expect("no change");
+        assert_eq!(
+            updated.authorization_revision().expect("revision"),
+            config.authorization_revision().expect("original revision")
+        );
+    }
+
+    #[test]
+    fn authorization_additions_allow_local_roots_and_legacy_workspaces() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = authorization_config(directory.path());
+        let extra = tempfile::tempdir().expect("new root");
+        let mut candidate = config.clone();
+        candidate
+            .bridge
+            .workspace_roots
+            .push(extra.path().to_path_buf());
+        candidate
+            .ahp
+            .shared_workspaces
+            .push(extra.path().to_path_buf());
+        let updated = config
+            .with_authorization_additions(&candidate)
+            .expect("local addition");
+        assert_eq!(updated.bridge.workspace_roots.len(), 2);
+        assert!(updated.ahp.authorized_targets.iter().any(|target| {
+            target.matches(&AhpAuthorizedTarget::local(extra.path().to_path_buf()))
+        }));
+    }
+
+    #[test]
+    fn authorization_removal_and_identity_changes_require_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = authorization_config(directory.path());
+        let revision = config.authorization_revision().expect("original revision");
+        let changes: [fn(&mut AppConfig); 6] = [
+            |candidate| {
+                candidate
+                    .ahp
+                    .authorized_targets
+                    .retain(|target| matches!(target, AhpAuthorizedTarget::Local { .. }))
+            },
+            |candidate| candidate.bridge.workspace_roots.clear(),
+            |candidate| {
+                if let AhpAuthorizedTarget::Ssh { host, .. } =
+                    &mut candidate.ahp.authorized_targets[1]
+                {
+                    *host = "changed.example.test".to_owned();
+                }
+            },
+            |candidate| {
+                if let AhpAuthorizedTarget::Ssh {
+                    host_key_fingerprints,
+                    ..
+                } = &mut candidate.ahp.authorized_targets[1]
+                {
+                    *host_key_fingerprints = vec!["SHA256:changed".to_owned()];
+                }
+            },
+            |candidate| candidate.bridge.pipe_name = "different-pipe".to_owned(),
+            |candidate| {
+                candidate
+                    .policy
+                    .auto_allow_tools
+                    .push("unapproved-tool".to_owned())
+            },
+        ];
+        for change in changes {
+            let mut candidate = config.clone();
+            change(&mut candidate);
+            assert!(config.with_authorization_additions(&candidate).is_err());
+            assert_eq!(
+                config.authorization_revision().expect("unchanged revision"),
+                revision
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_additions_reject_conflicting_aliases_but_allow_notification_changes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = authorization_config(directory.path());
+        let mut candidate = config.clone();
+        let mut conflicting = ssh_target("/srv/two");
+        if let AhpAuthorizedTarget::Ssh { port, .. } = &mut conflicting {
+            *port = 2222;
+        }
+        candidate.ahp.authorized_targets.push(conflicting);
+        assert!(config.with_authorization_additions(&candidate).is_err());
+        candidate.ahp.authorized_targets.pop();
+        candidate
+            .ahp
+            .authorized_targets
+            .push(ssh_target("/srv/two"));
+        candidate.ahp.tool_notification_mode = AhpToolNotificationMode::Full;
+        let updated = config
+            .with_authorization_additions(&candidate)
+            .expect("independent notification mode");
+        assert_eq!(
+            updated.ahp.tool_notification_mode,
+            config.ahp.tool_notification_mode
+        );
+    }
+
+    #[test]
+    fn authorization_config_parse_errors_do_not_include_source_contents() {
+        let contents = "[bridge]\nipc_token = \"private-test-value\" trailing";
+        let error = match AppConfig::parse(contents) {
+            Ok(_) => panic!("malformed config should fail"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("failed to parse config"));
+        assert!(!diagnostic.contains("private-test-value"));
     }
 
     #[cfg(windows)]
