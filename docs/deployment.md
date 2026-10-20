@@ -22,7 +22,7 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter
 ## 2. 系统要求
 
 - Windows 10/11，推荐使用非管理员标准用户。
-- VS Code 1.136，或已完成兼容测试的后续版本。
+- VS Code 1.142，或已完成兼容测试的后续版本。
 - Local Standalone/Remote SSH 还要求 `code agent host` 匹配当前 vendored 客户端已
   审计的 registry-to-wire 版本组合；未知组合会 fail-closed。
 - GitHub Copilot 已登录。
@@ -47,23 +47,27 @@ Set-Location .\qq-copilot
 
 ## 4. 构建固定 AHP 客户端
 
-VS Code 1.136 实际使用的 AHP 类型/reducer revision 是：
+VS Code 1.142.0 的 `state/protocol/.ahp-version` 锁定的 AHP 类型/reducer revision 是：
 
 ```text
-a0bc67f840788f816c9b44bb1325181cb4c4661d
+13277064ffa20cceab1bfc04ba876a1b181b6e80
 ```
 
-Editor endpoint 在注册表和握手中均使用 `0.9.0`。VS Code 1.136 的
-`code-tunnel agent host` 则在 standalone 注册表中使用 `0.1.0`，但握手服务器明确
-宣告 `0.9.0` 并接受 `^0.9.0`。Adapter 保留原始 advertised 值，只对该已验证组合设置
-`wireProtocolVersion = 0.9.0`，不会向 Host 提供 `0.1.0` wire。
+Editor endpoint 在注册表和握手中均使用 `1.1.0`。客户端支持已审计的
+`1.1.0`、`1.0.0`、`0.10.0` 和 `0.9.0`，不隐式接受未来 `1.x`。
+VS Code 1.142 与旧版 1.136 的 `code-tunnel agent host` 均在 standalone 注册表中
+使用 `0.1.0` 元数据。Adapter 仅在已审计的 wire 集合内握手，确认 1.142 的 `1.1.0`
+或旧版的 `0.9.0`，保留原始 advertised 值，并将确认结果写入内存中的
+`wireProtocolVersion`。后续连接只提供该版本，未知组合拒绝连接，
+不会向 Host 提供 `0.1.0` wire。
 本地 Host 使用 `agent host --new-instance --foreground`，由 Adapter 持有精确进程生命周期；
 默认 detach/reuse 模式不能用于受管目标。同一目标的后续连接操作复用 retained Host，
 避免替换 instance 使其他 Session 断线；本地 owned Host
 通过精确 instance ID 清理，Remote SSH 只关闭本地 tunnel。
 
 仓库的
-`vendor/ahp-vscode-1.136.patch` 复现 VS Code stable 的 registry overlay，
+`vendor/ahp-vscode-1.142.patch` 在上游基线之外增加已审计的 `1.1.0` 和 VS Code 的
+`0.10.0` 协议 offer，
 并包含生成后的固定 tarball。需要重新生成时运行：
 
 ```powershell
@@ -73,11 +77,11 @@ Editor endpoint 在注册表和握手中均使用 `0.9.0`。VS Code 1.136 的
 预期 SHA-256：
 
 ```text
-575eef7a2a166b08b804c56768cc727c65cf8be0e6d080fb2381affed8495185
+c59b0bddbbf99c79e0f92977dae024ea962c96491594f0de06e92a10dc447f39
 ```
 
-不要用 npm registry 中同名 `0.8.0` 包替换。其版本号相同，但 wire types
-并不与 VS Code 1.136 完全一致。
+固定 tarball 是 `microsoft-agent-host-protocol-1.0.0.tgz`；包版本不是 wire 版本，
+不要用 npm registry 中同名包替换经审计的源码。
 
 ## 5. 构建和验证
 

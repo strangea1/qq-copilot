@@ -12,7 +12,7 @@ import {
   managedTargetMatchesWorkspaceUri,
   managedTargetWorkspaceUri,
   prepareTargetResult,
-  standaloneWireProtocolVersion,
+  standaloneWireProtocolVersions,
   type PreparedTarget,
 } from "../src/managed-target.js";
 
@@ -38,11 +38,13 @@ test("managed target reports executable spawn failures without crashing", async 
   );
 });
 
-test("standalone registry 0.1.0 is an audited alias for the 0.9.0 wire", () => {
-  assert.equal(standaloneWireProtocolVersion("0.1.0"), "0.9.0");
-  assert.equal(standaloneWireProtocolVersion("0.9.0"), "0.9.0");
-  assert.equal(standaloneWireProtocolVersion("1.0.0"), "1.0.0");
-  assert.equal(standaloneWireProtocolVersion("0.2.0"), undefined);
+test("standalone registry 0.1.0 requires negotiation among audited wire dialects", () => {
+  assert.deepEqual(standaloneWireProtocolVersions("0.1.0"), ["1.1.0", "1.0.0", "0.10.0", "0.9.0"]);
+  for (const version of ["0.9.0", "1.0.0", "1.1.0", "0.10.0"]) {
+    assert.deepEqual(standaloneWireProtocolVersions(version), [version]);
+  }
+  assert.deepEqual(standaloneWireProtocolVersions("1.2.0"), []);
+  assert.deepEqual(standaloneWireProtocolVersions("0.2.0"), []);
 });
 
 test("managed targets prefer the standalone Copilot provider", () => {
@@ -94,6 +96,7 @@ test("managed discovery and reconnect list existing Sessions without authenticat
   const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   let connections = 0;
   let authenticationRequired = false;
+  let selectedProtocol = "0.9.0";
   server.on("connection", (socket) => {
     connections += 1;
     socket.on("message", (data) => {
@@ -108,7 +111,7 @@ test("managed discovery and reconnect list existing Sessions without authenticat
         case "initialize":
           advertisedVersions.push(message.params.protocolVersions ?? []);
           result = {
-            protocolVersion: "0.9.0",
+            protocolVersion: selectedProtocol,
             serverSeq: 1,
             snapshots: [{
               resource: "ahp-root://",
@@ -206,8 +209,45 @@ test("managed discovery and reconnect list existing Sessions without authenticat
       "initialize", "listSessions", "listSessions",
     ]);
     assert.ok(advertisedVersions.every((versions) => versions.includes("0.9.0") && !versions.includes("0.1.0")));
+    await t.test("registry 0.1.0 negotiates old/new wire dialects and pins retained connections", async () => {
+      const { wireProtocolVersion: _, ...entry } = prepared.entry;
+      const unnegotiated = { ...prepared, entry };
+      for (const protocol of ["0.9.0", "1.1.0"]) {
+        selectedProtocol = protocol;
+        const connection = await connectPreparedManagedTarget(unnegotiated);
+        let retained: PreparedTarget;
+        try {
+          retained = connection.prepared;
+          assert.equal(retained.entry.protocolVersion, "0.1.0");
+          assert.equal(retained.entry.wireProtocolVersion, protocol);
+          assert.equal(retained.endpointId, prepared.endpointId);
+          assert.equal(retained.entry.instanceId, prepared.entry.instanceId);
+          assert.deepEqual(connection.sessions, sessions);
+        } finally {
+          await connection.disconnect();
+        }
+        const reconnected = await connectPreparedManagedTarget(retained);
+        try {
+          assert.deepEqual(advertisedVersions.at(-1), [protocol]);
+          assert.strictEqual(reconnected.prepared, retained);
+        } finally {
+          await reconnected.disconnect();
+        }
+      }
+      selectedProtocol = "1.2.0";
+      await assert.rejects(
+        connectPreparedManagedTarget(unnegotiated),
+        { code: "incompatible-protocol" },
+      );
+      await assert.rejects(
+        connectPreparedManagedTarget(prepared),
+        { code: "incompatible-protocol" },
+      );
+      selectedProtocol = "0.9.0";
+    });
     await t.test("authentication failure during listing closes every connection before retry", async () => {
       authenticationRequired = true;
+      const previousConnections = connections;
       for (let attempt = 0; attempt < 2; attempt++) {
         const accepted = once(server, "connection");
         const connecting = connectPreparedManagedTarget(prepared);
@@ -217,7 +257,7 @@ test("managed discovery and reconnect list existing Sessions without authenticat
         await closed;
         assert.equal(server.clients.size, 0);
       }
-      assert.equal(connections, 4);
+      assert.equal(connections, previousConnections + 2);
     });
   } finally {
     for (const socket of server.clients) {

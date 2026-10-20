@@ -202,8 +202,8 @@ foreach ($ObsoleteFile in @("credential-broker.js", "credential-broker.js.map", 
     }
 }
 Copy-Item `
-    -LiteralPath (Join-Path $ProjectRoot "vendor\microsoft-agent-host-protocol-0.8.0.tgz") `
-    -Destination (Join-Path $AdapterVendorDirectory "microsoft-agent-host-protocol-0.8.0.tgz") `
+    -LiteralPath (Join-Path $ProjectRoot "vendor\microsoft-agent-host-protocol-1.0.0.tgz") `
+    -Destination (Join-Path $AdapterVendorDirectory "microsoft-agent-host-protocol-1.0.0.tgz") `
     -Force
 Push-Location $AdapterDirectory
 try {

@@ -9,7 +9,7 @@
 - `src/bin/qq-bridge.rs`：QQ Bridge Daemon 和本机管理命令。
 - `src/bin/copilot-qq-hook.rs`：四类 VS Code Hook Helper。
 - `src/bin/qq-mcp.rs`：stdio MCP Adapter。
-- `adapter/`：与 VS Code 1.136 精确协议 revision 匹配的 TypeScript AHP Client。
+- `adapter/`：与 VS Code 1.142 精确协议 revision 匹配的 TypeScript AHP Client。
 - `src/ahp_store.rs`：AHP Host/Session 目录、绑定、事件、命令 outbox、审批和输入。
 - `vscode-extension/`：QQ/AHP 连接与待补发状态栏。
 - `src/db.rs`：SQLite 状态机、去重、幂等和审计。
@@ -102,16 +102,17 @@ flowchart LR
 - 同一精确工作区的多个活动 Turn 不被强制阻断，但 Bridge 发送幂等冲突警告并建议写任务
   使用独立 Git worktree。
 
-VS Code 1.136 宣告 AHP `0.9.0`，其类型和 reducer 基于 revision
-`a0bc67f840788f816c9b44bb1325181cb4c4661d`，并带有 VS Code stable 的
-registry overlay。公开 npm 0.8 tarball 与该 Host 不完全匹配，因此安装包由
+VS Code 1.142 宣告 AHP `1.1.0`，其类型和 reducer 基于 Host 锁定的 revision
+`13277064ffa20cceab1bfc04ba876a1b181b6e80`，并带有已审计版本的
+registry overlay。包版本号不能证明与该 Host 匹配，因此安装包由
 `scripts/vendor-ahp-client.ps1` 固定 revision 并应用仓库 overlay 后生成。
 
 Local Standalone/Remote SSH 通过 `code agent host` / `code agent endpoints` 接入，
-VS Code 1.136 standalone 注册表中的 `protocolVersion = 0.1.0` 是 launcher 元数据
-版本，实际 `initialize` wire 服务器为 `0.9.0`。Adapter 保留前者用于状态展示，只对
-这一已探针验证的组合使用 `wireProtocolVersion = 0.9.0`；未知 registry-to-wire 组合
-继续 fail-closed，且 `0.1.0` 不会加入 wire 协议支持列表。
+VS Code 1.136 和 1.142 standalone 注册表中的 `protocolVersion = 0.1.0` 是 launcher
+元数据版本，实际 `initialize` wire 分别为 `0.9.0` 和 `1.1.0`。Adapter 保留前者用于
+状态展示，在已审计的 wire 集合内完成握手后将实际版本记录为 `wireProtocolVersion`，
+并固定后续连接；未知 registry-to-wire 组合继续 fail-closed，
+且 `0.1.0` 不会加入 wire 协议支持列表。
 Local managed Host 使用 `--new-instance --foreground` 启动并由 Adapter 持有进程；
 每个目标复用 retained Host，避免重连已有 Session 时替换 Host identity；
 本地 owned Host 用 instance ID 精确清理，Remote SSH 仅关闭本地 tunnel。

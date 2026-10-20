@@ -220,7 +220,7 @@ test("core gates protocols, lists all endpoints, keeps clientId stable, and reda
     "endpoint_C_123456",
     "token_C_123456789012345678901234",
     "\\\\.\\pipe\\secret-ahp-c",
-    "9.9.9",
+    "1.2.0",
   );
   const sessionA = summary(
     "opaque-session-a",
@@ -418,7 +418,7 @@ test("core preserves standalone 0.1.0 metadata while negotiating its audited 0.9
   }
 });
 
-test("binding losslessly hydrates opaque session/default-chat URIs and dispatches typed operations", async () => {
+test("AHP 1.1 binding losslessly hydrates opaque session/default-chat URIs and dispatches typed operations", async () => {
   const sessionUri = "urn:provider:session:exact-value";
   const chatA = "chat+vendor://opaque/A";
   const chatB = "chat+vendor://opaque/B";
@@ -428,6 +428,7 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
     "endpoint_D_123456",
     "token_D_123456789012345678901234",
     "\\\\.\\pipe\\secret-ahp-d",
+    "1.1.0",
   );
   const sessionState: SessionState = {
     provider: "copilot",
@@ -519,6 +520,7 @@ test("binding losslessly hydrates opaque session/default-chat URIs and dispatche
   const [clientTransport, serverTransport] = InMemoryTransport.pair();
   const server = new FakeAhpServer(serverTransport, {
     summary: summary(sessionUri, "Bound session"),
+    protocolVersion: "1.1.0",
     resources,
     echoStartedTurns: true,
     beforeSubscribe: async (channel, currentServer) => {

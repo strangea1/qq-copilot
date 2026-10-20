@@ -23,7 +23,7 @@
     "inspect-session": "node dist/inspect-session.js"
   },
   "dependencies": {
-    "@microsoft/agent-host-protocol": "file:../vendor/microsoft-agent-host-protocol-0.8.0.tgz",
+    "@microsoft/agent-host-protocol": "file:../vendor/microsoft-agent-host-protocol-1.0.0.tgz",
     "smol-toml": "1.8.0",
     "ws": "8.21.0"
   },

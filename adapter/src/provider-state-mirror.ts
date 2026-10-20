@@ -192,6 +192,7 @@ function isSessionAction(action: ActionEnvelope["action"]): action is SessionAct
     case ActionType.SessionChatAdded:
     case ActionType.SessionChatRemoved:
     case ActionType.SessionChatUpdated:
+    case ActionType.SessionChatsReordered:
     case ActionType.SessionDefaultChatChanged:
     case ActionType.SessionTitleChanged:
     case ActionType.SessionServerToolsChanged:
@@ -208,6 +209,7 @@ function isSessionAction(action: ActionEnvelope["action"]): action is SessionAct
     case ActionType.SessionCustomizationRemoved:
     case ActionType.SessionMcpServerStateChanged:
     case ActionType.SessionMcpServerStartRequested:
+    case ActionType.SessionMcpServerBackgroundRequested:
     case ActionType.SessionMcpServerStopRequested:
     case ActionType.SessionIsReadChanged:
     case ActionType.SessionIsArchivedChanged:
@@ -240,6 +242,11 @@ function isChatAction(action: ActionEnvelope["action"]): action is ChatAction {
     case ActionType.ChatError:
     case ActionType.ChatTurnResume:
     case ActionType.ChatActivityChanged:
+    case ActionType.ChatBackgroundWorkSet:
+    case ActionType.ChatBackgroundWorkRemoved:
+    case ActionType.ChatMovableChanged:
+    case ActionType.ChatChangesetsChanged:
+    case ActionType.ChatCanvasesChanged:
     case ActionType.ChatWorkingDirectorySet:
     case ActionType.ChatWorkingDirectoryRemoved:
     case ActionType.ChatUsage:
@@ -248,6 +255,8 @@ function isChatAction(action: ActionEnvelope["action"]): action is ChatAction {
     case ActionType.ChatPendingMessageRemoved:
     case ActionType.ChatQueuedMessagesReordered:
     case ActionType.ChatDraftChanged:
+    case ActionType.ChatIsReadChanged:
+    case ActionType.ChatIsArchivedChanged:
     case ActionType.ChatInputRequested:
     case ActionType.ChatInputAnswerChanged:
     case ActionType.ChatInputCompleted:

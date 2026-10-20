@@ -184,18 +184,18 @@ const MANAGED_CONTROL_REQUEST_TIMEOUT_MS = 30_000;
 const LOCAL_STANDALONE_START_TIMEOUT_MS = 240_000;
 const LOCAL_STANDALONE_POLL_INTERVAL_MS = 250;
 const LOCAL_STANDALONE_OUTPUT_LIMIT = 64 * 1024;
-const STANDALONE_REGISTRY_PROTOCOL_ALIASES = new Map<string, string>([
-  ["0.1.0", "0.9.0"],
+const STANDALONE_REGISTRY_PROTOCOL_ALIASES = new Map<string, readonly string[]>([
+  ["0.1.0", ["1.1.0", "1.0.0", "0.10.0", "0.9.0"]],
 ]);
 const PREFERRED_MANAGED_PROVIDERS = ["copilotcli", "copilot"] as const;
 
-export function standaloneWireProtocolVersion(
+export function standaloneWireProtocolVersions(
   registryProtocolVersion: string,
-): string | undefined {
+): readonly string[] {
   if (NEGOTIATED_PROTOCOL_VERSIONS.includes(registryProtocolVersion)) {
-    return registryProtocolVersion;
+    return [registryProtocolVersion];
   }
-  return STANDALONE_REGISTRY_PROTOCOL_ALIASES.get(registryProtocolVersion);
+  return STANDALONE_REGISTRY_PROTOCOL_ALIASES.get(registryProtocolVersion) ?? [];
 }
 
 export interface ConnectedManagedTarget {
@@ -295,6 +295,15 @@ async function connectPreparedTarget(
   let rootTracker: ManagedRootTracker | undefined;
   let ownsPrepared = stopPreparedOnClose;
   try {
+    const wireProtocolVersions = prepared.entry.wireProtocolVersion
+      ? [prepared.entry.wireProtocolVersion]
+      : standaloneWireProtocolVersions(prepared.entry.protocolVersion);
+    if (
+      wireProtocolVersions.length === 0 ||
+      wireProtocolVersions.some((version) => !NEGOTIATED_PROTOCOL_VERSIONS.includes(version))
+    ) {
+      throw codedError("incompatible-standalone-protocol");
+    }
     const transport = await openEndpointTransport(
       prepared.entry.endpoint,
       prepared.entry.connectionToken,
@@ -315,18 +324,15 @@ async function connectPreparedTarget(
             version: "0.1.0",
             title: "QQ Copilot AHP Adapter",
           },
-          protocolVersions: [...NEGOTIATED_PROTOCOL_VERSIONS],
+          protocolVersions: [...wireProtocolVersions],
           initialSubscriptions: ["ahp-root://"],
           locale: "zh-CN",
         }),
       Date.now() + MANAGED_CONTROL_REQUEST_TIMEOUT_MS,
       "managed-initialize-timeout",
     );
-    const expectedWireProtocolVersion =
-      prepared.entry.wireProtocolVersion ?? prepared.entry.protocolVersion;
     if (
-      initialized.protocolVersion !== expectedWireProtocolVersion ||
-      !NEGOTIATED_PROTOCOL_VERSIONS.includes(initialized.protocolVersion)
+      !wireProtocolVersions.includes(initialized.protocolVersion)
     ) {
       throw codedError(
         "incompatible-protocol",
@@ -343,7 +349,13 @@ async function connectPreparedTarget(
     activeRootTracker.assertHealthy();
     const connectedClient = managedClient;
     return {
-      prepared,
+      prepared: prepared.entry.protocolVersion !== initialized.protocolVersion &&
+        prepared.entry.wireProtocolVersion !== initialized.protocolVersion
+        ? {
+            ...prepared,
+            entry: { ...prepared.entry, wireProtocolVersion: initialized.protocolVersion },
+          }
+        : prepared,
       client: connectedClient,
       get rootState(): RootState {
         return activeRootTracker.root;
@@ -729,7 +741,7 @@ function selectStandaloneEndpoint(
   );
   const compatible = standalone.filter(
     (candidate) =>
-      standaloneWireProtocolVersion(candidate.protocolVersion) !== undefined,
+      standaloneWireProtocolVersions(candidate.protocolVersion).length > 0,
   );
   if (startedOutput) {
     const startedUrl = startedOutput.match(
@@ -763,10 +775,10 @@ function selectStandaloneEndpoint(
 }
 
 function toRegistryEntry(endpoint: CodeAgentEndpoint): EndpointRegistryEntry {
-  const wireProtocolVersion = standaloneWireProtocolVersion(
+  const wireProtocolVersions = standaloneWireProtocolVersions(
     endpoint.protocolVersion,
   );
-  if (!wireProtocolVersion) {
+  if (wireProtocolVersions.length === 0) {
     throw codedError("incompatible-standalone-protocol");
   }
   const identity = `${endpoint.type}\0${endpoint.pid}\0${endpoint.instanceId}`;
@@ -777,9 +789,6 @@ function toRegistryEntry(endpoint: CodeAgentEndpoint): EndpointRegistryEntry {
     pid: endpoint.pid,
     instanceId: endpoint.instanceId,
     protocolVersion: endpoint.protocolVersion,
-    ...(wireProtocolVersion === endpoint.protocolVersion
-      ? {}
-      : { wireProtocolVersion }),
     connectionToken: endpoint.connectionToken,
     endpoint: endpoint.endpoint,
     sourceFile,

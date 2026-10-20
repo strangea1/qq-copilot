@@ -790,7 +790,7 @@ export class AhpCore {
           version: "0.1.0",
           title: "QQ Copilot AHP Adapter",
         },
-        protocolVersions: [...NEGOTIATED_PROTOCOL_VERSIONS],
+        protocolVersions: [wireProtocolVersion],
         initialSubscriptions: [ROOT],
         ...(this.#locale ? { locale: this.#locale } : {}),
       };

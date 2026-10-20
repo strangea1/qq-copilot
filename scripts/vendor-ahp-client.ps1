@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Revision = "a0bc67f840788f816c9b44bb1325181cb4c4661d",
+    [string]$Revision = "13277064ffa20cceab1bfc04ba876a1b181b6e80",
 
     [switch]$Force
 )
@@ -8,11 +8,11 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VendorDirectory = Join-Path $ProjectRoot "vendor"
-$PackageName = "microsoft-agent-host-protocol-0.8.0.tgz"
+$PackageName = "microsoft-agent-host-protocol-1.0.0.tgz"
 $HashName = "$PackageName.sha256"
 $PackagePath = Join-Path $VendorDirectory $PackageName
 $HashPath = Join-Path $VendorDirectory $HashName
-$OverlayPath = Join-Path $VendorDirectory "ahp-vscode-1.136.patch"
+$OverlayPath = Join-Path $VendorDirectory "ahp-vscode-1.142.patch"
 $TempDirectory = Join-Path `
     ([Environment]::GetFolderPath("LocalApplicationData")) `
     "Temp"

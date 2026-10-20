@@ -1,0 +1,13 @@
+diff --git a/types/version/registry.ts b/types/version/registry.ts
+--- a/types/version/registry.ts
++++ b/types/version/registry.ts
+@@ -33,7 +33,9 @@ export const PROTOCOL_VERSION = '1.1.0';
+  * `scripts/verify-release-metadata.ts`.
+  */
+ export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = Object.freeze([
++  '1.1.0',
+   '1.0.0',
++  '0.10.0',
+   '0.9.0',
+ ]);
+ 

@@ -78,28 +78,28 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - QQ 不提供 GitHub 凭据 Broker，也不代替电脑端登录或授权。
 - 同一精确工作区允许多个 Turn 并发，但 Bridge 会发送冲突警告；有写操作的并发任务
   应使用独立 Git worktree，避免文件和 Git 索引互相覆盖。
-- AHP 直接连接针对 VS Code 1.136 的实际协议方言验证。当前 VS Code 1.136 宣告
-  AHP `0.9.0`，其类型和 reducer 对应 vendored revision
-  `a0bc67f840788f816c9b44bb1325181cb4c4661d`，并应用仓库中的 VS Code 1.136 registry overlay。
+- AHP 直接连接针对 VS Code 1.142.0 的实际协议方言验证。该版本宣告 AHP `1.1.0`，
+  其类型、reducer 和客户端对应 Host 锁定的 vendored revision
+  `13277064ffa20cceab1bfc04ba876a1b181b6e80`，并应用仓库中的 VS Code 1.142 registry overlay。
 - Local Standalone/Remote SSH Host 仍必须宣告 vendored 客户端支持的协议版本；未知版本
   必须 fail-closed，不能手工放宽版本列表。
-- npm 上同名 `@microsoft/agent-host-protocol@0.8.0` 不是精确源码；项目通过
+- npm 包版本号不等于 wire 协议版本；项目通过
   `scripts/vendor-ahp-client.ps1` 生成固定 revision 的本地 tarball。
 - VS Code 自动更新后，如果出现未知协议、Snapshot 或 Action，相关 Host 降为只读，
   QQ 不能继续发消息、审批或取消，直到兼容性修复。
 - AHP Host 重启后，正在执行的 Turn、审批和澄清请求按失败处理，不自动重放。
 - QQ 端只提供单次批准；PC 端仍可使用 VS Code 原生 Session Allow。
 - UAC、密码、MFA、系统弹窗和工具认证 Secret 不通过 QQ 处理。
-- AHP 是 VS Code 快速演进的接口。本项目固定并验证了 VS Code 1.136 的协议 revision；
+- AHP 是 VS Code 快速演进的接口。本项目固定并验证了 VS Code 1.142 的协议 revision；
   升级 VS Code 后应重新执行兼容性验收。
-- VS Code 1.136 的 Editor endpoint 宣告并协商 `0.9.0`；`code-tunnel agent host`
-  的 standalone 注册表宣告 `0.1.0`，但实际 wire 仍严格协商 `0.9.0`。Adapter 只对这一
-  已验证组合应用元数据映射，不把 `0.1.0` 当作 wire 协议。
+- VS Code 1.142 的 Editor endpoint 宣告并协商 `1.1.0`。Standalone 注册表仍使用
+  `0.1.0` 元数据；Adapter 通过握手确认实际 wire（1.142 为 `1.1.0`、旧版 1.136 为
+  `0.9.0`），并固定后续连接的版本。未知版本仍拒绝连接，不把 `0.1.0` 当作 wire 协议。
 
 ## 前置条件
 
 - Windows 当前标准用户。
-- VS Code 1.136 或经过兼容测试的后续版本；Standalone/Remote SSH 必须匹配已审计的
+- VS Code 1.142 或经过兼容测试的后续版本；Standalone/Remote SSH 必须匹配已审计的
   registry-to-wire 版本组合，未知组合继续 fail-closed。
 - Node.js 24.18 或更高版本。
 - Rust 1.89 或更高版本（仅源码构建需要）。
