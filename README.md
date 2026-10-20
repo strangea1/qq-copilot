@@ -9,6 +9,10 @@
 
 Session 创建、GitHub 登录、模型和审批模式选择均在电脑端完成；QQ 只操作已有 Session。
 
+可选启用本地 Windows **OpenAI Codex CLI**，通过官方 `codex app-server` 发现并恢复
+电脑端已有的 thread，复用 QQ 的会话切换、发消息、审批和取消流程。默认关闭，
+不影响现有 AHP 连接；安装和启用方式见 [Codex 适配指南](docs/codex.md)。
+
 ## 架构
 
 ```text
@@ -24,6 +28,7 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 | --- | --- |
 | `qq-bridge.exe` | QQ Gateway/OpenAPI、Owner 身份、SQLite、审批仲裁、消息投递和 Adapter 监督 |
 | `ahp-adapter` | 连接 VS Code Editor Host 或本地/Remote SSH Standalone Host，同时订阅并控制多个 Session/Chat |
+| Codex app-server（可选） | Adapter 持有的本地 stdio 子进程，恢复已有 Codex thread，不接管任意正在运行的终端 |
 | VS Code Agent Host | 唯一权威会话、工具策略和执行状态 |
 | QQ Bot | 手机端共享对话、审批、澄清回答和取消 |
 | QQ Copilot AHP Status | VS Code 状态栏显示运行状态，并报告工作区信任状态 |
@@ -63,6 +68,8 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
   幂等键，成功或投递结果不确定后都不会再次发送。
 - QQ 私聊语音使用事件自带的 ASR 结果作为普通共享会话输入；敏感控制命令仍要求文字或按钮。
 - AHP/Legacy 模式一键切换。
+- 可选本地 Codex 提供方：精确可信目录过滤、恢复已有 thread、排队消息、指定 Turn 取消、
+  命令/文件修改的单次批准或拒绝、单个非敏感问题回答；目录与通知链路和 AHP 共存。
 
 ## 重要边界
 
@@ -90,6 +97,10 @@ QQ Bot ↔ Rust Bridge ↔ TS Adapter ───┘
 - AHP Host 重启后，正在执行的 Turn、审批和澄清请求按失败处理，不自动重放。
 - QQ 端只提供单次批准；PC 端仍可使用 VS Code 原生 Session Allow。
 - UAC、密码、MFA、系统弹窗和工具认证 Secret 不通过 QQ 处理。
+- Codex 首期仅支持原生 Windows CLI `0.163.0`，不支持 SSH Codex、QQ 创建 thread，
+  或继承 VS Code 的 GitHub 登录。登录、模型及沙箱/审批策略仍由电脑端 Codex 管理。
+- 不要同时从原 Codex 终端和 QQ 写同一 thread；恢复历史 thread 不代表附着到原终端。
+  app-server 断开后不重放任务，新实例就绪后需重新选择 thread。
 - AHP 是 VS Code 快速演进的接口。本项目固定并验证了 VS Code 1.142 的协议 revision；
   升级 VS Code 后应重新执行兼容性验收。
 - VS Code 1.142 的 Editor endpoint 宣告并协商 `1.1.0`。Standalone 注册表仍使用

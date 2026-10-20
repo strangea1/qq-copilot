@@ -21,6 +21,7 @@ enabled = true
 poll_seconds = 25
 code_executable = "C:\\\\Tools\\\\code-tunnel.exe"
 ssh_executable = "C:\\\\Windows\\\\System32\\\\OpenSSH\\\\ssh.exe"
+codex_executable = "C:\\\\Tools\\\\codex.exe"
 shared_workspaces = ["C:\\\\test"]
 
 [[ahp.authorized_targets]]
@@ -37,6 +38,7 @@ host_key_fingerprints = ["SHA256:example"]
   const config = await loadAdapterConfig(configPath, root);
   assert.equal(config.codeExecutable?.endsWith("code-tunnel.exe"), true);
   assert.equal(config.sshExecutable?.endsWith("ssh.exe"), true);
+  assert.equal(config.codexExecutable, "C:\\Tools\\codex.exe");
   assert.equal(config.authorizedTargets.length, 2);
   assert.deepEqual(config.authorizedTargets[0], {
     kind: "local",
@@ -74,6 +76,7 @@ shared_workspaces = ["C:\\\\test"]
 
   const config = await loadAdapterConfig(configPath, root);
   assert.equal(config.codeExecutable, undefined);
+  assert.equal(config.codexExecutable, undefined);
   assert.equal(config.authorizedTargets.length, 1);
 });
 

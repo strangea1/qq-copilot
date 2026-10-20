@@ -117,6 +117,8 @@ pub struct AhpConfig {
     #[serde(default)]
     pub ssh_executable: Option<PathBuf>,
     #[serde(default)]
+    pub codex_executable: Option<PathBuf>,
+    #[serde(default)]
     pub tool_notification_mode: AhpToolNotificationMode,
     #[serde(default = "default_typing_indicator_enabled")]
     pub typing_indicator_enabled: bool,
@@ -192,6 +194,7 @@ impl Default for AhpConfig {
             code_executable: None,
             code_launcher: None,
             ssh_executable: None,
+            codex_executable: None,
             tool_notification_mode: AhpToolNotificationMode::Compact,
             typing_indicator_enabled: default_typing_indicator_enabled(),
             typing_duration_seconds: default_typing_duration_seconds(),
@@ -602,6 +605,7 @@ impl AppConfig {
                 self.ahp.code_executable.as_ref(),
                 self.ahp.code_launcher.as_ref(),
                 self.ahp.ssh_executable.as_ref(),
+                self.ahp.codex_executable.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -609,6 +613,13 @@ impl AppConfig {
                 if !path.is_absolute() {
                     bail!("AHP executable and script paths must be absolute");
                 }
+            }
+            if let Some(path) = &self.ahp.codex_executable
+                && !path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            {
+                bail!("ahp.codex_executable must be a native Windows .exe path");
             }
             if targets
                 .iter()
@@ -937,6 +948,32 @@ mod tests {
     use rand::{RngCore, rngs::OsRng};
 
     use super::*;
+
+    #[test]
+    fn codex_configuration_is_opt_in_and_persists() {
+        let defaults: AhpConfig = toml::from_str("").expect("legacy config");
+        assert!(defaults.codex_executable.is_none());
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        let mut config =
+            AppConfig::write_new(&path, vec![directory.path().to_path_buf()]).expect("config");
+        config.ahp.enabled = true;
+        config.ahp.shared_workspaces = vec![directory.path().to_path_buf()];
+        config.ahp.codex_executable = Some(directory.path().join("codex.exe"));
+        config.save(&path).expect("save");
+        assert_eq!(
+            AppConfig::load(&path).expect("load").ahp.codex_executable,
+            config.ahp.codex_executable
+        );
+        config.ahp.codex_executable = Some(directory.path().join("codex.cmd"));
+        assert!(
+            config
+                .validate()
+                .expect_err("native exe required")
+                .to_string()
+                .contains("codex_executable")
+        );
+    }
 
     #[test]
     fn qq_session_menu_limit_defaults_validates_and_persists() {

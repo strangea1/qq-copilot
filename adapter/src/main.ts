@@ -52,6 +52,9 @@ import {
 } from "./endpoint-registry.js";
 import { buildInputCompletion } from "./input-completion.js";
 import type { EndpointRegistryEntry } from "./endpoint-registry.js";
+import { CODEX_PROTOCOL, CodexCore } from "./codex-core.js";
+import type { startCodexClient } from "./codex-rpc.js";
+import { CombinedCore, type ProviderCore } from "./provider-core.js";
 
 const ADAPTER_VERSION = "0.1.0";
 const EVENT_BATCH_SIZE = 64;
@@ -137,17 +140,12 @@ export interface BridgeClientLike {
   call<T>(request: BridgeRequest, timeoutMs?: number): Promise<T>;
 }
 
-export interface AhpCoreLike {
-  readonly catalogue: CatalogueSnapshot;
-  start(): Promise<CatalogueSnapshot | void>;
-  stop(): Promise<void>;
-  refreshEndpoints(): Promise<CatalogueSnapshot>;
-  bindSession(endpointId: string, sessionUri: string): Promise<AhpSessionBinding>;
-}
+export type AhpCoreLike = ProviderCore;
 
 export interface RuntimeDependencies {
   readonly createBridgeClient?: (config: AdapterConfig) => BridgeClientLike;
   readonly createCore?: (options: AhpCoreOptions) => AhpCoreLike;
+  readonly createCodexClient?: typeof startCodexClient;
   readonly connectManagedTarget?: typeof connectManagedTarget;
   readonly connectPreparedManagedTarget?: typeof connectPreparedManagedTarget;
   readonly stopManagedTargetProcesses?: typeof stopManagedTargetProcesses;
@@ -298,7 +296,9 @@ export class AdapterRuntime {
           if (this.#stopping) {
             return;
           }
-          void this.#publishCatalogue(snapshot).catch((error) => {
+          void this.#publishCatalogue(
+            config.codexExecutable ? this.#core.catalogue : snapshot,
+          ).catch((error) => {
             safeLog("warn", "Failed to publish AHP catalogue", {
               code: errorCode(error),
             });
@@ -326,7 +326,19 @@ export class AdapterRuntime {
         },
       },
     };
-    this.#core = dependencies.createCore?.(coreOptions) ?? new AhpCore(coreOptions);
+    const ahpCore = dependencies.createCore?.(coreOptions) ?? new AhpCore(coreOptions);
+    this.#core = config.codexExecutable
+      ? new CombinedCore([
+          ahpCore,
+          new CodexCore({
+            executable: config.codexExecutable,
+            clientId: config.adapterId,
+            authorizedTargets: () => this.#authorizedTargets,
+            callbacks: coreOptions.callbacks ?? {},
+            ...(dependencies.createCodexClient ? { createClient: dependencies.createCodexClient } : {}),
+          }),
+        ])
+      : ahpCore;
   }
 
   async run(signal: AbortSignal): Promise<void> {
@@ -337,7 +349,10 @@ export class AdapterRuntime {
           adapter_id: this.#config.adapterId,
           adapter_instance_id: this.#adapterInstanceId,
           version: ADAPTER_VERSION,
-          supported_protocols: [...SUPPORTED_PROTOCOL_VERSIONS],
+          supported_protocols: [
+            ...SUPPORTED_PROTOCOL_VERSIONS,
+            ...(this.#config.codexExecutable ? [CODEX_PROTOCOL] : []),
+          ],
         },
       }),
     );
@@ -1671,7 +1686,8 @@ export class AdapterRuntime {
     if (
       event.status === "connected" &&
       event.selectedProtocol &&
-      NEGOTIATED_PROTOCOL_VERSIONS.includes(event.selectedProtocol)
+      (NEGOTIATED_PROTOCOL_VERSIONS.includes(event.selectedProtocol) ||
+       event.selectedProtocol === CODEX_PROTOCOL)
     ) {
       this.#readOnlyEndpoints.delete(event.endpoint.id);
       if (this.#restoreBindings.size > 0) {
@@ -1687,7 +1703,9 @@ export class AdapterRuntime {
       }
       this.#queueEvents(binding.bindingId, [
         binding.normalizer.hostDisconnected(
-          "VS Code Agent Host 连接已中断，Adapter 正在重连。",
+          event.endpoint.advertisedProtocol === CODEX_PROTOCOL
+            ? "Codex app-server 连接已中断，进行中的任务不会自动重放。"
+            : "VS Code Agent Host 连接已中断，Adapter 正在重连。",
         ),
       ]);
     }
@@ -1878,7 +1896,8 @@ export class AdapterRuntime {
             : entry.connection === "incompatible"
               ? "incompatible"
               : "unreachable",
-        host_label: managed?.prepared.hostLabel ?? "local",
+        host_label: entry.endpoint.advertisedProtocol === CODEX_PROTOCOL
+          ? "codex-local" : managed?.prepared.hostLabel ?? "local",
         ...(managed?.target.kind === "ssh"
           ? {
               ssh_alias: managed.target.alias,
@@ -1891,9 +1910,11 @@ export class AdapterRuntime {
                 target_path: managed.target.path,
               }
             : {}),
-        endpoint_type: managed?.entry.endpoint.type ?? "socket",
+        endpoint_type: entry.endpoint.advertisedProtocol === CODEX_PROTOCOL
+          ? "stdio" : managed?.entry.endpoint.type ?? "socket",
         editor_client_tools_available:
-          managed?.prepared.editorClientToolsAvailable ?? true,
+          entry.endpoint.advertisedProtocol === CODEX_PROTOCOL
+            ? false : managed?.prepared.editorClientToolsAvailable ?? true,
       };
     });
     const sessionsByUri = new Map<string, BridgeCatalogueSession>();
@@ -2256,8 +2277,8 @@ function toEditorBridgeSession(
     workspace_uris: session.workingDirectories ?? [],
     created_at: session.createdAt,
     modified_at: session.modifiedAt,
-    host_label: "local",
-    editor_client_tools_available: true,
+    host_label: entry.endpoint.advertisedProtocol === CODEX_PROTOCOL ? "codex-local" : "local",
+    editor_client_tools_available: entry.endpoint.advertisedProtocol !== CODEX_PROTOCOL,
   };
 }
 

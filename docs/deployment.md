@@ -18,6 +18,8 @@ QQ Bot ↔ qq-bridge ↔ AHP Adapter
   后台运行。Session 创建和 GitHub 登录在电脑端完成。
 - Bridge、Adapter 和状态栏扩展安装在 Agent 可编辑工作区之外。
 - 旧 Hooks/MCP 链只作为回滚模式。
+- 可选的本地 Windows Codex CLI 提供方与 AHP 共用 Adapter，通过受管 stdio
+  app-server 恢复已有 thread，详见 [Codex 适配指南](codex.md)。
 
 ## 2. 系统要求
 
@@ -139,6 +141,21 @@ shared_workspaces = [
 
 升级后执行 **Developer: Reload Window**。状态扩展不再提供 Session 认证 Broker、
 启用/撤销认证命令或相关设置；VS Code 自己管理的 GitHub 登录不受影响。
+
+### 可选：启用 Codex
+
+先在电脑端安装并登录原生 Windows Codex CLI `0.163.0`，创建 thread，并将其精确
+工作目录加入已有的可信目标。安装此版本 Bridge/Adapter 后运行：
+
+```powershell
+$Bridge = "$env:LOCALAPPDATA\Programs\CopilotQQBridge\qq-bridge.exe"
+& $Bridge configure-codex --executable "C:\Tools\Codex\codex.exe"
+```
+
+路径必须指向原生 `.exe`，不能指向 npm 的 `.cmd` 包装器。配置默认禁用；该命令只保存
+`ahp.codex_executable`，不读取登录凭据、不启动登录、不自动重启。所有 Binding、
+排队消息和未决交互空闲后，使用已有受管流程重启 Bridge/Adapter；不能只重载授权目录
+来启用新提供方。完整操作、禁用方式和限制见 [Codex 适配指南](codex.md)。
 
 ## 7. 配置 QQ
 

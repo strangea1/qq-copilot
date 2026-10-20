@@ -199,6 +199,13 @@ export class AhpEventNormalizer {
       ...this.#toolEvents(event.state, event.serverSeq, event.chatUri, historical),
     );
     this.#initialChatSnapshot = false;
+    const completed = event.completedAssistantPart;
+    if (!historical && completed &&
+        this.#openAssistantParts.get(completed.turnId)?.partId === completed.partId) {
+      events.push(...this.#flushAssistantPart(
+        completed.turnId, event.serverSeq, event.chatUri, completed.finalResponse,
+      ));
+    }
     return events;
   }
 

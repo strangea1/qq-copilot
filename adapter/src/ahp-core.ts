@@ -121,6 +121,11 @@ export interface ChatSnapshotEvent {
   readonly chatUri: URI;
   readonly serverSeq: number;
   readonly state: ChatState;
+  readonly completedAssistantPart?: {
+    readonly turnId: string;
+    readonly partId: string;
+    readonly finalResponse: boolean;
+  };
 }
 
 export type DomainActionEvent =

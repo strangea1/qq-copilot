@@ -51,6 +51,12 @@ enum Command {
         session: String,
     },
     AhpUnbind,
+    ConfigureCodex {
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        executable: Option<PathBuf>,
+        #[arg(long)]
+        disable: bool,
+    },
     ConfigureAhp {
         #[arg(long = "workspace", required = true)]
         workspaces: Vec<PathBuf>,
@@ -200,6 +206,34 @@ async fn main() -> Result<()> {
         Command::AhpUnbind => {
             let result = admin_call(&config_path, BridgeRequest::AhpUnbindSession).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        Command::ConfigureCodex {
+            executable,
+            disable,
+        } => {
+            let mut config = AppConfig::load(&config_path)?;
+            config.ahp.codex_executable = if disable {
+                None
+            } else {
+                let path = executable.context("--executable is required")?;
+                let path = path
+                    .canonicalize()
+                    .context("Codex executable does not exist")?;
+                if !path.is_file()
+                    || !path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+                {
+                    bail!("Codex executable must be a native Windows .exe file");
+                }
+                Some(path)
+            };
+            config.save(&config_path)?;
+            println!(
+                "Codex integration {}. Restart Bridge/Adapter after every Binding and pending interaction is idle.",
+                if disable { "disabled" } else { "configured" }
+            );
             Ok(())
         }
         Command::ConfigureAhp {
@@ -1387,6 +1421,44 @@ fn restrict_config_permissions(_config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_cli_requires_executable_or_disable() {
+        assert!(matches!(
+            Cli::try_parse_from(["qq-bridge", "configure-codex", "--disable"])
+                .expect("disable")
+                .command,
+            Some(Command::ConfigureCodex {
+                executable: None,
+                disable: true
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "qq-bridge",
+                "configure-codex",
+                "--executable",
+                r"C:\Tools\codex.exe"
+            ])
+            .expect("enable")
+            .command,
+            Some(Command::ConfigureCodex {
+                executable: Some(_),
+                disable: false
+            })
+        ));
+        assert!(Cli::try_parse_from(["qq-bridge", "configure-codex"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "qq-bridge",
+                "configure-codex",
+                "--disable",
+                "--executable",
+                r"C:\Tools\codex.exe"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn registration_preflight_accepts_supported_and_audited_standalone_versions() {

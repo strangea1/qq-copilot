@@ -15,6 +15,7 @@ export interface AdapterConfig {
   readonly pollSeconds: number;
   readonly codeExecutable?: string;
   readonly sshExecutable?: string;
+  readonly codexExecutable?: string;
   readonly authorizedTargets: readonly AuthorizedTargetConfig[];
 }
 
@@ -72,6 +73,12 @@ export async function loadAdapterConfig(
       ? ahp.ssh_executable
       : undefined;
   const authorizedTargets = parseConfiguredTargets(ahp);
+  const codexExecutable = ahp.codex_executable;
+  if (codexExecutable !== undefined &&
+      (typeof codexExecutable !== "string" ||
+       !win32.isAbsolute(codexExecutable) || !/\.exe$/iu.test(codexExecutable))) {
+    throw new Error("ahp.codex_executable must be an absolute native Windows .exe path");
+  }
   const adapterId = `qq-copilot-ahp-${createHash("sha256")
     .update(`adapter\0${pipeName}\0${bridgeToken}`, "utf8")
     .digest("hex")
@@ -87,6 +94,7 @@ export async function loadAdapterConfig(
     pollSeconds,
     ...(codeExecutable ? { codeExecutable: resolve(codeExecutable) } : {}),
     ...(sshExecutable ? { sshExecutable: resolve(sshExecutable) } : {}),
+    ...(typeof codexExecutable === "string" ? { codexExecutable } : {}),
     authorizedTargets,
   };
 }

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -34,6 +37,8 @@ import type {
 } from "../src/ahp-core.js";
 import type { BridgeRequest } from "../src/bridge-client.js";
 import type { AdapterConfig } from "../src/config.js";
+import { CODEX_PROTOCOL } from "../src/codex-core.js";
+import { record, type CodexMessage } from "../src/codex-rpc.js";
 import {
   endpointPublicId,
   type EndpointRegistryEntry,
@@ -359,6 +364,118 @@ test("runtime restores every registered binding and publishes per binding", asyn
   assert.equal(core?.stopCount, 1);
   assert.equal(firstBinding.closeCount, 1);
   assert.equal(secondBinding.closeCount, 1);
+});
+
+test("runtime preserves combined AHP and Codex catalogues and routes commands and replies", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "qq-codex-runtime-"));
+  const first = bindingRecord("binding-ahp", 1, "copilot:/session-1", "ahp-chat://default/session-1");
+  const bridge = new FakeBridgeClient({ bindings: [first] });
+  const ahpBinding = new FakeSessionBinding(boundSnapshot(first.session_uri, chatUriOf(first)));
+  const codexCalls: { method: string; params: unknown }[] = [];
+  let codexMessage: (message: CodexMessage) => void = () => {};
+  let closed = false;
+  let ahp: FakeCore | undefined;
+  const thread = {
+    id: "codex-existing", cwd, name: "Existing Codex", createdAt: 1_780_000_000,
+    updatedAt: 1_780_000_001, status: { type: "idle" }, turns: [],
+  };
+  const runtime = new AdapterRuntime({
+    ...config, codexExecutable: "C:\\Codex\\codex.exe", authorizedTargets: [{ kind: "local", path: cwd }],
+  }, {
+    createBridgeClient: () => bridge,
+    createCore: (options) => {
+      ahp = new FakeCore(options, catalogue([summary(first.session_uri, "AHP")]), [ahpBinding]);
+      return ahp;
+    },
+    createCodexClient: async (_exe, onMessage) => {
+      codexMessage = onMessage;
+      return {
+        pid: process.pid,
+        request: async (method, params) => {
+          codexCalls.push({ method, params });
+          switch (method) {
+            case "initialize": return {};
+            case "thread/list": return { data: [thread], nextCursor: null };
+            case "thread/read":
+            case "thread/resume": return { thread, cwd };
+            case "turn/start": return { turn: { id: "codex-turn", status: "inProgress" } };
+            case "thread/unsubscribe": return {};
+            default: throw new Error(`Unexpected Codex method ${method}`);
+          }
+        },
+        notify: async () => {},
+        respond: async () => {},
+        reject: async () => assert.fail("unexpected Codex request rejection"),
+        close: async () => { closed = true; },
+      };
+    },
+  });
+  const abort = new AbortController();
+  const running = runtime.run(abort.signal);
+  t.after(async () => {
+    abort.abort();
+    if (bridge.pendingPollCount > 0) {
+      bridge.resolvePoll({ commands: [] });
+    }
+    await running;
+    await rm(cwd, { recursive: true, force: true });
+  });
+  await waitFor(() => latestFullSessions(bridge).length === 2 && bridge.pendingPollCount > 0,
+    "expected both provider catalogues");
+  const codexSession = latestFullSessions(bridge).find((session) => session.provider === "codex");
+  assert.ok(codexSession);
+  assert.equal(codexSession.host_label, "codex-local");
+  const lastCatalogue = requestsFor(bridge, "ahp_catalog_replace").at(-1)!;
+  const hosts = lastCatalogue.hosts;
+  assert.ok(Array.isArray(hosts));
+  assert.ok(hosts.some((host) => record(host).selected_protocol === CODEX_PROTOCOL &&
+    record(host).endpoint_type === "stdio"));
+  const registered = record(requestsFor(bridge, "ahp_adapter_register")[0]!.registration);
+  assert.ok(Array.isArray(registered.supported_protocols) && registered.supported_protocols.includes(CODEX_PROTOCOL));
+  bridge.resolvePoll({ commands: [
+    {
+      command_id: 1, command_key: "bind:codex", binding_id: "binding-codex", binding_generation: 2,
+      kind: "bind_session", data: {
+        endpoint_id: codexSession.endpoint_id, host_instance_id: codexSession.host_instance_id,
+        session_uri: codexSession.session_uri,
+      },
+    },
+    {
+      command_id: 2, command_key: "send:ahp", binding_id: first.binding_id, binding_generation: first.generation,
+      kind: "send_message", data: { content: "AHP task" },
+    },
+    {
+      command_id: 3, command_key: "send:codex", binding_id: "binding-codex", binding_generation: 2,
+      kind: "send_message", data: { content: "Codex task" },
+    },
+  ] });
+  await waitFor(() => requestsFor(bridge, "ahp_ack_command").length === 3, "expected provider command acknowledgements");
+  assert.deepEqual(ahpBinding.queueUserTextCalls.map((call) => call.text), ["AHP task"]);
+  assert.equal(codexCalls.filter((call) => call.method === "turn/start").length, 1);
+  assert.equal(record(codexCalls.find((call) => call.method === "turn/start")!.params).threadId, thread.id);
+  codexMessage({
+    method: "item/completed", params: {
+      threadId: thread.id, turnId: "codex-turn",
+      item: { type: "agentMessage", id: "codex-final", text: "Codex finished", phase: "final_answer" },
+    },
+  });
+  await waitFor(() => requestsFor(bridge, "ahp_publish_events").some((request) =>
+    request.binding_id === "binding-codex" && publishedEvents(request).some((event) =>
+      event.kind === "assistant_message" && record(event.data).content === "Codex finished")),
+  "expected Codex reply on its own binding");
+  ahp?.emitCatalogue(ahp.catalogue);
+  await flushMicrotasks();
+  assert.equal(latestFullSessions(bridge).length, 2, "AHP refresh must not remove Codex sessions");
+  codexMessage({
+    method: "turn/completed", params: {
+      threadId: thread.id, turn: { id: "codex-turn", status: "completed", items: [] },
+    },
+  });
+  await flushMicrotasks();
+  abort.abort();
+  bridge.resolvePoll({ commands: [] });
+  await running;
+  assert.equal(closed, true);
 });
 
 test("runtime serializes catalogue snapshots in observation order", async () => {
